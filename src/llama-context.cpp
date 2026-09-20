@@ -15,10 +15,31 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+
+// strixllama: where one llama_decode's CPU time goes (STRIX_DECODE_TIMING=1). One line per call:
+//
+//   DT decode n=4 total=69.1ms prep=0.6 graph=0.3 inputs=1.9 compute=64.8 post=1.5 reused=1/1
+//
+//   prep     entry to the end of output_reserve: balloc->init, memory_update, init_batch, sched_reserve
+//   graph    per ubatch: mctx->apply, graph_params, can_reuse, and on a miss build_graph + sched_alloc
+//   inputs   per ubatch: res->set_inputs
+//   compute  per ubatch: graph_compute, i.e. the backend (submit + whatever of the GPU it waits for)
+//   post     the rest: output reordering and the logits/embeddings/h_nextn readbacks
+//   reused   ubatches that hit the graph-reuse path, out of ubatches in this call
+//
+// Everything but `compute` is CPU orchestration. Off by default; one static bool per call site when off.
+struct strixllama_decode_timing {
+    static bool enabled() { static const bool e = getenv("STRIX_DECODE_TIMING") && atoi(getenv("STRIX_DECODE_TIMING")); return e; }
+    int64_t prep = 0, graph = 0, inputs = 0, compute = 0;
+    int n_ubatch = 0, n_reused = 0;
+    void reset() { prep = graph = inputs = compute = 0; n_ubatch = n_reused = 0; }
+};
+static strixllama_decode_timing g_decode_timing;
 
 //
 // llama_context
@@ -1339,6 +1360,9 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    const bool dt = strixllama_decode_timing::enabled();
+    const int64_t dt_t0 = dt ? ggml_time_us() : 0;
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1358,6 +1382,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_prepare_inputs(sched.get());
 
         n_reused++;
+        if (dt) { g_decode_timing.n_reused++; }
     } else {
         res->reset();
 
@@ -1383,6 +1408,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    const int64_t dt_t1 = dt ? ggml_time_us() : 0;
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1393,7 +1420,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t dt_t2 = dt ? ggml_time_us() : 0;
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (dt) {
+        const int64_t dt_t3 = ggml_time_us();
+        g_decode_timing.graph   += dt_t1 - dt_t0;
+        g_decode_timing.inputs  += dt_t2 - dt_t1;
+        g_decode_timing.compute += dt_t3 - dt_t2;
+        g_decode_timing.n_ubatch++;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1658,6 +1694,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    const bool    dt    = strixllama_decode_timing::enabled();
+    const int64_t dt_t0 = dt ? ggml_time_us() : 0;
+    if (dt) { g_decode_timing.reset(); }
+
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
@@ -1807,6 +1847,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     for (const auto & entry : sampling.samplers) {
         llama_sampler_backend_begin(entry.second);
     }
+
+    if (dt) { g_decode_timing.prep = ggml_time_us() - dt_t0; }
 
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
@@ -2040,6 +2082,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    if (dt) {
+        const auto & g = g_decode_timing;
+        const int64_t total = ggml_time_us() - dt_t0;
+        fprintf(stderr, "DT decode n=%d total=%.1fms prep=%.2f graph=%.2f inputs=%.2f compute=%.2f post=%.2f reused=%d/%d\n",
+                (int) batch_inp.n_tokens, total / 1000.0, g.prep / 1000.0, g.graph / 1000.0, g.inputs / 1000.0,
+                g.compute / 1000.0, (total - g.prep - g.graph - g.inputs - g.compute) / 1000.0,
+                g.n_reused, g.n_ubatch);
+    }
 
     return 0;
 }

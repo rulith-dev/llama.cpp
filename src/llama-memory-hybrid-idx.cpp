@@ -13,6 +13,7 @@
 #include <cassert>
 #include <cmath>
 #include <iterator>
+#include <map>
 #include <stdexcept>
 
 //
@@ -78,7 +79,92 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+    }()) {
+    // strixllama: block-key cache, one F16 [idx_dim, kv_size + 1] tensor per indexer layer, allocated next to
+    // that layer's indexer keys (LLAMA_QSA_BLOCK_KEY_CACHE=0 turns it off and restores the full rebuild)
+    const char * kb_env = getenv("LLAMA_QSA_BLOCK_KEY_CACHE");
+    if (mem_idx && (kb_env == nullptr || atoi(kb_env) != 0)) {
+        const uint32_t kv_size = mem_idx->get_size();
+        const int64_t  idx_dim = model.hparams.indexer_head_size;
+        const uint32_t n_layer = model.hparams.n_layer_all;
+
+        std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            if (!filter_idx(il)) {
+                continue;
+            }
+            ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+            if (offload) {
+                buft = ggml_backend_dev_buffer_type(model.dev_layer(il));
+            }
+            ggml_context * ctx = nullptr;
+            auto it = ctx_map.find(buft);
+            if (it == ctx_map.end()) {
+                ggml_init_params params = { size_t(2u*n_layer*ggml_tensor_overhead()), nullptr, true };
+                ctx = ggml_init(params);
+                if (ctx == nullptr) {
+                    throw std::runtime_error("failed to create ggml context for the QSA block-key cache");
+                }
+                ctx_map[buft] = ctx;
+                kb_ctxs.emplace_back(ctx);
+            } else {
+                ctx = it->second;
+            }
+            ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, idx_dim, (int64_t) kv_size + 1);
+            ggml_format_name(t, "cache_idx_kb_l%d", il);
+            kb_map[(int32_t) il] = t;
+        }
+        size_t bytes = 0;
+        for (auto & [buft, ctx] : ctx_map) {
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+            if (buf == nullptr) {
+                throw std::runtime_error("failed to allocate the QSA block-key cache");
+            }
+            ggml_backend_buffer_clear(buf, 0);
+            bytes += ggml_backend_buffer_get_size(buf);
+            kb_bufs.emplace_back(buf);
+        }
+        LLAMA_LOG_INFO("%s: QSA block-key cache: %zu layers, %.1f MiB\n", __func__, kb_map.size(), bytes/1024.0/1024.0);
+    }
+}
+
+ggml_tensor * llama_memory_hybrid_idx::get_kb(int32_t il) const {
+    const auto it = kb_map.find(il);
+    return it == kb_map.end() ? nullptr : it->second;
+}
+
+uint32_t llama_memory_hybrid_idx::kb_scratch_row() const {
+    return mem_idx ? mem_idx->get_size() : 0;
+}
+
+bool llama_memory_hybrid_idx::kb_needs_full() const {
+    return kb_full_gen != kb_gen;
+}
+
+void llama_memory_hybrid_idx::kb_mark_full() const {
+    kb_full_gen = kb_gen;
+}
+
+bool llama_memory_hybrid_idx::kb_pos_dup() const {
+    return kb_dup;
+}
+
+// strixllama: does this ubatch carry a position per axis, i.e. an image under M-RoPE? A text token has
+// the same value on every axis (the whole batch is then "position scalar"), an image token does not,
+// and the cells it writes repeat one position across the image. Mirrors qwen4exp_pos_scalar().
+static bool hybrid_idx_ubatch_pos_dup(const llama_ubatch & ubatch) {
+    if (!ubatch.pos || ubatch.n_tokens == 0) {
+        return false;
+    }
+    for (uint32_t axis = 1; axis < ubatch.n_pos; ++axis) {
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (ubatch.pos[i + axis*ubatch.n_tokens] != ubatch.pos[i]) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
@@ -118,6 +204,38 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
             break;
         }
 
+        // strixllama: decide here whether the block-key cache may be wired into the graph built from this
+        // context (see kb_pos_dup), because set_input_qsa will then rank cells instead of using their
+        // position, and the cache cannot track ranked cells. Two ways to get there, both sticky:
+        //   - an image ubatch: M-RoPE gives it a position per axis and repeats one position across the
+        //     image, so cells share positions (`dup`);
+        //   - a gap: this ubatch does not continue the sequence, so cells and positions drift apart and
+        //     a cell can land outside the block window (`oor`). The MTP draft is where this bites -
+        //     common_speculative_impl_draft_mtp::process() skips embedding batches, so the draft never
+        //     stores the image's tokens and every later position is shifted past its cell.
+        {
+            std::map<llama_seq_id, llama_pos> next_pos;
+            for (const auto & ub : ubatches) {
+                if (hybrid_idx_ubatch_pos_dup(ub)) {
+                    kb_dup = true;
+                    break;
+                }
+                if (ub.n_tokens == 0 || !ub.pos || !ub.seq_id || !ub.seq_id[0]) {
+                    continue;
+                }
+                const llama_seq_id s  = ub.seq_id[0][0];
+                const auto         it = next_pos.find(s);
+                const llama_pos    expect = it != next_pos.end()
+                    ? it->second
+                    : get_mem_attn()->seq_pos_max(s) + 1;
+                if (ub.pos[0] > expect) {
+                    kb_dup = true;
+                    break;
+                }
+                next_pos[s] = ub.pos[ub.n_tokens - 1] + 1;
+            }
+        }
+
         // prepare the recurrent batches first
         if (!hybrid_idx_no_recr(get_mem_recr()) && !get_mem_recr()->prepare(ubatches)) {
             // TODO: will the recurrent cache be in an undefined context at this point?
@@ -154,6 +272,8 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lc
 }
 
 void llama_memory_hybrid_idx::clear(bool data) {
+    kb_gen++;   // strixllama: block keys depend on positions and cell contents; rebuild them all once
+    kb_dup = false;   // strixllama: no cells left, so no image cells either
     llama_memory_hybrid::clear(data);
 
     if (mem_idx) {
@@ -165,6 +285,14 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
     // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
     if (!hybrid_idx_no_recr(get_mem_recr()) && !get_mem_recr()->seq_rm(seq_id, p0, p1)) {
         return false;
+    }
+
+    // strixllama: only a request that drops every sequence is proof the image cells are gone. A whole-
+    // sequence seq_rm is NOT: the server calls it when it reuses a slot by longest-common-prefix and
+    // then keeps the cached prefix, image cells included, so clearing the flag there wires the cache
+    // back in under ranked cells and aborts. Measured that failure directly (tmp/vis_stress.py).
+    if (seq_id < 0 && p0 <= 0 && p1 < 0) {
+        kb_dup = false;
     }
 
     if (mem_idx) {
@@ -191,6 +319,7 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    kb_gen++;   // strixllama: block keys depend on positions and cell contents; rebuild them all once
     llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
 
     if (mem_idx) {
@@ -199,6 +328,7 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
 }
 
 void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    kb_gen++;   // strixllama: block keys depend on positions and cell contents; rebuild them all once
     llama_memory_hybrid::seq_div(seq_id, p0, p1, d);
 
     if (mem_idx) {
@@ -235,6 +365,7 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
 }
 
 void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    kb_gen++;   // strixllama: block keys depend on positions and cell contents; rebuild them all once
     // note: repeats llama_memory_hybrid::state_read
     // the indexer needs the attention cache's cells, and a half-failed restore must leave all three caches alike
 
@@ -288,14 +419,14 @@ llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
 
 void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias) const {
-    set_input_qsa_impl(cell_blk, blk_cells, blk_pos, bias, nullptr, ubatch, ratio, blk_bias);
+        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias, const qsa_kb_inputs * kb) const {
+    set_input_qsa_impl(cell_blk, blk_cells, blk_pos, bias, nullptr, ubatch, ratio, blk_bias, kb);
 }
 
 void llama_memory_hybrid_idx::set_input_qsa_blocks(
         ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-        ggml_tensor * bias, ggml_tensor * tail_idxs, const llama_ubatch * ubatch, uint32_t ratio) const {
-    set_input_qsa_impl(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, true);
+        ggml_tensor * bias, ggml_tensor * tail_idxs, const llama_ubatch * ubatch, uint32_t ratio, const qsa_kb_inputs * kb) const {
+    set_input_qsa_impl(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, true, kb);
 }
 
 void llama_memory_hybrid_idx::set_input_qsa_impl(
@@ -306,7 +437,8 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
         ggml_tensor * tail_idxs,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        bool blk_bias) const {
+        bool blk_bias,
+        const qsa_kb_inputs * kb) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
 
@@ -322,8 +454,20 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
 
     int32_t * dst_cell_blk  = tail_idxs ? nullptr : (int32_t *) cell_blk->data;
+    // strixllama: with the block-key cache an incremental graph builds its keys from the dirty list, so no
+    // node reads blk_cells / blk_pos and ggml leaves them unallocated. They are still needed here (the
+    // dirty-block scan reads them), so fall back to local scratch instead of writing through null.
+    std::vector<int32_t> blk_cells_local, blk_pos_local;
     int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
-    int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
+    if (dst_blk_cells == nullptr) {
+        blk_cells_local.assign((size_t) blk_cells->ne[0]*blk_cells->ne[1], 0);
+        dst_blk_cells = blk_cells_local.data();
+    }
+    int32_t * dst_blk_pos = (int32_t *) blk_pos->data;
+    if (dst_blk_pos == nullptr) {
+        blk_pos_local.assign((size_t) blk_pos->ne[0], 0);
+        dst_blk_pos = blk_pos_local.data();
+    }
     const bool compact = bias->type == GGML_TYPE_I32;
     float * dst_bias = compact ? nullptr : (float *) bias->data;
     int32_t * limits = compact ? (int32_t *) bias->data : nullptr;
@@ -458,8 +602,13 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
 
         group_cells();
 
-        // mrope repeats one position across an image, so rank cells instead of using the position
-        if (dup && ubatch->is_pos_2d() && one_seq) {
+        // mrope repeats one position across an image, so rank cells instead of using the position.
+        // strixllama: `oor` needs the same treatment. M-RoPE also advances the position past an image by
+        // its grid extent rather than by its token count, so positions run ahead of the cells holding
+        // them and a cell can land outside the block window - the rank is dense by construction, so
+        // ranking fixes that too. Without it the assert below aborts the server on the first long
+        // enough conversation that contains an image.
+        if ((dup || oor) && ubatch->is_pos_2d() && one_seq) {
             order.clear();
             order.reserve(n_kv);
 
@@ -569,6 +718,68 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
             const llama_seq_id seq = ubatch->seq_id[0][0];
             for (int64_t b=0;b<n_blocks;++b) {
                 limits[b] = b<n_bid && cells.seq_has((uint32_t)bid_cell[b],seq) ? bid_idx[b] : INT32_MAX;
+            }
+        }
+
+        // strixllama: block-key cache inputs. A cached block key goes stale only when one of the block's cells
+        // is written, and a write happens exactly when a ubatch token lands in the cell, so the blocks this
+        // ubatch completes are the full groups holding a cell whose (seq, pos) is a ubatch token.
+        if (kb) {
+            GGML_ASSERT(n_ns == 1 && !ranked && "qsa block-key cache: single stream, 1-D positions");
+            GGML_ASSERT(kb->bid_rows && kb->bid_rows->ne[0] == n_blocks && kb->bid_rows->data);
+            const int32_t scratch = (int32_t) kb_scratch_row();
+            int32_t * br = (int32_t *) kb->bid_rows->data;
+            for (int64_t b = 0; b < n_blocks; ++b) {
+                br[b] = b < n_bid ? bid_cell[b] : scratch;
+            }
+        }
+        // the dirty list exists only in incremental graphs (a full-rebuild graph reads no such input)
+        if (kb && kb->dirty_dst && kb->dirty_dst->data) {
+            const int64_t dirty_max = kb->dirty_dst->ne[0];
+            GGML_ASSERT(kb->dirty_cells->ne[0] == r*dirty_max && kb->dirty_pos->ne[0] == 4*dirty_max);
+            GGML_ASSERT(kb->dirty_cells->data && kb->dirty_pos->data);
+            const int32_t scratch = (int32_t) kb_scratch_row();
+
+            llama_pos pmin = ubatch->pos[0], pmax = ubatch->pos[0];
+            for (int64_t i = 1; i < n_tokens; ++i) {
+                pmin = std::min(pmin, ubatch->pos[i]);
+                pmax = std::max(pmax, ubatch->pos[i]);
+            }
+            std::vector<uint8_t> grp_dirty(grp_first.size(), 0);
+            for (int64_t j = 0; j < n_kv; ++j) {
+                const int32_t g = cell_grp[j];
+                if (g < 0 || grp_bid[g] < 0) { continue; }
+                const llama_pos p = cells.pos_get(j);
+                if (p < pmin || p > pmax) { continue; }
+                for (int64_t i = 0; i < n_tokens; ++i) {
+                    if (ubatch->pos[i] == p && cells.seq_has(j, ubatch->seq_id[i][0])) { grp_dirty[g] = 1; break; }
+                }
+            }
+
+            int32_t * dc = (int32_t *) kb->dirty_cells->data;
+            int32_t * dp = (int32_t *) kb->dirty_pos->data;
+            int32_t * dd = (int32_t *) kb->dirty_dst->data;
+            int64_t n_dirty = 0;
+            int64_t n_dirty_total = 0;
+            for (int32_t b = 0; b < n_bid; ++b) {
+                bool dirty = false;
+                for (int64_t slot = 0; slot < r; ++slot) {
+                    const int32_t g = cell_grp[cur_blk_cells[b*r + slot]];
+                    if (g >= 0 && grp_dirty[g]) { dirty = true; break; }
+                }
+                if (!dirty) { continue; }
+                ++n_dirty_total;
+                if (n_dirty >= dirty_max) { continue; }
+                for (int64_t slot = 0; slot < r; ++slot) { dc[n_dirty*r + slot] = cur_blk_cells[b*r + slot]; }
+                for (int64_t sec = 0; sec < 4; ++sec) { dp[sec*dirty_max + n_dirty] = dst_blk_pos[sec*n_blocks + b]; }
+                dd[n_dirty] = bid_cell[b];
+                ++n_dirty;
+            }
+            GGML_ASSERT(n_dirty_total <= dirty_max && "qsa block-key cache: more blocks completed than the graph can refresh");
+            for (int64_t d = n_dirty; d < dirty_max; ++d) {
+                for (int64_t slot = 0; slot < r; ++slot) { dc[d*r + slot] = (int32_t) std::min<int64_t>(slot, n_kv - 1); }
+                for (int64_t sec = 0; sec < 4; ++sec) { dp[sec*dirty_max + d] = 0; }
+                dd[d] = scratch;
             }
         }
 
@@ -758,17 +969,39 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        bool blk_bias) const {
+        bool blk_bias,
+        const llama_memory_hybrid_idx::qsa_kb_inputs * kb) const {
     GGML_ASSERT(mem != nullptr);
 
-    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, kb);
+}
+
+ggml_tensor * llama_memory_hybrid_idx_context::get_kb(int32_t il) const {
+    return mem ? mem->get_kb(il) : nullptr;
+}
+
+uint32_t llama_memory_hybrid_idx_context::kb_scratch_row() const {
+    return mem ? mem->kb_scratch_row() : 0;
+}
+
+bool llama_memory_hybrid_idx_context::kb_needs_full() const {
+    return mem ? mem->kb_needs_full() : false;
+}
+
+bool llama_memory_hybrid_idx_context::kb_pos_dup() const {
+    return mem ? mem->kb_pos_dup() : false;
+}
+
+void llama_memory_hybrid_idx_context::kb_mark_full() const {
+    if (mem) { mem->kb_mark_full(); }
 }
 
 void llama_memory_hybrid_idx_context::set_input_qsa_blocks(
         ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-        ggml_tensor * bias, ggml_tensor * tail_idxs, const llama_ubatch * ubatch, uint32_t ratio) const {
+        ggml_tensor * bias, ggml_tensor * tail_idxs, const llama_ubatch * ubatch, uint32_t ratio,
+        const llama_memory_hybrid_idx::qsa_kb_inputs * kb) const {
     GGML_ASSERT(mem != nullptr);
-    mem->set_input_qsa_blocks(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio);
+    mem->set_input_qsa_blocks(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, kb);
 }
 
 bool llama_memory_hybrid_idx_context::qsa_position_prefix(const llama_ubatch & ubatch) const {

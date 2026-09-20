@@ -711,6 +711,13 @@ struct llama_model {
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
+    // strixllama: decode-precision twins of the Q8_0 trunk (LLAMA_TRUNK_DECODE_Q6K=1). Built once the
+    // weights are loaded, in their own device buffers; the originals are untouched, so prefill keeps
+    // its numerics. build_lora_mm swaps a weight for its twin on batches of at most
+    // llama_decode_twin_max_tokens() tokens (LLAMA_TRUNK_DECODE_MAX_T, default 8).
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> decode_twins;
+    void build_decode_twins();
+
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 
@@ -779,6 +786,10 @@ protected:
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
+
+// strixllama: the decode twin of a trunk weight (null if none) and the batch bound under which it is used
+ggml_tensor * llama_decode_twin(const ggml_tensor * w);
+int64_t       llama_decode_twin_max_tokens();
 
 llama_model * llama_model_create(llm_arch arch, const llama_model_params & params);
 llama_model * llama_model_create(llama_model_loader & ml, const llama_model_params & params);

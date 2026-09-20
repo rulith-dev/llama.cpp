@@ -41,6 +41,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -1171,6 +1172,10 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
+    // strixllama: metadata contexts and device buffers of the decode twins (build_decode_twins)
+    std::vector<ggml_context_ptr>        twin_ctxs;
+    std::vector<ggml_backend_buffer_ptr> twin_bufs;
+
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
@@ -1188,6 +1193,117 @@ struct llama_model::impl {
     std::vector<float> tensor_split_owned;
 };
 
+// strixllama: process-wide twin table. The graph context has no pointer to its model, so
+// build_lora_mm looks weights up here; entries are removed when their model is destroyed.
+static std::mutex g_decode_twin_mutex;
+static std::unordered_map<const ggml_tensor *, ggml_tensor *> g_decode_twins;
+
+ggml_tensor * llama_decode_twin(const ggml_tensor * w) {
+    std::lock_guard<std::mutex> lock(g_decode_twin_mutex);
+    const auto it = g_decode_twins.find(w);
+    return it == g_decode_twins.end() ? nullptr : it->second;
+}
+
+int64_t llama_decode_twin_max_tokens() {
+    static const int64_t v = []() {
+        const char * e = getenv("LLAMA_TRUNK_DECODE_MAX_T");
+        return e ? (int64_t) atoll(e) : (int64_t) 8;
+    }();
+    return v;
+}
+
+// strixllama: LLAMA_TRUNK_DECODE_Q6K=1 builds a Q6_K copy of every 2-D Q8_0 weight (the trunk: attention,
+// delta-net, HC projections, shared experts, PLE key/value; token_embd excluded) in a device buffer of
+// its own. The copy is made with the same ggml_quantize_chunk that llama-quantize uses, so it is
+// byte-identical to a --tensor-type-file requant of the same tensors. Decode on this model streams
+// the trunk once per token at the memory-bandwidth wall; Q6_K reads 23% fewer bytes there (measured
+// -9% per token), while prefill keeps the Q8_0 originals, whose MMB path is faster. Costs the size of
+// the copies (2.9 GB on Qwen3.8-Flash-Next) and a few seconds at load.
+void llama_model::build_decode_twins() {
+    const char * e = getenv("LLAMA_TRUNK_DECODE_Q6K");
+    if (e == nullptr || atoi(e) == 0) {
+        return;
+    }
+    const ggml_type ttype = GGML_TYPE_Q6_K;
+    const int64_t t0 = ggml_time_us();
+
+    std::map<ggml_backend_buffer_type_t, std::vector<std::pair<std::string, ggml_tensor *>>> groups;
+    for (const auto & [name, t] : tensors_by_name) {
+        if (t == nullptr || t->type != GGML_TYPE_Q8_0 || !ggml_is_matrix(t) || t->buffer == nullptr) {
+            continue;
+        }
+        if (name == "token_embd.weight" || t->ne[0] % ggml_blck_size(ttype) != 0) {
+            continue;
+        }
+        groups[ggml_backend_buffer_get_type(t->buffer)].emplace_back(name, t);
+    }
+    if (groups.empty()) {
+        LLAMA_LOG_WARN("%s: LLAMA_TRUNK_DECODE_Q6K set but no 2-D Q8_0 weights found\n", __func__);
+        return;
+    }
+
+    size_t n_twins = 0, bytes = 0;
+    const int n_threads = std::max(1, std::min(16, (int) std::thread::hardware_concurrency()));
+    for (auto & [buft, list] : groups) {
+        ggml_init_params ip = { ggml_tensor_overhead() * (list.size() + 1), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        if (ctx == nullptr) {
+            throw std::runtime_error("failed to create decode twin context");
+        }
+        pimpl->twin_ctxs.emplace_back(ctx);
+        std::vector<std::pair<ggml_tensor *, ggml_tensor *>> pairs;
+        for (auto & [name, t] : list) {
+            ggml_tensor * twin = ggml_new_tensor_2d(ctx, ttype, t->ne[0], t->ne[1]);
+            ggml_format_name(twin, "%s.q6k", name.c_str());
+            pairs.emplace_back(t, twin);
+        }
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        if (buf == nullptr) {
+            throw std::runtime_error(format("failed to allocate decode twin buffer on %s", ggml_backend_buft_name(buft)));
+        }
+        pimpl->twin_bufs.emplace_back(buf);
+        bytes += ggml_backend_buffer_get_size(buf);
+
+        const auto * q8 = ggml_get_type_traits(GGML_TYPE_Q8_0);
+        for (auto & [t, twin] : pairs) {
+            const int64_t n_per_row = t->ne[0];
+            const int64_t nrows     = t->ne[1];
+            std::vector<uint8_t> src(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, src.data(), 0, src.size());
+            std::vector<float> f32((size_t) n_per_row * nrows);
+            q8->to_float(src.data(), f32.data(), (int64_t) f32.size());
+            std::vector<uint8_t> dst(ggml_nbytes(twin));
+            const int64_t rows_per_thread = (nrows + n_threads - 1) / n_threads;
+            std::vector<std::thread> workers;
+            for (int w = 0; w < n_threads; ++w) {
+                const int64_t first = w * rows_per_thread;
+                const int64_t count = std::min(rows_per_thread, nrows - first);
+                if (count <= 0) {
+                    break;
+                }
+                workers.emplace_back([&, first, count]() {
+                    ggml_quantize_chunk(ttype, f32.data(), dst.data(), first * n_per_row, count, n_per_row, nullptr);
+                });
+            }
+            for (auto & w : workers) {
+                w.join();
+            }
+            ggml_backend_tensor_set(twin, dst.data(), 0, dst.size());
+            decode_twins[t] = twin;
+            ++n_twins;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_decode_twin_mutex);
+        for (const auto & [t, twin] : decode_twins) {
+            g_decode_twins[t] = twin;
+        }
+    }
+    LLAMA_LOG_INFO("%s: %zu Q8_0 trunk tensors got %s decode twins (%.2f GiB, %d threads, %.1f s); used for batches of <= %lld tokens\n",
+            __func__, n_twins, ggml_type_name(ttype), bytes / 1024.0 / 1024.0 / 1024.0, n_threads,
+            (ggml_time_us() - t0) / 1e6, (long long) llama_decode_twin_max_tokens());
+}
+
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
@@ -1201,6 +1317,12 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
+    }
+    if (!decode_twins.empty()) {
+        std::lock_guard<std::mutex> lock(g_decode_twin_mutex);
+        for (const auto & [t, twin] : decode_twins) {
+            g_decode_twins.erase(t);
+        }
     }
 }
 
@@ -1860,10 +1982,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // strixllama: optional Q6_K decode copies of the Q8_0 trunk (LLAMA_TRUNK_DECODE_Q6K=1)
+    build_decode_twins();
+
     return true;
 }
 
-#ifndef _WIN32
 const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader & ml, const char * tensor_name, const ggml_tensor * t) {
     if (ml.lazy.mode != LLAMA_LAZY_MODE_DIRECT) {
         return nullptr;
@@ -1883,6 +2007,24 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader 
         return nullptr;
     }
 
+#ifdef _WIN32
+    const std::string & name = ml.files[w->idx]->name();
+    const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name.c_str(), -1, nullptr, 0);
+    if (size == 0) {
+        throw std::runtime_error("invalid UTF-8 path for lazy reader");
+    }
+    std::wstring wide(size, L'\0');
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name.c_str(), -1, wide.data(), size)) {
+        throw std::runtime_error("failed to convert lazy reader path");
+    }
+    const HANDLE fd = CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                  FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, nullptr);
+    if (fd == INVALID_HANDLE_VALUE) {
+        LLAMA_LOG_WARN("%s: Windows lazy reader open failed (%lu), using lazy mmap reads\n",
+                __func__, (unsigned long) GetLastError());
+        return nullptr;
+    }
+#else
     // an independently opened buffered descriptor: dup() would share the
     // loader's open file description, whose readahead advice and O_DIRECT
     // flag would fight the small scattered row reads
@@ -1897,6 +2039,8 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader 
     ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
 #endif
 
+#endif
+
     // in-flight reads are IO queue depth, not compute; 2x cores worked well
     // on NVMe and stays sane on smaller machines
     int n_threads = 2 * (int) std::max(1u, std::thread::hardware_concurrency());
@@ -1905,8 +2049,18 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader 
         if (v > 0 && v <= 4096) { n_threads = v; }
     }
 
-    auto reader = std::make_unique<llama_lazy_reader>(fd, w->offs,
-            ggml_row_size(t->type, t->ne[0]), t->ne[1], n_threads, t->type, t->ne[0]);
+    std::unique_ptr<llama_lazy_reader> reader;
+    try {
+        reader = std::make_unique<llama_lazy_reader>(fd, w->offs,
+                ggml_row_size(t->type, t->ne[0]), t->ne[1], n_threads, t->type, t->ne[0]);
+    } catch (...) {
+#ifdef _WIN32
+        CloseHandle(fd);
+#else
+        ::close(fd);
+#endif
+        throw;
+    }
 
     LLAMA_LOG_INFO("%s: direct reads enabled for %s: %" PRId64 " rows of %zu bytes at file offset %zu, %d threads\n",
             __func__, tensor_name, reader->n_rows, reader->row_size, w->offs, n_threads);
@@ -1914,14 +2068,7 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader 
     lazy_readers[tensor_name] = std::move(reader);
     return lazy_readers.at(tensor_name).get();
 }
-#else
-const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader & ml, const char *, const ggml_tensor *) {
-    if (ml.lazy.mode == LLAMA_LAZY_MODE_DIRECT) {
-        LLAMA_LOG_WARN("%s: --lazy-mode on-direct is not supported on this platform, using lazy mmap reads\n", __func__);
-    }
-    return nullptr;
-}
-#endif
+
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;

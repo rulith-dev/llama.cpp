@@ -2551,6 +2551,21 @@ common_speculative_init_result::common_speculative_init_result(
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
+    // strixllama: the draft also inherits the target's batch sizes, so its compute buffers grow with
+    // the target ubatch and can exceed the device carve on a unified-memory box. Cap the draft
+    // alone; unset leaves the upstream behaviour untouched.
+    if (const char * strixllama_draft_ub = getenv("STRIX_SPEC_DRAFT_UBATCH")) {
+        const int strixllama_ub = atoi(strixllama_draft_ub);
+        if (strixllama_ub > 0 && (uint32_t) strixllama_ub < cparams.n_ubatch) {
+            LOG_INF("%s: capping draft ubatch %u -> %d (STRIX_SPEC_DRAFT_UBATCH)\n",
+                    __func__, cparams.n_ubatch, strixllama_ub);
+            cparams.n_ubatch = (uint32_t) strixllama_ub;
+            if (cparams.n_batch < cparams.n_ubatch) {
+                cparams.n_batch = cparams.n_ubatch;
+            }
+        }
+    }
+
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;

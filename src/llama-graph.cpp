@@ -1524,7 +1524,15 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    // strixllama: decode-sized batches read the Q6_K twin of a Q8_0 trunk weight when one was built
+    // (LLAMA_TRUNK_DECODE_Q6K); larger batches, and the LoRA lookup below, keep the original
+    ggml_tensor * w_mm = w;
+    if (n_tokens <= llama_decode_twin_max_tokens()) {
+        if (ggml_tensor * twin = llama_decode_twin(w)) {
+            w_mm = twin;
+        }
+    }
+    ggml_tensor * res = ggml_mul_mat(ctx0, w_mm, cur);
 
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);

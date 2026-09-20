@@ -73,6 +73,10 @@ public:
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
 
+    // strixllama: layers this memory actually keeps state for; the layer filter can leave none (the MTP
+    // draft's hybrid-idx memory), and then the cell position bookkeeping has nothing to protect
+    uint32_t n_layer_recr = 0;
+
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 

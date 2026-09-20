@@ -38,6 +38,27 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// strixllama: CPU-side breakdown of one speculative pass (STRIX_SPEC_TIMING=1). A pass starts at the
+// draft call; the line printed there covers the previous pass: the draft (its llama_decode calls
+// included), the target decode, the catch-up decode inside common_speculative_process, the target
+// sampling in sample_and_accept_n, and whatever is left, which is server bookkeeping.
+struct strixllama_spec_timing {
+    static bool enabled() { static const bool e = getenv("STRIX_SPEC_TIMING") && atoi(getenv("STRIX_SPEC_TIMING")); return e; }
+    int64_t t_pass0 = 0, draft = 0, decode = 0, process = 0, sample = 0;
+    int n_batch_tokens = 0;
+    void begin_pass() {
+        const int64_t now = ggml_time_us();
+        if (t_pass0) {
+            const int64_t pass = now - t_pass0;
+            fprintf(stderr, "ST pass=%.1fms n=%d draft=%.1f decode=%.1f process=%.1f sample=%.1f other=%.1f\n",
+                    pass / 1000.0, n_batch_tokens, draft / 1000.0, decode / 1000.0, process / 1000.0, sample / 1000.0,
+                    (pass - draft - decode - process - sample) / 1000.0);
+        }
+        t_pass0 = now; draft = decode = process = sample = 0; n_batch_tokens = 0;
+    }
+};
+static strixllama_spec_timing g_spec_timing;
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -3042,9 +3063,13 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            const bool st = strixllama_spec_timing::enabled();
+            if (st) { g_spec_timing.begin_pass(); }
+            const int64_t t0 = st ? ggml_time_us() : 0;
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            if (st) { g_spec_timing.draft += ggml_time_us() - t0; }
         }
 
         // make checkpoints if needed
@@ -3678,12 +3703,15 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const bool st = strixllama_spec_timing::enabled();
+        const int64_t t_dec0 = st ? ggml_time_us() : 0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (st) { g_spec_timing.decode += ggml_time_us() - t_dec0; g_spec_timing.n_batch_tokens += batch_view.n_tokens; }
 
         if (ret != 0) {
             {
@@ -3743,9 +3771,11 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            const int64_t t_proc0 = st ? ggml_time_us() : 0;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
             });
+            if (st) { g_spec_timing.process += ggml_time_us() - t_proc0; }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -3912,11 +3942,13 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
+                const int64_t t_smp0 = strixllama_spec_timing::enabled() ? ggml_time_us() : 0;
                 auto accepted = synth_probs.empty()
                     ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
                     : server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                if (t_smp0) { g_spec_timing.sample += ggml_time_us() - t_smp0; }
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);

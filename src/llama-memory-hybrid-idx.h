@@ -2,6 +2,9 @@
 
 #include "llama-memory-hybrid.h"
 
+#include "ggml-cpp.h"
+
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -83,17 +86,53 @@ public:
     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
     // the caller then adds the attention mask, the only part of the bias that varies within a block
+    //
+    // strixllama: incremental block-key cache (LLAMA_QSA_BLOCK_KEY_CACHE, default on). The pooled, normed and
+    // rotated indexer key of a block depends only on its member cells and its position, so it is computed
+    // once, when a write completes the block, and kept in one F16 row per cell of the indexer cache (at the
+    // row of the block's first member cell) plus one scratch row. Before it, every graph rebuilt every block
+    // key from the raw cache: a full-context gather, pool, norm and rope per decoded token (10 ms at 97K).
+    //   dirty_cells I32 [ratio*dirty_max]  member cells of the blocks this ubatch completes (padded)
+    //   dirty_pos   I32 [4*dirty_max]      their mrope position rows, laid out like blk_pos
+    //   dirty_dst   I32 [dirty_max]        destination rows (padding writes the scratch row)
+    //   bid_rows    I32 [n_blocks]         row of every enumerated block, scratch row past n_bid
+    struct qsa_kb_inputs {
+        ggml_tensor * dirty_cells = nullptr;
+        ggml_tensor * dirty_pos   = nullptr;
+        ggml_tensor * dirty_dst   = nullptr;
+        ggml_tensor * bid_rows    = nullptr;
+    };
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       bool blk_bias, const qsa_kb_inputs * kb = nullptr) const;
     void set_input_qsa_blocks(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                              ggml_tensor * bias, ggml_tensor * tail_idxs,
-                             const llama_ubatch * ubatch, uint32_t ratio) const;
+                             const llama_ubatch * ubatch, uint32_t ratio, const qsa_kb_inputs * kb = nullptr) const;
+
+    ggml_tensor * get_kb(int32_t il) const;   // F16 [idx_dim, kv_size + 1]; null when off or no indexer on il
+    uint32_t      kb_scratch_row() const;     // the spare row: kv_size of the indexer cache
+    bool          kb_needs_full() const;      // positions moved (shift, restore, clear) since the last full write
+    void          kb_mark_full() const;
+    // strixllama: true once a ubatch with per-axis positions (an image under M-RoPE) has been written.
+    // Such cells repeat one position across the image, so set_input_qsa ranks cells instead of using
+    // the position, which the block-key cache cannot track - the graph must not wire the cache in.
+    bool          kb_pos_dup() const;
 
 private:
     void set_input_qsa_impl(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                             ggml_tensor * bias, ggml_tensor * tail_idxs,
-                            const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias) const;
+                            const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias,
+                            const qsa_kb_inputs * kb) const;
+
+    // strixllama: block-key cache storage, one tensor per indexer layer, in the layer's device buffer
+    std::vector<ggml_context_ptr>        kb_ctxs;
+    std::vector<ggml_backend_buffer_ptr> kb_bufs;
+    std::map<int32_t, ggml_tensor *>     kb_map;
+    uint64_t                             kb_gen      = 1;
+    mutable uint64_t                     kb_full_gen = 0;
+    // set in init_batch when an image ubatch or a position gap arrives, cleared only when every
+    // sequence is dropped - see kb_pos_dup() and the reset in seq_rm()
+    bool                                 kb_dup      = false;
 
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
@@ -152,10 +191,18 @@ public:
 
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       bool blk_bias, const llama_memory_hybrid_idx::qsa_kb_inputs * kb = nullptr) const;
     void set_input_qsa_blocks(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                              ggml_tensor * bias, ggml_tensor * tail_idxs,
-                             const llama_ubatch * ubatch, uint32_t ratio) const;
+                             const llama_ubatch * ubatch, uint32_t ratio,
+                             const llama_memory_hybrid_idx::qsa_kb_inputs * kb = nullptr) const;
+
+    // strixllama: block-key cache pass-throughs (see llama_memory_hybrid_idx)
+    ggml_tensor * get_kb(int32_t il) const;
+    uint32_t      kb_scratch_row() const;
+    bool          kb_needs_full() const;
+    void          kb_mark_full() const;
+    bool          kb_pos_dup() const;
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;

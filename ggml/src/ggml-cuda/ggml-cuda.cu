@@ -73,6 +73,8 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx, const 
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
+#include "ggml-cuda/strixllama-chain.cuh"
+#include "ggml-cuda/strixllama-getrows-cast.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
@@ -2083,7 +2085,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
-static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     if (ggml_cuda_mmb_marks_count() > 0 && dst->op != GGML_OP_MUL_MAT && dst->op != GGML_OP_MUL_MAT_ID && dst->op != GGML_OP_VIEW &&
             dst->op != GGML_OP_RESHAPE && dst->op != GGML_OP_PERMUTE && dst->op != GGML_OP_TRANSPOSE && dst->op != GGML_OP_NONE) {
         for (int s = 0; s < GGML_MAX_SRC && dst->src[s]; ++s) {
@@ -2578,6 +2580,32 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
+// strixllama ablation helper: which op classes STRIX_SKIP_OPS asks to replace by a zero fill
+static bool strixllama_skip_op(const ggml_tensor * node) {
+    static const std::vector<std::string> wanted = []() {
+        std::vector<std::string> v;
+        if (const char * e = getenv("STRIX_SKIP_OPS")) {
+            std::string cur;
+            for (const char * c = e; ; ++c) {
+                if (*c == ',' || *c == 0) { if (!cur.empty()) { v.push_back(cur); } cur.clear(); if (*c == 0) { break; } }
+                else { cur.push_back(*c); }
+            }
+            if (!v.empty()) { fprintf(stderr, "STRIX_SKIP_OPS: %zu op classes zero-filled instead of computed\n", v.size()); }
+        }
+        return v;
+    }();
+    if (wanted.empty()) { return false; }
+    const char * op = ggml_op_name(node->op);
+    for (const auto & w : wanted) {
+        const size_t colon = w.find(':');
+        if (colon == std::string::npos) { if (w == op) { return true; } continue; }
+        if (w.compare(0, colon, op) != 0) { continue; }
+        if (node->op == GGML_OP_UNARY && w.compare(colon + 1, std::string::npos, ggml_unary_op_name(ggml_get_unary_op(node))) == 0) { return true; }
+        if (node->op == GGML_OP_GLU && w.compare(colon + 1, std::string::npos, ggml_glu_op_name(ggml_get_glu_op(node))) == 0) { return true; }
+    }
+    return false;
+}
+
 static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
     return ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
@@ -2603,6 +2631,14 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 // the mul_mat_id fallback path synchronizes the stream, so we cannot use CUDA graphs
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
                 use_cuda_graph = false;
+                if (getenv("LLAMA_GRAPH_TRACE")) {   // the notice below is compiled out of a release build
+                    static unsigned strixllama_hits = 0;
+                    if (strixllama_hits++ < 4) {
+                        fprintf(stderr, "GRAPH_TRACE: graphs OFF, mul_mat_id needs sync: %s type=%s ne=[%lld,%lld,%lld]\n",
+                                node->name, ggml_type_name(node->src[0]->type),
+                                (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2]);
+                    }
+                }
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
@@ -2618,7 +2654,29 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    // strixllama: fold the graph's shape into the key. One context alternates between batch shapes on the
+    // same first node (the MTP draft's catch-up at 1+n_draft tokens then its draft steps at 1, the
+    // target at 1+n_draft), and keying on the first node alone made every switch look like a property
+    // change: warmup reset, the next graph run direct, the one after captured again. With the shape in
+    // the key each shape keeps its own instance and replays. The value is only ever a map key.
+    // STRIX_GRAPH_KEY_SHAPE=0 restores the first-node key.
+    static const bool by_shape = [] {
+        const char * e = getenv("STRIX_GRAPH_KEY_SHAPE");
+        return !e || atoi(e) != 0;
+    }();
+    if (!by_shape || cgraph->n_nodes == 0) {
+        return cgraph->nodes[0];
+    }
+    uint64_t h = (uint64_t) (uintptr_t) cgraph->nodes[0];
+    h ^= (uint64_t) cgraph->n_nodes * 0x9E3779B97F4A7C15ull;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * t = cgraph->nodes[i];
+        h = (h ^ (uint64_t) t->op) * 0x100000001B3ull;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            h = (h ^ (uint64_t) t->ne[d]) * 0x100000001B3ull;
+        }
+    }
+    return (const void *) (uintptr_t) h;
 }
 
 static ggml_cuda_graph::node_properties ggml_cuda_graph_node_props(const ggml_tensor * node) {
@@ -2646,10 +2704,9 @@ static bool ggml_cuda_graph_verify_uid() {
 }
 
 // see docs/development/backend-scheduler.md
-static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const void * graph_key) {
     bool res = false;
 
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (cgraph->uid != 0 &&
@@ -3158,6 +3215,19 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
 // The long form spans 2*k + 1 nodes. ggml_can_fuse_subgraph() accepts at most
 // 31 nodes, so k <= 15; larger values use the per-operation path.
 static constexpr int MOE_WEIGHTED_REDUCTION_MAX_EXPERTS = 15;
+
+// strixllama: set by the LLAMA_GRAPH_TRACE counter so the fusion skip site can report how many nodes
+// it swallowed; null whenever the trace is off
+static unsigned * g_strixllama_fused_away = nullptr;
+
+// strixllama: STRIX_NODE_TIMING=1 (needs GGML_CUDA_DISABLE_GRAPHS=1) brackets every dispatch with
+// stream events and prints the costliest nodes of each graph; see the report after the dispatch loop
+#if defined(GGML_USE_HIP) && !defined(cudaEventElapsedTime)
+#define cudaEventElapsedTime hipEventElapsedTime
+#endif
+static const bool g_strixllama_node_timing = getenv("STRIX_NODE_TIMING") != nullptr;
+static std::vector<cudaEvent_t> g_strixllama_ev0, g_strixllama_ev1;
+static std::vector<int> g_strixllama_ev_node;
 
 struct ggml_cuda_moe_weighted_reduction_match {
     const ggml_tensor * experts      = nullptr;
@@ -3752,6 +3822,23 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    // strixllama: the same runs but with SIGMOID, which is what this architecture gates with - a
+    // decode pass dispatches 195 SIGMOID and zero TANH, so the softcap rule above never fires.
+    // The fused kernel folds in both biases, so unlike softcap there is nothing to reject here.
+    if (unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID &&
+            ops.size() >= 2 && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY &&
+            (ops.size() == 2 || (ops.size() == 3 && ops.begin()[2] == GGML_OP_SCALE))) {
+        const ggml_tensor * scale = cgraph->nodes[node_idx];
+        const ggml_tensor * sig   = cgraph->nodes[node_idx + 1];
+        if (ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID) {
+            return false;
+        }
+        if (scale->src[0]->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32) {
+            return false;
+        }
+        return true;
+    }
+
     return false;
 }
 
@@ -3848,6 +3935,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_idx_relu_sum_args args;
         const int count = ggml_cuda_match_idx_relu_sum(cgraph, i, args);
         if (count > 0) { ggml_cuda_op_idx_relu_sum(*cuda_ctx, args); return count - 1; }
+    }
+
+    // strixllama: gather straight into F16 rather than through an F32 copy (strixllama-getrows-cast.cuh)
+    if (node->op == GGML_OP_GET_ROWS) {
+        if (const int skip = ggml_cuda_get_rows_cast_try(*cuda_ctx, cgraph, i)) {
+            return skip;
+        }
     }
 
     if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
@@ -4616,11 +4710,87 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // strixllama: try the triple before the pair, so a scale/sigmoid/scale run collapses to one
+    // launch rather than two. STRIX_NO_SIGMOID_FUSE=1 takes this path out without touching the
+    // IQ3_S kernel, which is how the two are told apart when hunting a numerics regression.
+    static const bool strixllama_sigmoid_fuse = !getenv("STRIX_NO_SIGMOID_FUSE");
+    if (strixllama_sigmoid_fuse &&
+        ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_SIGMOID })) {
+        ggml_cuda_op_scale_sigmoid(*cuda_ctx, cgraph->nodes[i + 2], node, /*post_scale =*/ true);
+        return 2;
+    }
+
+    if (strixllama_sigmoid_fuse &&
+        ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }, { GGML_UNARY_OP_SIGMOID })) {
+        ggml_cuda_op_scale_sigmoid(*cuda_ctx, cgraph->nodes[i + 1], node, /*post_scale =*/ false);
+        return 1;
+    }
+
+    // strixllama: consecutive elementwise chains (see strixllama-chain.cuh), tried after every specific pattern
+    if (const int chain = ggml_cuda_strixllama_chain_try(*cuda_ctx, cgraph, i)) {
+        return chain;
+    }
     return 0;
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
+
+    // strixllama: whether HIP graphs actually engage decides how much of a decode step is kernel
+    // launch overhead, and the upstream notice is a GGML_LOG_DEBUG compiled out of a release
+    // build. Report the first few graphs either way under LLAMA_GRAPH_TRACE=1.
+    if (getenv("LLAMA_GRAPH_TRACE")) {
+        static unsigned strixllama_calls = 0, strixllama_used = 0, strixllama_recaptured = 0;
+        ++strixllama_calls;
+        if (use_cuda_graph) { ++strixllama_used; }
+        if (use_cuda_graph && cuda_graph_update_required) { ++strixllama_recaptured; }
+        if (strixllama_calls % 64 == 0) {
+            fprintf(stderr, "GRAPH_TRACE: %u calls, graph used %u (%.0f%%), re-captured %u (%.0f%% of used), nodes=%d\n",
+                    strixllama_calls, strixllama_used, 100.0 * strixllama_used / strixllama_calls,
+                    strixllama_recaptured, strixllama_used ? 100.0 * strixllama_recaptured / strixllama_used : 0.0,
+                    cgraph->n_nodes);
+        }
+        // once: where the nodes go, since with graphs replaying properly the node COUNT is what a
+        // decode step costs (7325 nodes over 48 layers is ~153 per layer)
+        static bool strixllama_histogrammed = false;
+        if (!strixllama_histogrammed && cgraph->n_nodes > 1000 && getenv("LLAMA_GRAPH_DUMP")) {
+            // LLAMA_GRAPH_DUMP=<n>: print the op and name of nodes [n, n+220), enough to read one
+            // layer's chain and see which elementwise runs are fusable
+            const int from = atoi(getenv("LLAMA_GRAPH_DUMP"));
+            for (int i = from; i < cgraph->n_nodes && i < from + 220; ++i) {
+                const ggml_tensor * t = cgraph->nodes[i];
+                char strixllama_op[48];
+                if (t->op == GGML_OP_UNARY) {
+                    snprintf(strixllama_op, sizeof(strixllama_op), "UNARY:%s", ggml_unary_op_name(ggml_get_unary_op(t)));
+                } else {
+                    snprintf(strixllama_op, sizeof(strixllama_op), "%s", ggml_op_name(t->op));
+                }
+                fprintf(stderr, "GRAPH_DUMP %4d %-16s %-28s ne=[%lld,%lld,%lld]%s\n", i,
+                        strixllama_op, t->name,
+                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2],
+                        ggml_cuda_is_view_or_noop(t) ? "  (view/noop)" : "");
+            }
+        }
+        if (!strixllama_histogrammed && cgraph->n_nodes > 1000) {
+            strixllama_histogrammed = true;
+            int counts[GGML_OP_COUNT] = {0}, skipped = 0;
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                if (ggml_cuda_is_view_or_noop(cgraph->nodes[i])) { ++skipped; continue; }
+                ++counts[cgraph->nodes[i]->op];
+            }
+            fprintf(stderr, "GRAPH_TRACE: node census of %d (%d are views/noops):\n", cgraph->n_nodes, skipped);
+            for (int pass = 0; pass < 14; ++pass) {   // print the 14 biggest, descending
+                int best = -1;
+                for (int op = 0; op < GGML_OP_COUNT; ++op) {
+                    if (counts[op] > 0 && (best < 0 || counts[op] > counts[best])) { best = op; }
+                }
+                if (best < 0) { break; }
+                fprintf(stderr, "GRAPH_TRACE:   %-24s %5d  (%.1f per layer)\n",
+                        ggml_op_name((ggml_op) best), counts[best], counts[best] / 48.0);
+                counts[best] = 0;
+            }
+        }
+    }
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -4751,6 +4921,50 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 prev_i = i;
 
+                // strixllama: the graph's node count is NOT the kernel count - views and noops are
+                // skipped and fusions swallow whole runs. Count what actually dispatches, since
+                // that is what a decode step pays for.
+                if (getenv("LLAMA_GRAPH_TRACE")) {
+                    static unsigned strixllama_passes = 0, strixllama_dispatch = 0, strixllama_fused_away = 0, strixllama_views = 0;
+                    static unsigned strixllama_by_op[GGML_OP_COUNT] = {0};
+                    static unsigned strixllama_by_unary[GGML_UNARY_OP_COUNT] = {0};
+                    if (i == 0) {
+                        if (strixllama_passes == 1) {      // report the second pass: the first still captures
+                            fprintf(stderr, "GRAPH_TRACE: per pass - %u dispatched, %u swallowed by fusions, %u views/noops, %d nodes\n",
+                                    strixllama_dispatch, strixllama_fused_away, strixllama_views, cgraph->n_nodes);
+                            unsigned tmp[GGML_OP_COUNT];
+                            memcpy(tmp, strixllama_by_op, sizeof(tmp));
+                            for (int pass = 0; pass < 12; ++pass) {   // the 12 biggest DISPATCHED ops
+                                int best = -1;
+                                for (int op = 0; op < GGML_OP_COUNT; ++op) {
+                                    if (tmp[op] > 0 && (best < 0 || tmp[op] > tmp[best])) { best = op; }
+                                }
+                                if (best < 0) { break; }
+                                fprintf(stderr, "GRAPH_TRACE:   dispatched %-18s %5u  (%.1f per layer)\n",
+                                        ggml_op_name((ggml_op) best), tmp[best], tmp[best] / 48.0);
+                                tmp[best] = 0;
+                            }
+                            for (int u = 0; u < GGML_UNARY_OP_COUNT; ++u) {   // UNARY hides its real op
+                                if (strixllama_by_unary[u]) {
+                                    fprintf(stderr, "GRAPH_TRACE:     unary %-16s %5u  (%.1f per layer)\n",
+                                            ggml_unary_op_name((ggml_unary_op) u), strixllama_by_unary[u],
+                                            strixllama_by_unary[u] / 48.0);
+                                }
+                            }
+                        }
+                        ++strixllama_passes;
+                        strixllama_dispatch = strixllama_fused_away = strixllama_views = 0;
+                        memset(strixllama_by_op, 0, sizeof(strixllama_by_op));
+                        memset(strixllama_by_unary, 0, sizeof(strixllama_by_unary));
+                    }
+                    if (ggml_cuda_is_view_or_noop(node)) { ++strixllama_views; }
+                    else {
+                        ++strixllama_dispatch; ++strixllama_by_op[node->op];
+                        if (node->op == GGML_OP_UNARY) { ++strixllama_by_unary[ggml_get_unary_op(node)]; }
+                    }
+                    g_strixllama_fused_away = &strixllama_fused_away;
+                }
+
                 if (ggml_cuda_is_view_or_noop(node)) {
                     continue;
                 }
@@ -4758,6 +4972,28 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                     continue;
                 }
+
+                // strixllama ablation: STRIX_SKIP_OPS=SCALE,UNARY,UNARY:SIGMOID,... replaces those nodes by a
+                // zero fill so the per-token cost of an op class can be measured (output is garbage)
+                if (strixllama_skip_op(node)) {
+                    CUDA_CHECK(cudaMemsetAsync(node->data, 0, ggml_nbytes(node), cuda_ctx->stream()));
+                    continue;
+                }
+
+                // strixllama: STRIX_NODE_TIMING=1 (with GGML_CUDA_DISABLE_GRAPHS=1) brackets every dispatch,
+                // fused or not, with stream events; the top entries are printed after the graph
+                if (g_strixllama_node_timing) {
+                    cudaEvent_t e; CUDA_CHECK(cudaEventCreateWithFlags(&e, 0)); CUDA_CHECK(cudaEventRecord(e, cuda_ctx->stream()));
+                    g_strixllama_ev0.push_back(e); g_strixllama_ev_node.push_back(i);
+                }
+                struct strixllama_timing_close {
+                    bool on; ggml_backend_cuda_context * ctx;
+                    ~strixllama_timing_close() {
+                        if (!on) { return; }
+                        cudaEvent_t e; CUDA_CHECK(cudaEventCreateWithFlags(&e, 0)); CUDA_CHECK(cudaEventRecord(e, ctx->stream()));
+                        g_strixllama_ev1.push_back(e);
+                    }
+                } strixllama_timing_guard{g_strixllama_node_timing, cuda_ctx};
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
@@ -4768,6 +5004,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
+                    if (g_strixllama_fused_away) { *g_strixllama_fused_away += nodes_to_skip; }
                     i += nodes_to_skip;
                     continue;
                 }
@@ -4797,6 +5034,46 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
+            }
+
+            // strixllama: per-node timing report (STRIX_NODE_TIMING=1)
+            if (g_strixllama_node_timing && !g_strixllama_ev0.empty() && g_strixllama_ev0.size() == g_strixllama_ev1.size()) {
+                CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                struct row { float ms; int node; };
+                std::vector<row> rows;
+                float total = 0.0f;
+                for (size_t k = 0; k < g_strixllama_ev0.size(); ++k) {
+                    float ms = 0.0f;
+                    CUDA_CHECK(cudaEventElapsedTime(&ms, g_strixllama_ev0[k], g_strixllama_ev1[k]));
+                    rows.push_back({ms, g_strixllama_ev_node[k]});
+                    total += ms;
+                    CUDA_CHECK(cudaEventDestroy(g_strixllama_ev0[k]));
+                    CUDA_CHECK(cudaEventDestroy(g_strixllama_ev1[k]));
+                }
+                // aggregate by op + shape so the 48 copies of a layer op add up
+                std::map<std::string, std::pair<float, int>> by_kind;
+                for (const row & r : rows) {
+                    const ggml_tensor * t = cgraph->nodes[r.node];
+                    char key[256];
+                    snprintf(key, sizeof(key), "%-18s %-12s [%lld,%lld,%lld,%lld]", ggml_op_name(t->op),
+                             t->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(t)) : (t->op == GGML_OP_GLU ? ggml_glu_op_name(ggml_get_glu_op(t)) : ""),
+                             (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
+                    auto & e = by_kind[key];
+                    e.first += r.ms; e.second += 1;
+                }
+                std::vector<std::pair<std::string, std::pair<float, int>>> agg(by_kind.begin(), by_kind.end());
+                std::sort(agg.begin(), agg.end(), [](const auto & a, const auto & b) { return a.second.first > b.second.first; });
+                fprintf(stderr, "NODE_TIMING: graph of %d nodes, %zu dispatches, %.2f ms of GPU time; top kinds:\n", cgraph->n_nodes, rows.size(), total);
+                for (size_t k = 0; k < agg.size() && k < 24; ++k) {
+                    fprintf(stderr, "  %8.3f ms %4d x %s\n", agg[k].second.first, agg[k].second.second, agg[k].first.c_str());
+                }
+                std::sort(rows.begin(), rows.end(), [](const row & a, const row & b) { return a.ms > b.ms; });
+                for (size_t k = 0; k < rows.size() && k < 6; ++k) {
+                    const ggml_tensor * t = cgraph->nodes[rows[k].node];
+                    fprintf(stderr, "  single: %8.3f ms %s '%s' [%lld,%lld,%lld,%lld]\n", rows[k].ms, ggml_op_name(t->op), t->name,
+                            (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
+                }
+                g_strixllama_ev0.clear(); g_strixllama_ev1.clear(); g_strixllama_ev_node.clear();
             }
         }
 
@@ -4890,7 +5167,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
         }
         if (graph_compatible) {
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph, graph_key);
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call

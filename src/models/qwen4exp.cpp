@@ -834,6 +834,17 @@ static bool qwen4exp_use_block_selection(bool blk_bias, int64_t n_stream, int64_
         !hparams.attn_soft_cap && hparams.n_embd_head_k()==256 && hparams.n_embd_head_v()==256;
 }
 
+// the mrope sections make every ubatch "2-D" (n_pos > 1); text has all rows equal, images do not
+static bool qwen4exp_pos_scalar(const llama_ubatch & ubatch) {
+    if (!ubatch.pos || ubatch.n_tokens == 0) { return false; }
+    for (uint32_t axis = 1; axis < ubatch.n_pos; ++axis) {
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (ubatch.pos[i + axis*ubatch.n_tokens] != ubatch.pos[i]) { return false; }
+        }
+    }
+    return true;
+}
+
 static bool qwen4exp_qsa_flag(const char *name) {
     const char *value=getenv(name);
     return value && atoi(value)!=0;
@@ -887,10 +898,18 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
+        llama_memory_hybrid_idx::qsa_kb_inputs kb;
+        kb.dirty_cells = kb_dirty_cells; kb.dirty_pos = kb_dirty_pos; kb.dirty_dst = kb_dirty_dst; kb.bid_rows = kb_bid_rows;
+        const auto * kbp = kb_bid_rows ? &kb : nullptr;
         if (tail_idxs) {
-            mctx->set_input_qsa_blocks(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio);
+            mctx->set_input_qsa_blocks(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, kbp);
         } else {
-            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, kbp);
+        }
+        // a graph that rewrites every block key refreshes the cache when it runs, not when it is built:
+        // llama_context::graph_reserve builds graphs that never execute
+        if (kbp && kb_full) {
+            mctx->kb_mark_full();
         }
     }
 
@@ -922,7 +941,8 @@ public:
         res &= (tail_idxs != nullptr) == blocks;
         const bool scalar=blocks && params.hparams.n_swa==0 && mctx->qsa_scalar_visibility(params.ubatch);
         res &= compact == (scalar && qwen4exp_qsa_flag("LLAMA_QSA_COMPACT_METADATA"));
-        res &= maskless == (scalar && qwen4exp_qsa_flag("LLAMA_QSA_NO_DENSE_MASK"));
+        res &= maskless == (scalar && qwen4exp_qsa_flag("LLAMA_QSA_NO_DENSE_MASK") &&
+                params.ubatch.n_tokens/n_stream >= 128);
         if (tail_idxs) { res &= tail_idxs->ne[1] == params.ubatch.n_tokens/n_stream; }
         // [QSA_SCORE_BOUNDS] the trimmed widths are baked into the graph, so a reused graph must agree on them
         const int64_t next_strip=qwen4exp_query_strip(params.ubatch.n_tokens/n_stream,n_stream);
@@ -930,9 +950,26 @@ public:
                 params.hparams.indexer_top_k/ratio,scalar && compact);
         res &= score_strip==next_strip;
         res &= score_key_limits==next_limits;
+        // strixllama: block-key cache shapes and mode are baked into the graph
+        // the block-key cache is wired in only while no image cells are present, so a graph built
+        // before one arrived cannot be reused after (it would take the ranked path and abort)
+        res &= kb_dup == mctx->kb_pos_dup();
+        if (kb_bid_rows) {
+            res &= kb_full == mctx->kb_needs_full();
+            res &= kb_bid_rows->ne[0] == n_blocks;
+            if (kb_dirty_dst) { res &= kb_dirty_dst->ne[0] == params.ubatch.n_tokens/n_stream/ratio + 4; }
+        }
 
         return res;
     }
+
+    // strixllama: block-key cache inputs (null when the cache is off); kb_full = this graph rebuilds every key
+    ggml_tensor * kb_dirty_cells = nullptr;   // I32 [ratio*dirty_max, 1]
+    ggml_tensor * kb_dirty_pos   = nullptr;   // I32 [4*dirty_max]
+    ggml_tensor * kb_dirty_dst   = nullptr;   // I32 [dirty_max]
+    ggml_tensor * kb_bid_rows    = nullptr;   // I32 [n_blocks]
+    bool          kb_full        = false;
+    bool          kb_dup         = false;     // the memory held image cells when this graph was built
 
     // per stream: a cell index names a different token in each stream
     ggml_tensor * k_idxs    = nullptr;   // I32 [n_tokens]
@@ -1079,7 +1116,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const bool scalar = qwen4exp_use_block_selection(blk_bias,n_stream,r,n_kv,ubatch,cparams,hparams) &&
             hparams.n_swa==0 && mctx_hyb->qsa_scalar_visibility(ubatch);
         qsa->compact = scalar && qwen4exp_qsa_flag("LLAMA_QSA_COMPACT_METADATA");
-        qsa->maskless = scalar && qwen4exp_qsa_flag("LLAMA_QSA_NO_DENSE_MASK");
+        // strixllama: only the qsa3 kernel honours the indices without a mask, and it declines batches under
+        // 128 queries. On HIP the generic flash-attention kernels ignore the indices (sparse gather is
+        // CUDA-only), so a maskless op there runs dense attention over the whole batch with no causal
+        // mask: every query of a multi-token decode batch sees the tokens after it. That is exactly the
+        // MTP verification batch (2-4 tokens), whose target logits then see the drafts they are meant to
+        // check. Keep the mask for anything the qsa3 kernel will not take.
+        qsa->maskless = scalar && qwen4exp_qsa_flag("LLAMA_QSA_NO_DENSE_MASK") && n_tps >= 128;
         qsa->score_strip=qwen4exp_query_strip(n_tps,n_stream);
         qsa->score_key_limits=qwen4exp_score_key_limits(mctx_hyb,ubatch,n_blocks,qsa->score_strip,r,
                 hparams.indexer_top_k/r,qsa->compact);
@@ -1094,6 +1137,29 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             GGML_ASSERT(hparams.indexer_top_k % r == 0);
             qsa->tail_idxs=ggml_new_tensor_3d(ctx0,GGML_TYPE_I32,r-1,n_tps,n_stream);
             ggml_set_input(qsa->tail_idxs);
+        }
+        // strixllama: block-key cache inputs (llama_memory_hybrid_idx::qsa_kb_inputs); single stream, 1-D
+        // positions only. qwen4exp_pos_scalar covers this ubatch; kb_pos_dup covers the cells already
+        // in the cache, because an image written earlier makes set_input_qsa rank cells even for a
+        // later text ubatch, and the cache cannot track ranked cells (it asserts !ranked).
+        qsa->kb_dup = mctx_hyb->kb_pos_dup();
+        if (mctx_hyb->get_kb(il) != nullptr && n_stream == 1 && qwen4exp_pos_scalar(ubatch) &&
+                !qsa->kb_dup) {
+            const int64_t dirty_max = n_tps/r + 4;
+            // an input no node reads is never allocated, so a full-rebuild graph gets only the rows tensor
+            qsa->kb_full        = mctx_hyb->kb_needs_full();
+            qsa->kb_bid_rows    = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_blocks);
+            if (!qsa->kb_full) {
+                qsa->kb_dirty_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*dirty_max, 1);
+                qsa->kb_dirty_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*dirty_max);
+                qsa->kb_dirty_dst   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, dirty_max);
+            }
+            ggml_set_input(qsa->kb_bid_rows);
+            if (!qsa->kb_full) {
+                ggml_set_input(qsa->kb_dirty_cells);
+                ggml_set_input(qsa->kb_dirty_pos);
+                ggml_set_input(qsa->kb_dirty_dst);
+            }
         }
 
         inp = qsa.get();
@@ -1112,31 +1178,48 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
     k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
 
-    // gathers per stream: blk_cells row s indexes stream s's own cells
-    ggml_tensor * members = ggml_get_rows(ctx0, k_all, inp->blk_cells);
-    members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
+    // r member keys -> one mean-pooled, normed, rotated key per block (rope wants [n_dims, n_head, n_tokens])
+    // the block count along ne1: rms_norm launches gridDim.y = ne2, capped at 65535, and 262144/4 = 65536
+    auto build_block_keys = [&](ggml_tensor * cells_idx, ggml_tensor * pos_idx, int64_t nb_out) -> ggml_tensor * {
+        ggml_tensor * members = ggml_get_rows(ctx0, k_all, cells_idx);
+        members = ggml_reshape_4d(ctx0, members, idx_dim, r, nb_out, n_stream);
+        ggml_tensor * pk = nullptr;
+        for (int64_t i = 0; i < r; ++i) {
+            ggml_tensor * slice = ggml_cont(ctx0,
+                    ggml_view_3d(ctx0, members, idx_dim, nb_out, n_stream,
+                            members->nb[2], members->nb[3], i*members->nb[1]));
+            pk = pk ? ggml_add(ctx0, pk, slice) : slice;
+        }
+        pk = ggml_scale(ctx0, pk, 1.0f/(float) r);
+        pk = ggml_reshape_3d(ctx0, pk, idx_dim, nb_out*n_stream, 1);
+        pk = build_norm(pk, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
+        pk = ggml_reshape_3d(ctx0, pk, idx_dim, 1, nb_out*n_stream);
+        pk = ggml_rope_multi(ctx0, pk, pos_idx, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        return ggml_reshape_3d(ctx0, pk, idx_dim, nb_out, n_stream);
+    };
 
-    // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
+    // strixllama: with the block-key cache only the blocks this ubatch completes are built and stored; the
+    // scorer gathers every enumerated block's key from the cache. Without it (or on the first graph after
+    // positions moved) every block is rebuilt from the raw keys and, if the cache exists, written to it.
+    ggml_tensor * kb_raw = inp->kb_bid_rows ? mctx_hyb->get_kb(il) : nullptr;
+    // wrap the externally owned cache in a ctx0 view, as the KV cache does through get_k()
+    ggml_tensor * kb = kb_raw ? ggml_view_2d(ctx0, kb_raw, kb_raw->ne[0], kb_raw->ne[1], kb_raw->nb[1], 0) : nullptr;
     ggml_tensor * pooled = nullptr;
-    for (int64_t i = 0; i < r; ++i) {
-        ggml_tensor * slice = ggml_cont(ctx0,
-                ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
-                        members->nb[2], members->nb[3], i*members->nb[1]));
-        pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
+    if (kb && !inp->kb_full) {
+        const int64_t dirty_max = inp->kb_dirty_dst->ne[0];
+        ggml_tensor * fresh = build_block_keys(inp->kb_dirty_cells, inp->kb_dirty_pos, dirty_max);
+        cb(fresh, "indexer_kb_fresh", il);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, kb, ggml_reshape_2d(ctx0, fresh, idx_dim, dirty_max), inp->kb_dirty_dst));
+        pooled = ggml_get_rows(ctx0, kb, inp->kb_bid_rows);
+        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
+    } else {
+        pooled = build_block_keys(inp->blk_cells, inp->blk_pos, n_blocks);
+        if (kb) {
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, kb, ggml_reshape_2d(ctx0, pooled, idx_dim, n_blocks), inp->kb_bid_rows));
+        }
     }
-    pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
-    cb(pooled, "indexer_k_pooled", il);
-
-    // count blocks along ne1: rms_norm launches gridDim.y = ne2, capped at 65535, and 262144/4 = 65536
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks*n_stream, 1);
-    pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
-
-    // rope wants [n_dims, n_head, n_tokens]: lay every stream's blocks flat, split after.
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_blocks*n_stream);
-    pooled = ggml_rope_multi(ctx0, pooled, inp->blk_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
     cb(pooled, "indexer_k", il);
 
     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
@@ -1267,6 +1350,60 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     return top_k;
 }
 
+// strixllama: decode-side sparse attention by gathering.
+//
+// The qsa3 kernel is the only one that honours the block indices, and it needs the packed K/V layout
+// that qwen4exp builds only for batches of >= 128 tokens; every other kernel ignores src[5] and reads
+// the whole cache. So a single decoded token attends densely over the entire context - 15.6 ms of a
+// 58 ms token at 97K (results/hip-rocm101-20260917.json, decode_node_timing_97k_20260918).
+//
+// For a decode-sized batch the selection is small and fixed (indexer_top_k + ratio - 1 = 2051 cells),
+// so it is cheaper to materialise it: gather those cells out of the cache into a compact K/V and run
+// the ordinary flash-attention kernel over 2051 keys instead of 97512. The selection carries -1 for
+// "no cell" (block-graph.inc), which becomes a -inf mask entry, and the gather length is padded to a
+// multiple of FATTN_KQ_STRIDE with the same -inf so every kernel variant can take it.
+//
+// This makes decode sparse, which is what the model intends and what prefill already does; it is not
+// bit-identical to the dense decode it replaces.
+static ggml_tensor * qwen4exp_gather_attn(ggml_context * ctx0, ggml_tensor * q, ggml_tensor * k,
+        ggml_tensor * v, ggml_tensor * top_k, int64_t n_query, float kq_scale) {
+    const int64_t head_k  = k->ne[0];
+    const int64_t n_head_kv = k->ne[1];
+    const int64_t width   = top_k->ne[0];
+    const int64_t n_sel   = (width + 255) & ~255;   // FATTN_KQ_STRIDE
+
+    // [head_k, n_head_kv, n_kv] -> [head_k*n_head_kv, n_kv], so a cell is one row
+    ggml_tensor * k2d = ggml_view_2d(ctx0, k, head_k*n_head_kv, k->ne[2], k->nb[2], 0);
+    ggml_tensor * v2d = ggml_view_2d(ctx0, v, v->ne[0]*v->ne[1], v->ne[2], v->nb[2], 0);
+
+    ggml_tensor * out = nullptr;
+    for (int64_t qi = 0; qi < n_query; ++qi) {
+        ggml_tensor * idx = ggml_cont(ctx0, ggml_view_2d(ctx0, top_k, width, 1, top_k->nb[1], qi*top_k->nb[1]));
+
+        // shift by one so "no cell" (-1) becomes 0 and the zero padding means the same thing
+        ggml_tensor * shifted = ggml_pad(ctx0, ggml_scale_bias(ctx0, ggml_cast(ctx0, idx, GGML_TYPE_F32), 1.0f, 1.0f),
+                (int) (n_sel - width), 0, 0, 0);
+        ggml_tensor * valid = ggml_step(ctx0, shifted);
+        ggml_tensor * rows  = ggml_cast(ctx0, ggml_relu(ctx0, ggml_scale_bias(ctx0, shifted, 1.0f, -1.0f)), GGML_TYPE_I32);
+        ggml_tensor * mask  = ggml_cast(ctx0, ggml_log(ctx0, valid), GGML_TYPE_F16);   // 0 where selected, -inf elsewhere
+        mask = ggml_cont(ctx0, ggml_reshape_4d(ctx0, mask, n_sel, 1, 1, 1));
+
+        ggml_tensor * kg = ggml_cast(ctx0, ggml_get_rows(ctx0, k2d, rows), GGML_TYPE_F16);
+        ggml_tensor * vg = ggml_cast(ctx0, ggml_get_rows(ctx0, v2d, rows), GGML_TYPE_F16);
+        kg = ggml_permute(ctx0, ggml_reshape_3d(ctx0, kg, head_k,    n_head_kv, n_sel), 0, 2, 1, 3);
+        vg = ggml_permute(ctx0, ggml_reshape_3d(ctx0, vg, v->ne[0], n_head_kv, n_sel), 0, 2, 1, 3);
+
+        // q is [head_k, n_head_q, n_query]; one query at a time, laid out as the kernel wants
+        ggml_tensor * q1 = ggml_permute(ctx0, ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], 1,
+                q->nb[1], q->nb[2], qi*q->nb[2]), 0, 2, 1, 3);
+
+        ggml_tensor * cur = ggml_flash_attn_ext(ctx0, q1, kg, vg, mask, kq_scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+        out = out ? ggml_concat(ctx0, out, cur, 2) : cur;
+    }
+    return out;
+}
+
 // Dense GQA self-attention restricted to the cells that top_k names.
 // The mask build below copies the MLA sparse path in llm_graph_context::build_attn.
 ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
@@ -1390,8 +1527,31 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         //ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
         const char * sparse_env = getenv("LLAMA_QSA_SPARSE");
         const int64_t n_kv_max = sparse_env && atoi(sparse_env) != 0 ? top_k->ne[0] : 0;
+        // strixllama: decode-sized batches gather the selected cells instead of reading the whole cache
+        static const bool gather_on = []() {
+            const char * e = getenv("LLAMA_QSA_DECODE_GATHER");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        static const int64_t gather_max_t = []() {
+            const char * e = getenv("LLAMA_QSA_DECODE_GATHER_MAX_T");
+            return e ? (int64_t) atoll(e) : (int64_t) 8;
+        }();
+        const bool gather = gather_on && n_query <= gather_max_t && n_stream == 1 &&
+            cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap &&
+            k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && v->nb[1] <= v->nb[2] &&
+            q->ne[0] == 256 &&
+            // only worth it when the selection is a real reduction: gathering 2304 of 2329 cells costs
+            // more than reading them in place (measured 42.9 vs 41.1 ms/token at 2.3K context)
+            2*(((top_k->ne[0] + 255) & ~255)) <= k->ne[2];
+
         ggml_tensor * cur;
-        if (direct_indices) {
+        if (gather) {
+            ggml_tensor * idx = ggml_is_contiguous(top_k) ? top_k : ggml_cont(ctx0, top_k);
+            cur = qwen4exp_gather_attn(ctx0, q, k, v, idx, n_query, kq_scale);
+            // same layout the other branches hand to qwen4exp_append_strip: [head_v*n_head_q, n_query]
+            cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+            ggml_build_forward_expand(gf, cur);
+        } else if (direct_indices) {
             GGML_ASSERT(q->ne[0] == 256 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
             const bool v_trans = v->nb[1] > v->nb[2];
             ggml_tensor * q_view = ggml_permute(ctx0, q, 0, 2, 1, 3);
@@ -1738,7 +1898,7 @@ public:
 
 // Prefetch hook: the chunk-boundary stall is the PLE row gather (257k-393k scattered 90-byte reads, ~300 ms with the
 // GPU idle). Given the whole batch up front we can compute the same row indices and warm the page cache for them while
-// the previous chunk is still on the GPU. It only calls posix_fadvise, so a wrong prediction costs nothing but readahead.
+// the previous chunk is still on the GPU. Prefetch only warms the file cache; it does not change gathered rows.
 void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_token * tokens, int32_t n_tokens) {
     if (!tokens || n_tokens < 4096) { return; }
     const auto & pmodel = static_cast<const llama_model_qwen4exp &>(model_base);
@@ -1750,7 +1910,7 @@ void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_token * t
     const int64_t eos = hp.ple_eos_token_id, n_prev = n_gram - 1;
     if (n_heads <= 0 || n_gram < 2) { return; }
     std::vector<llama_token> toks(tokens, tokens + n_tokens);
-    std::thread([&pmodel, toks = std::move(toks), n_gram, n_heads, per_gram, eos, n_prev, &hp]() {
+    auto prefetch = [reader = pmodel.ple_reader, toks = std::move(toks), n_gram, n_heads, per_gram, eos, n_prev, hp]() {
         const int64_t n = (int64_t) toks.size();
         std::vector<int32_t> idx((size_t) n_heads * n);
         std::vector<int64_t> ctx(n_gram);
@@ -1773,8 +1933,13 @@ void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_token * t
                 }
             }
         }
-        pmodel.ple_reader->prefetch(idx.data(), (int64_t) idx.size());
-    }).detach();
+        reader->prefetch(idx.data(), (int64_t) idx.size());
+    };
+#ifdef _WIN32
+    pmodel.ple_reader->launch_prefetch(std::move(prefetch));
+#else
+    std::thread(std::move(prefetch)).detach();
+#endif
 }
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {

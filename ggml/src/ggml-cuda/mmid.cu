@@ -185,6 +185,14 @@ static constexpr int MM_IDS_ROUTE_BITS = 10;
 static constexpr int MM_IDS_ROUTE_EXPERTS = 512;
 static constexpr int MM_IDS_ROUTE_USED = 10;
 
+// strixllama 2026-09-17: a counting sort was tried here, following halogen CHANGELOG 0.5.3 ("expert
+// ordering produced by general-purpose sort...counted out directly instead", reported +4.6% at 8k
+// and +8.1% at 32k). On this kernel it LOST: 904.26 and, with the expert ids cached in LDS so
+// global memory is read once, 906.35 pp16384 against 946.06 for the bitonic sort below (3 reps,
+// perplexity identical at 2.3786 either way). The atomic cursor in the scatter serialises threads
+// landing on one expert and the 512-wide scan costs more than the sort it replaces - the bitonic
+// version runs entirely in LDS with no atomics at all, which suits 1024 elements. Reverted; the
+// gain halogen saw must come from their own engine's ordering code, not from this shape.
 static __global__ void mm_ids_route_sort(
         const int32_t * ids, uint32_t * sorted, int32_t * offsets, int32_t * starts,
         int routes, int chunks, int ids_stride) {
