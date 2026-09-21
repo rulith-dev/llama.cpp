@@ -1,10 +1,22 @@
 static ggml_tensor * qwen4exp_apply_compact_visibility(ggml_context *ctx,ggml_tensor *score,
-        ggml_tensor *limits,int64_t blocks,int64_t first,int64_t queries) {
+        ggml_tensor *limits,int64_t blocks,int64_t first,int64_t queries,
+        ggml_tensor *seq_blk=nullptr,ggml_tensor *seq_tok=nullptr) {
     GGML_ASSERT(limits->type==GGML_TYPE_I32 && score->ne[0]<=blocks && score->ne[1]==queries && score->ne[2]==1);
     auto *starts=ggml_cast(ctx,ggml_view_1d(ctx,limits,score->ne[0],0),GGML_TYPE_F32);
     auto *tails=ggml_cast(ctx,ggml_view_1d(ctx,limits,queries,(blocks+first)*sizeof(int32_t)),GGML_TYPE_F32);
     tails=ggml_reshape_2d(ctx,tails,1,queries);
     auto *visible=ggml_step(ctx,ggml_sub(ctx,ggml_repeat(ctx,tails,score),starts));
+    if (seq_blk) {
+        // strixllama: several sequences in the ubatch - a block is visible only to the sequence that owns it.
+        // membership = seq_blk^T seq_tok is exactly 0 or 1 per (block, token); f16 for the key side so the
+        // product takes the same kernel as the indexer score (an f32 x f32 mul_mat is not exercised here)
+        GGML_ASSERT(seq_tok && seq_blk->ne[0]==seq_tok->ne[0] && seq_blk->ne[1]>=score->ne[0] && seq_tok->ne[1]>=first+queries);
+        const int64_t n_slots=seq_blk->ne[0];
+        auto *blk=ggml_cast(ctx,ggml_view_2d(ctx,seq_blk,n_slots,score->ne[0],seq_blk->nb[1],0),GGML_TYPE_F16);
+        auto *tok=ggml_view_2d(ctx,seq_tok,n_slots,queries,seq_tok->nb[1],first*seq_tok->nb[1]);
+        auto *member=ggml_mul_mat(ctx,blk,tok);
+        visible=ggml_mul(ctx,visible,ggml_step(ctx,ggml_scale_bias(ctx,member,1.0f,-0.5f)));
+    }
     return ggml_add(ctx,score,ggml_log(ctx,visible));
 }
 

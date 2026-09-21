@@ -10,6 +10,7 @@
 #include "llama-model.h"
 
 #include <algorithm>
+#include <bitset>
 #include <cassert>
 #include <cmath>
 #include <iterator>
@@ -214,25 +215,38 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
         //     common_speculative_impl_draft_mtp::process() skips embedding batches, so the draft never
         //     stores the image's tokens and every later position is shifted past its cell.
         {
+            // strixllama: per token and per sequence. A ubatch that serves several slots at once
+            // (unified cache, equal-length split) carries tokens of several sequences, so its first
+            // and last tokens belong to different sequences; comparing them as one made the flag
+            // trip on any multi-stream decode, and it is sticky, so the block-key cache then stayed
+            // off for every sequence, single streams included (measured: ROPE and GET_ROWS over
+            // every block of the pool back in each step, 8% slower single-stream decode).
             std::map<llama_seq_id, llama_pos> next_pos;
             for (const auto & ub : ubatches) {
                 if (hybrid_idx_ubatch_pos_dup(ub)) {
                     kb_dup = true;
                     break;
                 }
-                if (ub.n_tokens == 0 || !ub.pos || !ub.seq_id || !ub.seq_id[0]) {
+                if (ub.n_tokens == 0 || !ub.pos || !ub.seq_id) {
                     continue;
                 }
-                const llama_seq_id s  = ub.seq_id[0][0];
-                const auto         it = next_pos.find(s);
-                const llama_pos    expect = it != next_pos.end()
-                    ? it->second
-                    : get_mem_attn()->seq_pos_max(s) + 1;
-                if (ub.pos[0] > expect) {
+                bool gap = false;
+                for (uint32_t i = 0; i < ub.n_tokens && !gap; ++i) {
+                    if (!ub.seq_id[i]) {
+                        continue;
+                    }
+                    const llama_seq_id s  = ub.seq_id[i][0];
+                    const auto         it = next_pos.find(s);
+                    const llama_pos    expect = it != next_pos.end()
+                        ? it->second
+                        : get_mem_attn()->seq_pos_max(s) + 1;
+                    gap = ub.pos[i] > expect;
+                    next_pos[s] = ub.pos[i] + 1;
+                }
+                if (gap) {
                     kb_dup = true;
                     break;
                 }
-                next_pos[s] = ub.pos[ub.n_tokens - 1] + 1;
             }
         }
 
@@ -425,8 +439,8 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
 void llama_memory_hybrid_idx::set_input_qsa_blocks(
         ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-        ggml_tensor * bias, ggml_tensor * tail_idxs, const llama_ubatch * ubatch, uint32_t ratio, const qsa_kb_inputs * kb) const {
-    set_input_qsa_impl(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, true, kb);
+        ggml_tensor * bias, ggml_tensor * tail_idxs, const llama_ubatch * ubatch, uint32_t ratio, const qsa_kb_inputs * kb, const qsa_mixed_inputs * mixed) const {
+    set_input_qsa_impl(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, true, kb, mixed);
 }
 
 void llama_memory_hybrid_idx::set_input_qsa_impl(
@@ -438,7 +452,8 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
         const llama_ubatch * ubatch,
         uint32_t ratio,
         bool blk_bias,
-        const qsa_kb_inputs * kb) const {
+        const qsa_kb_inputs * kb,
+        const qsa_mixed_inputs * mixed) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
 
@@ -471,9 +486,19 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
     const bool compact = bias->type == GGML_TYPE_I32;
     float * dst_bias = compact ? nullptr : (float *) bias->data;
     int32_t * limits = compact ? (int32_t *) bias->data : nullptr;
+    // strixllama: several sequences in one compact ubatch - the membership inputs carry the sequence half
+    const bool mixed_seqs = compact && mixed != nullptr && mixed->seq_blk != nullptr && mixed->seq_tok != nullptr;
     if (compact) {
         GGML_ASSERT(tail_idxs && blk_bias && n_ns == 1 && ggml_nelements(bias) == n_blocks+n_tps);
-        for (int64_t i=0;i<n_tokens;++i) { GGML_ASSERT(ubatch->seq_id[i][0] == ubatch->seq_id[0][0]); }
+        if (mixed_seqs) {
+            GGML_ASSERT(ubatch->seq_idx && ubatch->seq_id_unq && ubatch->n_seqs_unq >= 1);
+            GGML_ASSERT(mixed->seq_blk->type == GGML_TYPE_F32 && mixed->seq_tok->type == GGML_TYPE_F32);
+            GGML_ASSERT(mixed->seq_blk->ne[0] == ubatch->n_seqs_unq && mixed->seq_blk->ne[1] == n_blocks);
+            GGML_ASSERT(mixed->seq_tok->ne[0] == ubatch->n_seqs_unq && mixed->seq_tok->ne[1] == n_tps);
+            GGML_ASSERT(mixed->seq_blk->data && mixed->seq_tok->data);
+        } else {
+            for (int64_t i=0;i<n_tokens;++i) { GGML_ASSERT(ubatch->seq_id[i][0] == ubatch->seq_id[0][0]); }
+        }
     }
     int32_t * dst_tail = tail_idxs ? (int32_t *) tail_idxs->data : nullptr;
     if (tail_idxs) {
@@ -717,7 +742,26 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
         if (compact) {
             const llama_seq_id seq = ubatch->seq_id[0][0];
             for (int64_t b=0;b<n_blocks;++b) {
-                limits[b] = b<n_bid && cells.seq_has((uint32_t)bid_cell[b],seq) ? bid_idx[b] : INT32_MAX;
+                // with several sequences the position half stays per block and the ownership goes to seq_blk
+                limits[b] = b<n_bid && (mixed_seqs || cells.seq_has((uint32_t)bid_cell[b],seq)) ? bid_idx[b] : INT32_MAX;
+            }
+            if (mixed_seqs) {
+                const int64_t n_slots = mixed->seq_blk->ne[0];
+                float * sb = (float *) mixed->seq_blk->data;
+                float * st = (float *) mixed->seq_tok->data;
+                std::fill(sb, sb + n_slots*n_blocks, 0.0f);
+                std::fill(st, st + n_slots*n_tps,    0.0f);
+                for (int32_t b = 0; b < n_bid; ++b) {
+                    const auto & owners = cells.seq_get_all((uint32_t) bid_cell[b]);
+                    for (int64_t sl = 0; sl < n_slots; ++sl) {
+                        if (owners.test(ubatch->seq_id_unq[sl])) { sb[b*n_slots + sl] = 1.0f; }
+                    }
+                }
+                for (int64_t ii = 0; ii < n_tps; ++ii) {
+                    const int32_t sl = ubatch->seq_idx[ubatch->seq_id[ii][0]];
+                    GGML_ASSERT(sl >= 0 && sl < n_slots);
+                    st[ii*n_slots + sl] = 1.0f;
+                }
             }
         }
 
@@ -999,9 +1043,10 @@ void llama_memory_hybrid_idx_context::kb_mark_full() const {
 void llama_memory_hybrid_idx_context::set_input_qsa_blocks(
         ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
         ggml_tensor * bias, ggml_tensor * tail_idxs, const llama_ubatch * ubatch, uint32_t ratio,
-        const llama_memory_hybrid_idx::qsa_kb_inputs * kb) const {
+        const llama_memory_hybrid_idx::qsa_kb_inputs * kb,
+        const llama_memory_hybrid_idx::qsa_mixed_inputs * mixed) const {
     GGML_ASSERT(mem != nullptr);
-    mem->set_input_qsa_blocks(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, kb);
+    mem->set_input_qsa_blocks(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, kb, mixed);
 }
 
 bool llama_memory_hybrid_idx_context::qsa_position_prefix(const llama_ubatch & ubatch) const {
@@ -1017,18 +1062,30 @@ bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch &
     if (get_n_stream()!=1 || !get_idx() || !ubatch.token || !embd_ok || !ubatch.pos || !ubatch.n_tokens ||
             !ubatch.n_pos || !ubatch.seq_id || !ubatch.n_seq_id) { return false; }
     if (ubatch.n_seq_id[0]<1 || !ubatch.seq_id[0]) { return false; }
+    // strixllama: several sequences in one ubatch are fine (set_input_qsa_impl's membership inputs carry
+    // which sequence owns a block) as long as every token names exactly one and no image or gap has
+    // been written: those cells need the ranked enumeration, which only a single-sequence ubatch gets.
     const llama_seq_id seq=ubatch.seq_id[0][0];
+    std::bitset<LLAMA_MAX_SEQ> seqs;
     for (uint32_t i=0;i<ubatch.n_tokens;++i) {
-        if (ubatch.n_seq_id[i]<1 || !ubatch.seq_id[i] || ubatch.seq_id[i][0]!=seq ||
+        if (ubatch.n_seq_id[i]<1 || !ubatch.seq_id[i] || ubatch.seq_id[i][0]<0 || ubatch.seq_id[i][0]>=LLAMA_MAX_SEQ ||
                 ubatch.pos[i]<0 || ubatch.pos[i]>=16777216) { return false; }
+        if (ubatch.seq_id[i][0]!=seq && ubatch.n_seq_id[i]!=1) { return false; }
+        seqs.set(ubatch.seq_id[i][0]);
         for (uint32_t axis=1;axis<ubatch.n_pos;++axis) {
             if (ubatch.pos[i+axis*ubatch.n_tokens]!=ubatch.pos[i]) { return false; }
+        }
+    }
+    if (seqs.count()>1) {
+        if (mem->kb_pos_dup() || !ubatch.seq_idx || !ubatch.seq_id_unq || ubatch.n_seqs_unq!=seqs.count()) { return false; }
+        for (uint32_t i=0;i<ubatch.n_tokens;++i) {
+            if (ubatch.n_seq_id[i]!=1 || ubatch.seq_idx[ubatch.seq_id[i][0]]<0) { return false; }
         }
     }
     if (ubatch.is_pos_2d()) {
         const auto & cells=mem->get_mem_idx()->get_cells(seq);
         for (uint32_t j=0;j<get_idx()->get_n_kv();++j) {
-            if (!cells.is_empty(j) && cells.seq_has(j,seq) && cells.ext_get(j).is_2d_gt(cells.pos_get(j),cells.pos_get(j))) { return false; }
+            if (!cells.is_empty(j) && (cells.seq_get_all(j) & seqs).any() && cells.ext_get(j).is_2d_gt(cells.pos_get(j),cells.pos_get(j))) { return false; }
         }
     }
     return true;

@@ -902,7 +902,9 @@ public:
         kb.dirty_cells = kb_dirty_cells; kb.dirty_pos = kb_dirty_pos; kb.dirty_dst = kb_dirty_dst; kb.bid_rows = kb_bid_rows;
         const auto * kbp = kb_bid_rows ? &kb : nullptr;
         if (tail_idxs) {
-            mctx->set_input_qsa_blocks(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, kbp);
+            llama_memory_hybrid_idx::qsa_mixed_inputs mx;
+            mx.seq_blk = seq_blk; mx.seq_tok = seq_tok;
+            mctx->set_input_qsa_blocks(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, kbp, seq_blk ? &mx : nullptr);
         } else {
             mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, kbp);
         }
@@ -943,6 +945,12 @@ public:
         res &= compact == (scalar && qwen4exp_qsa_flag("LLAMA_QSA_COMPACT_METADATA"));
         res &= maskless == (scalar && qwen4exp_qsa_flag("LLAMA_QSA_NO_DENSE_MASK") &&
                 params.ubatch.n_tokens/n_stream >= 128);
+        // strixllama: the membership inputs exist for a compact ubatch of several sequences, sized by their count
+        res &= (seq_blk != nullptr) == (compact && params.ubatch.n_seqs_unq > 1);
+        if (seq_blk) {
+            res &= seq_blk->ne[0] == params.ubatch.n_seqs_unq && seq_blk->ne[1] == n_blocks;
+            res &= seq_tok->ne[0] == params.ubatch.n_seqs_unq && seq_tok->ne[1] == params.ubatch.n_tokens/n_stream;
+        }
         if (tail_idxs) { res &= tail_idxs->ne[1] == params.ubatch.n_tokens/n_stream; }
         // [QSA_SCORE_BOUNDS] the trimmed widths are baked into the graph, so a reused graph must agree on them
         const int64_t next_strip=qwen4exp_query_strip(params.ubatch.n_tokens/n_stream,n_stream);
@@ -957,7 +965,7 @@ public:
         if (kb_bid_rows) {
             res &= kb_full == mctx->kb_needs_full();
             res &= kb_bid_rows->ne[0] == n_blocks;
-            if (kb_dirty_dst) { res &= kb_dirty_dst->ne[0] == params.ubatch.n_tokens/n_stream/ratio + 4; }
+            if (kb_dirty_dst) { res &= kb_dirty_dst->ne[0] == params.ubatch.n_tokens/n_stream/ratio + 2*(int64_t) params.ubatch.n_seqs_unq + 2; }
         }
 
         return res;
@@ -979,6 +987,9 @@ public:
     ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
 
     ggml_tensor * tail_idxs = nullptr;
+    // strixllama: several sequences in a compact ubatch (llama_memory_hybrid_idx::qsa_mixed_inputs)
+    ggml_tensor * seq_blk = nullptr;   // F32 [n_seqs_unq, n_blocks]
+    ggml_tensor * seq_tok = nullptr;   // F32 [n_seqs_unq, n_tokens/n_stream]
     bool compact = false;
     bool maskless = false;
     int64_t score_strip = 0;
@@ -1138,6 +1149,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             qsa->tail_idxs=ggml_new_tensor_3d(ctx0,GGML_TYPE_I32,r-1,n_tps,n_stream);
             ggml_set_input(qsa->tail_idxs);
         }
+        // strixllama: a compact ubatch of several sequences (unified cache, several slots decoding or
+        // prefilling in one step) carries the block ownership as membership inputs; this is what keeps
+        // the mixed-sequence graph - the reserve graph included - off the dense n_kv x n_tokens mask
+        if (qsa->compact && ubatch.n_seqs_unq > 1) {
+            qsa->seq_blk = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, ubatch.n_seqs_unq, n_blocks);
+            qsa->seq_tok = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, ubatch.n_seqs_unq, n_tps);
+            ggml_set_input(qsa->seq_blk);
+            ggml_set_input(qsa->seq_tok);
+        }
         // strixllama: block-key cache inputs (llama_memory_hybrid_idx::qsa_kb_inputs); single stream, 1-D
         // positions only. qwen4exp_pos_scalar covers this ubatch; kb_pos_dup covers the cells already
         // in the cache, because an image written earlier makes set_input_qsa rank cells even for a
@@ -1145,7 +1165,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         qsa->kb_dup = mctx_hyb->kb_pos_dup();
         if (mctx_hyb->get_kb(il) != nullptr && n_stream == 1 && qwen4exp_pos_scalar(ubatch) &&
                 !qsa->kb_dup) {
-            const int64_t dirty_max = n_tps/r + 4;
+            // strixllama: a ubatch of several sequences can complete up to two blocks per sequence
+            const int64_t dirty_max = n_tps/r + 2*(int64_t) ubatch.n_seqs_unq + 2;
             // an input no node reads is never allocated, so a full-rebuild graph gets only the rows tensor
             qsa->kb_full        = mctx_hyb->kb_needs_full();
             qsa->kb_bid_rows    = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_blocks);
@@ -1304,7 +1325,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
         // one value per block, so it is cheaper to bias here than after the cells are expanded
         if (inp->compact) {
-            score = qwen4exp_apply_compact_visibility(ctx0,score,inp->bias,n_blocks,first,n_query);
+            score = qwen4exp_apply_compact_visibility(ctx0,score,inp->bias,n_blocks,first,n_query,inp->seq_blk,inp->seq_tok);
         } else if (blk_bias) {
             score = ggml_add(ctx0, score, bias);
         }
@@ -1363,8 +1384,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 // "no cell" (block-graph.inc), which becomes a -inf mask entry, and the gather length is padded to a
 // multiple of FATTN_KQ_STRIDE with the same -inf so every kernel variant can take it.
 //
+// All queries go through one gather and one flash-attention call: the queries sit on the kernel's
+// sequence axis (ne[3]), each with its own K/V slab and mask row, so the node count does not grow
+// with the batch. That is what lets a ubatch that serves several slots (4 streams x 4 verify tokens
+// = 16 queries) stay on this path instead of falling back to dense attention over the whole pool.
+// The gathered rows stay f16: ggml_get_rows only offers an f32 result, which doubled the traffic
+// (read f16, write f32, read f32, write f16) - the CUDA kernel casts to whatever the destination
+// is, so the node is built here with an f16 destination.
+//
 // This makes decode sparse, which is what the model intends and what prefill already does; it is not
 // bit-identical to the dense decode it replaces.
+static ggml_tensor * qwen4exp_get_rows_f16(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b) {
+    GGML_ASSERT(a->type == GGML_TYPE_F16 && b->type == GGML_TYPE_I32 && b->ne[1] == 1 && b->ne[2] == 1 && b->ne[3] == 1);
+    ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, a->ne[0], b->ne[0]);
+    result->op     = GGML_OP_GET_ROWS;
+    result->src[0] = a;
+    result->src[1] = b;
+    return result;
+}
+
 static ggml_tensor * qwen4exp_gather_attn(ggml_context * ctx0, ggml_tensor * q, ggml_tensor * k,
         ggml_tensor * v, ggml_tensor * top_k, int64_t n_query, float kq_scale) {
     const int64_t head_k  = k->ne[0];
@@ -1372,36 +1410,37 @@ static ggml_tensor * qwen4exp_gather_attn(ggml_context * ctx0, ggml_tensor * q, 
     const int64_t width   = top_k->ne[0];
     const int64_t n_sel   = (width + 255) & ~255;   // FATTN_KQ_STRIDE
 
+    GGML_ASSERT(ggml_is_contiguous(top_k) && top_k->ne[1] >= n_query);
+
     // [head_k, n_head_kv, n_kv] -> [head_k*n_head_kv, n_kv], so a cell is one row
     ggml_tensor * k2d = ggml_view_2d(ctx0, k, head_k*n_head_kv, k->ne[2], k->nb[2], 0);
     ggml_tensor * v2d = ggml_view_2d(ctx0, v, v->ne[0]*v->ne[1], v->ne[2], v->nb[2], 0);
 
-    ggml_tensor * out = nullptr;
-    for (int64_t qi = 0; qi < n_query; ++qi) {
-        ggml_tensor * idx = ggml_cont(ctx0, ggml_view_2d(ctx0, top_k, width, 1, top_k->nb[1], qi*top_k->nb[1]));
+    // every query's selection at once: [width, n_query] -> [n_sel, n_query]
+    ggml_tensor * idx = ggml_view_2d(ctx0, top_k, width, n_query, top_k->nb[1], 0);
 
-        // shift by one so "no cell" (-1) becomes 0 and the zero padding means the same thing
-        ggml_tensor * shifted = ggml_pad(ctx0, ggml_scale_bias(ctx0, ggml_cast(ctx0, idx, GGML_TYPE_F32), 1.0f, 1.0f),
-                (int) (n_sel - width), 0, 0, 0);
-        ggml_tensor * valid = ggml_step(ctx0, shifted);
-        ggml_tensor * rows  = ggml_cast(ctx0, ggml_relu(ctx0, ggml_scale_bias(ctx0, shifted, 1.0f, -1.0f)), GGML_TYPE_I32);
-        ggml_tensor * mask  = ggml_cast(ctx0, ggml_log(ctx0, valid), GGML_TYPE_F16);   // 0 where selected, -inf elsewhere
-        mask = ggml_cont(ctx0, ggml_reshape_4d(ctx0, mask, n_sel, 1, 1, 1));
+    // shift by one so "no cell" (-1) becomes 0 and the zero padding means the same thing
+    ggml_tensor * shifted = ggml_pad(ctx0, ggml_scale_bias(ctx0, ggml_cast(ctx0, idx, GGML_TYPE_F32), 1.0f, 1.0f),
+            (int) (n_sel - width), 0, 0, 0);
+    ggml_tensor * valid = ggml_step(ctx0, shifted);
+    ggml_tensor * rows  = ggml_cast(ctx0, ggml_relu(ctx0, ggml_scale_bias(ctx0, shifted, 1.0f, -1.0f)), GGML_TYPE_I32);
+    rows = ggml_reshape_1d(ctx0, rows, n_sel*n_query);
+    ggml_tensor * mask  = ggml_cast(ctx0, ggml_log(ctx0, valid), GGML_TYPE_F16);   // 0 where selected, -inf elsewhere
+    mask = ggml_cont(ctx0, ggml_reshape_4d(ctx0, mask, n_sel, 1, 1, n_query));
 
-        ggml_tensor * kg = ggml_cast(ctx0, ggml_get_rows(ctx0, k2d, rows), GGML_TYPE_F16);
-        ggml_tensor * vg = ggml_cast(ctx0, ggml_get_rows(ctx0, v2d, rows), GGML_TYPE_F16);
-        kg = ggml_permute(ctx0, ggml_reshape_3d(ctx0, kg, head_k,    n_head_kv, n_sel), 0, 2, 1, 3);
-        vg = ggml_permute(ctx0, ggml_reshape_3d(ctx0, vg, v->ne[0], n_head_kv, n_sel), 0, 2, 1, 3);
+    // one K/V slab per query on the sequence axis: [head, n_sel, n_head_kv, n_query]
+    ggml_tensor * kg = qwen4exp_get_rows_f16(ctx0, k2d, rows);
+    ggml_tensor * vg = qwen4exp_get_rows_f16(ctx0, v2d, rows);
+    kg = ggml_permute(ctx0, ggml_reshape_4d(ctx0, kg, head_k,    n_head_kv, n_sel, n_query), 0, 2, 1, 3);
+    vg = ggml_permute(ctx0, ggml_reshape_4d(ctx0, vg, v->ne[0], n_head_kv, n_sel, n_query), 0, 2, 1, 3);
 
-        // q is [head_k, n_head_q, n_query]; one query at a time, laid out as the kernel wants
-        ggml_tensor * q1 = ggml_permute(ctx0, ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], 1,
-                q->nb[1], q->nb[2], qi*q->nb[2]), 0, 2, 1, 3);
+    // q is [head_k, n_head_q, n_query]; one query per sequence, laid out as the kernel wants
+    ggml_tensor * q4 = ggml_permute(ctx0, ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], 1, n_query,
+            q->nb[1], q->nb[2], q->nb[2], 0), 0, 2, 1, 3);
 
-        ggml_tensor * cur = ggml_flash_attn_ext(ctx0, q1, kg, vg, mask, kq_scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
-        out = out ? ggml_concat(ctx0, out, cur, 2) : cur;
-    }
-    return out;
+    ggml_tensor * cur = ggml_flash_attn_ext(ctx0, q4, kg, vg, mask, kq_scale, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+    return cur;   // [head_v, n_head_q, 1, n_query]
 }
 
 // Dense GQA self-attention restricted to the cells that top_k names.
@@ -1532,9 +1571,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
             const char * e = getenv("LLAMA_QSA_DECODE_GATHER");
             return e != nullptr && atoi(e) != 0;
         }();
+        // 32 covers eight slots verifying a draft of 3 each; above that the gather reads more than it saves
         static const int64_t gather_max_t = []() {
             const char * e = getenv("LLAMA_QSA_DECODE_GATHER_MAX_T");
-            return e ? (int64_t) atoll(e) : (int64_t) 8;
+            return e ? (int64_t) atoll(e) : (int64_t) 32;
         }();
         const bool gather = gather_on && n_query <= gather_max_t && n_stream == 1 &&
             cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap &&
