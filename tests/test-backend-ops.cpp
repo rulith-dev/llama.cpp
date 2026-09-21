@@ -11202,6 +11202,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // strixllama: this model's expert matmuls (Qwen3.8-Flash-Next UD-IQ4_XS: 512 experts, 10 used,
+    // n_embd 2560, n_ff_exp 640; gate/up IQ3_S, down IQ4_NL) at decode-sized batches, plus the same
+    // shapes in other quants, to tell the dequant's cost from the bytes' cost. STRIX_MOE_PERF=1.
+    if (const char * moe = getenv("STRIX_MOE_PERF")) {
+        std::vector<int> ns = {1, 4, 8, 16, 32};
+        if (strchr(moe, ',') || atoi(moe) > 1) {           // STRIX_MOE_PERF=8,16,24,32,48,64
+            ns.clear();
+            for (const char * c = moe; *c; ) { ns.push_back(atoi(c)); c = strchr(c, ','); if (!c) break; ++c; }
+        }
+        for (int n : ns) {
+            for (ggml_type t : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+                test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 512, 10, false, 640, n, 2560));   // gate / up
+            }
+            for (ggml_type t : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+                test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));   // down
+            }
+        }
+        return test_cases;
+    }
     for (int kv : {2048, 40704, 40960, 101120, 101376}) {
         for (int width : {1, 2, 3}) {
             test_cases.emplace_back(new test_get_rows_packed(GGML_TYPE_F32, width, kv / 4, kv, 1, 1, 0, 2, true));

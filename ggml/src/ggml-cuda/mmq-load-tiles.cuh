@@ -1396,15 +1396,33 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 #pragma unroll
         for (int l = 0; l < QR3_S; ++l) {
+#if defined(GGML_USE_HIP) && defined(AMD_WMMA_AVAILABLE)
+            // strixllama: the LDS copy of the grid that mul_mat_q_process_tile fills right after the x tile
+            const uint32_t * grid = (const uint32_t *) (x_qs + I*sram_stride);
+            const int2 grid_pos = make_int2(
+                grid[qs[2*l+0] | ((qh << (8 - 2*l)) & 0x100)],
+                grid[qs[2*l+1] | ((qh << (7 - 2*l)) & 0x100)]);
+#else
             const int2 grid_pos = make_int2(
                 iq3s_grid[qs[2*l+0] | ((qh << (8 - 2*l)) & 0x100)],
                 iq3s_grid[qs[2*l+1] | ((qh << (7 - 2*l)) & 0x100)]);
+#endif // GGML_USE_HIP && AMD_WMMA_AVAILABLE
 
+#if defined(GGML_USE_HIP)
+            // strixllama: __vcmpne4 and __vsub4 are byte loops on HIP, and this runs once per 8 weights of
+            // every tile. The grid magnitudes are odd and positive (1..15), so a negated byte is
+            // (255 - g) + 1 with no carry out of the byte: xor with the byte mask, add 1 in the masked bytes.
+            const uint32_t m0 = strixllama_iq3s_sign_mask(signs_packed_8[l] & 0x0F);
+            const uint32_t m1 = strixllama_iq3s_sign_mask(signs_packed_8[l] >> 4);
+            const int grid_l = (int) ((((uint32_t) grid_pos.x) ^ m0) + (m0 & 0x01010101u));
+            const int grid_h = (int) ((((uint32_t) grid_pos.y) ^ m1) + (m1 & 0x01010101u));
+#else
             const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
             const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);
 
             const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
             const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+#endif // GGML_USE_HIP
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
             x_qs[i*sram_stride + 8*kqsx + (2*l+0)] = grid_l;

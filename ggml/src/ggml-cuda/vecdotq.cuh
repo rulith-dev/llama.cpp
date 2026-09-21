@@ -1205,11 +1205,12 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
 }
 
 #if defined(GGML_USE_HIP)
-// strixllama: 0xFF in byte i when sign bit i is set, for the 4-weight halves of an IQ3_S sign byte
-static __device__ const uint32_t strixllama_iq3s_sign_mask[16] = {
-    0x00000000u, 0x000000FFu, 0x0000FF00u, 0x0000FFFFu, 0x00FF0000u, 0x00FF00FFu, 0x00FFFF00u, 0x00FFFFFFu,
-    0xFF000000u, 0xFF0000FFu, 0xFF00FF00u, 0xFF00FFFFu, 0xFFFF0000u, 0xFFFF00FFu, 0xFFFFFF00u, 0xFFFFFFFFu,
-};
+// strixllama: 0xFF in byte i when sign bit i of the 4-bit half `s4` is set, for the 4-weight halves of
+// an IQ3_S sign byte. Two multiplies and an and, no table: s4 * 0x00204081 puts bit i at position
+// 8*i (plus stray copies the mask removes), and * 0xFF spreads each kept bit over its byte.
+static __device__ __forceinline__ uint32_t strixllama_iq3s_sign_mask(const uint32_t s4) {
+    return ((s4 * 0x00204081u) & 0x01010101u) * 0xFFu;
+}
 #endif
 
 #define VDR_IQ3_S_Q8_1_MMVQ 2
@@ -1241,8 +1242,8 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
 #if defined(GGML_USE_HIP)
         // strixllama: __vcmpne4 / __vsub4 are byte loops on HIP. The grid magnitudes are positive, so split
         // each word by the sign mask and take two native dp4a instead: identical integer result.
-        const uint32_t m0 = strixllama_iq3s_sign_mask[signs_packed_8[l0/2] & 0x0F];
-        const uint32_t m1 = strixllama_iq3s_sign_mask[signs_packed_8[l0/2] >> 4];
+        const uint32_t m0 = strixllama_iq3s_sign_mask(signs_packed_8[l0/2] & 0x0F);
+        const uint32_t m1 = strixllama_iq3s_sign_mask(signs_packed_8[l0/2] >> 4);
         sumi  = ggml_cuda_dp4a((int) ((uint32_t) grid_pos.x & ~m0), u0, sumi);
         sumi -= ggml_cuda_dp4a((int) ((uint32_t) grid_pos.x &  m0), u0, 0);
         sumi  = ggml_cuda_dp4a((int) ((uint32_t) grid_pos.y & ~m1), u1, sumi);

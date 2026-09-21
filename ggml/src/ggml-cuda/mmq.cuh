@@ -884,6 +884,19 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     extern __shared__ int data_mul_mat_q[];
     int * tile_y = data_mul_mat_q + J;
     int * tile_x = tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
+#if defined(GGML_USE_HIP) && defined(AMD_WMMA_AVAILABLE)
+    if constexpr (type == GGML_TYPE_IQ3_S) {
+        // strixllama: load_tiles_iq3_s reads the 512-entry grid twice per 8 weights of every tile; from
+        // LDS that is a ds_read instead of a global load through the vector cache. The copy sits right
+        // after tile_x (mmq_get_nbytes_shared reserves it) and is filled per tile - a handful of times
+        // per block against thousands of lookups.
+        uint32_t * grid_lds = (uint32_t *) (tile_x + I * ggml_cuda_mmq_get_sram_stride(type, J, fallback));
+        for (int i = threadIdx.y*warp_size + threadIdx.x; i < 512; i += nwarps*warp_size) {
+            grid_lds[i] = iq3s_grid[i];
+        }
+        __syncthreads();
+    }
+#endif // GGML_USE_HIP && AMD_WMMA_AVAILABLE
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
     // FP4 tile stores 8 blocks
@@ -1473,7 +1486,11 @@ struct mmq_args {
 
 static uint64_t fork_compact_calls[129] = {};
 static bool fork_compact_supported(const mmq_args & a, bool fallback, int cc) {
-    return a.type_x == GGML_TYPE_IQ4_NL && GGML_CUDA_CC_IS_RDNA3_5(cc) && !fallback &&
+    // strixllama: the gate/up experts (IQ3_S, one layer IQ4_XS) take the same shapes as the IQ4_NL down
+    // projection this path was written for; without it they fall off a cliff at 24+ tokens per step
+    // (73 GB/s against 195 at 16, tools: test-backend-ops perf with STRIX_MOE_PERF)
+    return (a.type_x == GGML_TYPE_IQ4_NL || a.type_x == GGML_TYPE_IQ3_S || a.type_x == GGML_TYPE_IQ4_XS) &&
+        GGML_CUDA_CC_IS_RDNA3_5(cc) && !fallback &&
         a.ids_dst != nullptr && a.expert_bounds != nullptr && a.nchannels_x == 512 && a.nchannels_y == 512 &&
         a.nsamples_x == 1 && a.nsamples_y == 1 && a.ncols_max >= 16 && a.ncols_max <= 32768 &&
         a.ncols_dst == a.ncols_max * 10 &&
@@ -1484,7 +1501,13 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     const size_t nbs_ids = config.J*sizeof(int);
     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
     const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
-    return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
+#if defined(GGML_USE_HIP)
+    // strixllama: the static LDS grid copy (strixllama_iq3s_grid_lds) counts against the same budget
+    const size_t nbs_grid = config.type == GGML_TYPE_IQ3_S ? 512*sizeof(uint32_t) : 0;
+#else
+    const size_t nbs_grid = 0;
+#endif // GGML_USE_HIP
+    return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int)) + nbs_grid;
 }
 
 template <ggml_type type, int J, bool fallback>
