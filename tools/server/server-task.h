@@ -632,6 +632,30 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+
+    // strixllama: a disk tier under the RAM cache. Every entry that goes into the RAM cache is also
+    // written to disk_dir (tokens, state, checkpoints - the checkpoints are what let a hybrid model
+    // resume at all), and a miss in RAM is looked up on disk with the same prefix criteria before the
+    // prompt is processed from scratch. A 34K-token session of Qwen3.8-Flash-Next is ~1.3 GB and reads
+    // back in well under a second against ~40 s of prefill. Entries with media are not persisted.
+    struct disk_entry {
+        std::string   path;
+        server_tokens tokens;
+        size_t        bytes;
+        int64_t       order;    // larger = more recently written or used
+    };
+
+    std::string             disk_dir;
+    size_t                  disk_limit = 0;      // bytes, 0 = no disk tier
+    bool                    disk_has_mtmd = false;
+    int64_t                 disk_seq = 0;
+    std::vector<disk_entry> disk_index;
+
+    void set_disk(const std::string & dir, size_t limit_mib, bool has_mtmd);
+    size_t disk_size() const;
+    void persist(const server_prompt_cache_state & state);
+    // appends the best disk entry to `states` when it beats (f_keep_best, f_sim_best); returns it or nullptr
+    server_prompt_cache_state * load_from_disk(const server_tokens & tokens_new, float & f_keep_best, float & f_sim_best);
 };
 
 // used exclusively by router mode

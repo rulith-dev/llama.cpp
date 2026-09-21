@@ -340,6 +340,9 @@ struct server_slot {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
 
+        // strixllama: the disk tier keeps a copy, checkpoints included
+        prompt_cache.persist(*cur);
+
         return true;
     }
 
@@ -1378,6 +1381,13 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+
+            // strixllama: STRIX_PROMPT_CACHE_DIR / STRIX_PROMPT_CACHE_MIB add a disk tier under the RAM cache
+            // (tools/manager.py sets them from the "disk prompt cache" switch)
+            if (const char * dir = getenv("STRIX_PROMPT_CACHE_DIR"); dir && *dir) {
+                const char * mib = getenv("STRIX_PROMPT_CACHE_MIB");
+                prompt_cache->set_disk(dir, mib ? std::max(1, atoi(mib)) : 16384, mctx != nullptr);
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
