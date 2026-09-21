@@ -11206,6 +11206,53 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // strixllama: this model's expert matmuls (Qwen3.8-Flash-Next UD-IQ4_XS: 512 experts, 10 used,
     // n_embd 2560, n_ff_exp 640; gate/up IQ3_S, down IQ4_NL) at decode-sized batches, plus the same
     // shapes in other quants, to tell the dequant's cost from the bytes' cost. STRIX_MOE_PERF=1.
+    // strixllama: the dense projections the same model reads once per pass (attn_qkv 2560->10240,
+    // attn_gate 2560->6144, ssm_out 6144->2560, hc up/down, the shared expert), Q8_0 as in the file
+    // plus the same shapes in other quants. STRIX_DENSE_PERF=1 or a token list like STRIX_MOE_PERF.
+    if (const char * dense = getenv("STRIX_DENSE_PERF")) {
+        std::vector<int> ns = {1, 4, 8, 16};
+        if (strchr(dense, ',') || atoi(dense) > 1) {
+            ns.clear();
+            for (const char * c = dense; *c; ) { ns.push_back(atoi(c)); c = strchr(c, ','); if (!c) break; ++c; }
+        }
+        // 8 distinct weight matrices per case (bs = 8), so the working set exceeds the 32 MB MALL and the
+        // number is DRAM bandwidth, not cache bandwidth (Q8_0 and Q4_0: block 32, any of these K)
+        const int64_t bs = getenv("STRIX_DENSE_BS") ? atoll(getenv("STRIX_DENSE_BS")) : 8;
+        for (int n : ns) {
+            for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+                for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{10240, 2560}, {6144, 2560}, {2560, 6144}}) {
+                    test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk.first, n, mk.second, {bs, 1}, {1, 1}));
+                }
+            }
+        }
+        return test_cases;
+    }
+    // strixllama: the small-M projections every layer runs (STRIX_SMALL_PERF=1 or a token list): the
+    // hyper-connection inject [K=10240, M=4] and the GDN beta/alpha [K=2560, M=48] in F32 as in the file,
+    // the same in F16 / Q8_0, and the Q8_0 hc / shared-expert shapes [K=2560, M=320..1280]
+    if (const char * small = getenv("STRIX_SMALL_PERF")) {
+        std::vector<int> ns = {1, 4, 8, 16};
+        if (strchr(small, ',') || atoi(small) > 1) {
+            ns.clear();
+            for (const char * c = small; *c; ) { ns.push_back(atoi(c)); c = strchr(c, ','); if (!c) break; ++c; }
+        }
+        for (int n : ns) {
+            // STRIX_SMALL_TYPES=f32|f16|q8_0 picks one type (the F16 [1280 x 2560] case aborts this test binary)
+            std::vector<ggml_type> types = {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0};
+            if (const char * st = getenv("STRIX_SMALL_TYPES")) {
+                types.clear();
+                if (strstr(st, "f32"))  types.push_back(GGML_TYPE_F32);
+                if (strstr(st, "f16"))  types.push_back(GGML_TYPE_F16);
+                if (strstr(st, "q8_0")) types.push_back(GGML_TYPE_Q8_0);
+            }
+            for (ggml_type t : types) {
+                for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{4, 10240}, {48, 2560}, {320, 2560}, {640, 2560}, {1280, 2560}}) {
+                    test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+                }
+            }
+        }
+        return test_cases;
+    }
     if (const char * moe = getenv("STRIX_MOE_PERF")) {
         std::vector<int> ns = {1, 4, 8, 16, 32};
         if (strchr(moe, ',') || atoi(moe) > 1) {           // STRIX_MOE_PERF=8,16,24,32,48,64

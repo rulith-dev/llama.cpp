@@ -45,16 +45,20 @@ constexpr int HTTP_POLLING_SECONDS = 1;
 struct strixllama_spec_timing {
     static bool enabled() { static const bool e = getenv("STRIX_SPEC_TIMING") && atoi(getenv("STRIX_SPEC_TIMING")); return e; }
     int64_t t_pass0 = 0, draft = 0, decode = 0, process = 0, sample = 0;
+    // strixllama: where "other" goes - pre: update_slots entry to the draft call (slot bookkeeping,
+    // checkpoints, batch assembly); post: post_decode less the sampling it already counts (accept,
+    // process_token, responses); gap: between update_slots calls (the task queue, HTTP work)
+    int64_t pre = 0, post = 0, gap = 0, t_enter = 0, t_exit = 0;
     int n_batch_tokens = 0;
     void begin_pass() {
         const int64_t now = ggml_time_us();
         if (t_pass0) {
             const int64_t pass = now - t_pass0;
-            fprintf(stderr, "ST pass=%.1fms n=%d draft=%.1f decode=%.1f process=%.1f sample=%.1f other=%.1f\n",
+            fprintf(stderr, "ST pass=%.1fms n=%d draft=%.1f decode=%.1f process=%.1f sample=%.1f other=%.1f pre=%.1f post=%.1f gap=%.1f\n",
                     pass / 1000.0, n_batch_tokens, draft / 1000.0, decode / 1000.0, process / 1000.0, sample / 1000.0,
-                    (pass - draft - decode - process - sample) / 1000.0);
+                    (pass - draft - decode - process - sample) / 1000.0, pre / 1000.0, (post - sample) / 1000.0, gap / 1000.0);
         }
-        t_pass0 = now; draft = decode = process = sample = 0; n_batch_tokens = 0;
+        t_pass0 = now; draft = decode = process = sample = 0; pre = post = gap = 0; n_batch_tokens = 0;
     }
 };
 static strixllama_spec_timing g_spec_timing;
@@ -2822,6 +2826,11 @@ private:
 #endif
 
     void update_slots() {
+        if (strixllama_spec_timing::enabled()) {
+            const int64_t now = ggml_time_us();
+            if (g_spec_timing.t_exit) { g_spec_timing.gap += now - g_spec_timing.t_exit; }
+            g_spec_timing.t_enter = now;
+        }
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -2928,13 +2937,16 @@ private:
 
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
+                const int64_t t_pd0 = strixllama_spec_timing::enabled() ? ggml_time_us() : 0;
                 post_decode(n_tokens, off, batch_view);
+                if (t_pd0) { g_spec_timing.post += ggml_time_us() - t_pd0; }
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
         }
+        if (strixllama_spec_timing::enabled()) { g_spec_timing.t_exit = ggml_time_us(); }
     }
 
     void pre_decode() {
@@ -3074,7 +3086,7 @@ private:
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             const bool st = strixllama_spec_timing::enabled();
-            if (st) { g_spec_timing.begin_pass(); }
+            if (st) { g_spec_timing.pre += ggml_time_us() - g_spec_timing.t_enter; g_spec_timing.begin_pass(); }
             const int64_t t0 = st ? ggml_time_us() : 0;
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
