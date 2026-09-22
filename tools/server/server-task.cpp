@@ -13,10 +13,12 @@
 #include <sstream>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <system_error>
 
 // XXH3 names the disk tier's chunks and checkpoints; inlined here, so nothing new to link
 #define XXH_INLINE_ALL
@@ -1810,7 +1812,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
-                               const std::function<void(size_t)> & before_restore) {
+                               const std::function<void(size_t)> & before_restore, ckpt_paged_map * paged_out) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1842,13 +1844,26 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
-    // strixllama: the disk tier, with the same criteria, only when it would beat what is in RAM
+    // strixllama: the disk tier, with the same criteria, only when it would beat what is in RAM. Its checkpoints
+    // stay on disk when the caller can page them in (disk_paged holds their pins until the slot takes them); such
+    // a state must never stay in the RAM tier, whose entries are complete, so every way out below drops it
+    ckpt_paged_map disk_paged;
+    bool from_disk = false;
     if (disk_limit > 0) {
-        if (server_prompt_cache_state * from_disk = load_from_disk(tokens_new, f_keep_best, f_sim_best)) {
+        if (server_prompt_cache_state * s = load_from_disk(tokens_new, f_keep_best, f_sim_best, paged_out ? &disk_paged : nullptr)) {
             it_best = std::prev(states.end());
-            GGML_ASSERT(&*it_best == from_disk);
+            GGML_ASSERT(&*it_best == s);
+            from_disk = true;
         }
     }
+    auto drop_from_disk = [&]() {
+        if (from_disk) {
+            states.erase(it_best);
+            it_best = states.end();
+            ckpt_release(disk_paged);
+            from_disk = false;
+        }
+    };
 
     // strixllama: an entry written while MTP was off carries no draft state, and nothing here can
     // build one for a sequence the target is already deep into. Restoring the target alone would
@@ -1856,8 +1871,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     // the cache than about the tokens: process the prompt instead.
     if (it_best != states.end() && ctx_dft && it_best->data.drft.empty()) {
         SRV_WRN("%s", " - cached prompt carries no draft state and this server drafts: processing the prompt instead\n");
-        states.erase(it_best);
-        it_best = states.end();
+        if (from_disk) {
+            drop_from_disk();
+        } else {
+            states.erase(it_best);
+            it_best = states.end();
+        }
     }
 
     if (it_best != states.end()) {
@@ -1874,6 +1893,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
             if (n != size) {
                 SRV_ERR("failed to restore state with size %zu\n", size);
+                drop_from_disk();
 
                 return false;
             }
@@ -1900,6 +1920,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
                 if (n != size) {
                     SRV_WRN("failed to restore state with size %zu\n", size);
+                    drop_from_disk();
 
                     return false;
                 }
@@ -1912,6 +1933,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         prompt = std::move(it_best->prompt);
 
         states.erase(it_best);
+
+        // strixllama: the slot takes the pins of the checkpoints that stayed on disk; a RAM-tier state brings its
+        // checkpoints whole
+        if (paged_out) {
+            *paged_out = from_disk ? std::move(disk_paged) : ckpt_paged_map {};
+        }
+        from_disk = false;
     }
 
     return true;
@@ -2556,11 +2584,16 @@ struct read_fault {
     uint64_t key = 0;
 };
 
-// a whole entry into memory. Chunks and checkpoints are checked against their hashes: a state that is
-// wrong in one byte decodes into nonsense, and XXH3 over 5.6 GiB costs ~0.2 s. Throws std::bad_alloc when
-// there is no memory for it, which says nothing about the entry.
+// chunks are separate files, and one reader leaves the drive idle between them: 2.8 GB/s from one thread
+// against 6.5 GB/s from four, measured unbuffered on this machine (eight add nothing)
+constexpr int SPC_READERS = 4;
+
+// an entry into memory. Chunks and checkpoints are checked against their hashes: a state that is wrong in
+// one byte decodes into nonsense, and XXH3 over 5.6 GiB costs ~0.2 s. With `lazy_ckpts` a version 2 entry's
+// checkpoints are left on disk and come back as their headers only (no bytes); the caller pins and pages them.
+// Throws std::bad_alloc when there is no memory for it, which says nothing about the entry.
 bool read_entry(spc_stage & st, const std::string & dir, const disk_entry & e, bool has_mtmd,
-                server_prompt_cache_state & state, std::string & why, read_fault & fault) {
+                server_prompt_cache_state & state, std::string & why, read_fault & fault, bool lazy_ckpts = false) {
     spc_file f(st);
     if (e.version == (int32_t) SPC_V1) {
         // the blobs cannot be longer than the file: a damaged length is a damaged file, not a bad_alloc
@@ -2595,35 +2628,83 @@ bool read_entry(spc_stage & st, const std::string & dir, const disk_entry & e, b
         const int64_t a0 = ggml_time_us();
         v.resize(size);
         g_spc_cost.alloc_us += ggml_time_us() - a0;
+        std::vector<uint64_t> offs(refs.size());
         uint64_t off = 0;
-        for (const auto & c : refs) {
-            if (off + c.size > size) {
+        for (size_t i = 0; i < refs.size(); ++i) {
+            if (off + refs[i].size > size) {
                 why = "chunk list longer than the state";
                 return false;
             }
-            const int64_t r0 = ggml_time_us();
-            const bool ok = f.open(chunk_path(dir, c.hi, c.lo)) && f.read(v.data() + off, c.size);
-            f.close();
-            g_spc_cost.read_us += ggml_time_us() - r0;
-            g_spc_cost.bytes   += c.size;
-            const disk_chunk_ref got = ok ? chunk_ref(v.data() + off, c.size) : disk_chunk_ref {};
-            if (!ok || got.hi != c.hi || got.lo != c.lo) {
-                why = (ok ? "chunk does not match its name: " : "missing chunk ") + chunk_hex(c.hi, c.lo);
-                fault.chunk = true;
-                fault.hi = c.hi;
-                fault.lo = c.lo;
-                return false;
-            }
-            off += c.size;
+            offs[i] = off;
+            off += refs[i].size;
         }
-        return off == size;
+        if (off != size) {
+            why = "chunk list shorter than the state";
+            return false;
+        }
+        // the chunks land in disjoint ranges of v; each reader has its own staging buffer, and this thread
+        // uses the caller's. A reader that cannot get a buffer leaves its share to the others.
+        std::atomic<size_t>   next   { 0 };
+        std::atomic<bool>     failed { false };
+        std::atomic<uint64_t> bytes  { 0 };
+        std::mutex            fault_mu;
+        auto reader = [&](spc_file * fp) {
+            std::unique_ptr<spc_stage> own_st;
+            std::unique_ptr<spc_file>  own_f;
+            if (!fp) {
+                try {
+                    own_st = std::make_unique<spc_stage>();
+                } catch (const std::bad_alloc &) {
+                    return;
+                }
+                own_f = std::make_unique<spc_file>(*own_st);
+                fp = own_f.get();
+            }
+            for (size_t i; !failed && (i = next.fetch_add(1)) < refs.size(); ) {
+                const auto & c = refs[i];
+                const bool ok = fp->open(chunk_path(dir, c.hi, c.lo)) && fp->read(v.data() + offs[i], c.size);
+                fp->close();
+                const disk_chunk_ref got = ok ? chunk_ref(v.data() + offs[i], c.size) : disk_chunk_ref {};
+                if (!ok || got.hi != c.hi || got.lo != c.lo) {
+                    std::lock_guard<std::mutex> lk(fault_mu);
+                    if (!failed.exchange(true)) {
+                        why = (ok ? "chunk does not match its name: " : "missing chunk ") + chunk_hex(c.hi, c.lo);
+                        fault.chunk = true;
+                        fault.hi = c.hi;
+                        fault.lo = c.lo;
+                    }
+                    return;
+                }
+                bytes += c.size;
+            }
+        };
+        const int64_t r0 = ggml_time_us();
+        std::vector<std::thread> pool;
+        for (int t = 1; t < SPC_READERS && (size_t) t < refs.size(); ++t) {
+            try {
+                pool.emplace_back(reader, nullptr);
+            } catch (const std::system_error &) {
+                break;                                  // fewer readers, same result
+            }
+        }
+        reader(&f);
+        for (auto & t : pool) {
+            t.join();
+        }
+        g_spc_cost.read_us += ggml_time_us() - r0;
+        g_spc_cost.bytes   += bytes;
+        return !failed;
     };
     if (!fill(state.data.main, e.main_size, e.main) || !fill(state.data.drft, e.drft_size, e.drft)) {
         return false;
     }
     for (const auto & k : e.ckpts) {
         common_prompt_checkpoint c;
-        if (!read_ckpt(f, ckpt_path(dir, k.key), k, c)) {       // its blobs time themselves
+        if (lazy_ckpts) {
+            c.n_tokens = k.n_tokens;                    // the header: a rewind reads the bytes if it picks this one
+            c.pos_min  = k.pos_min;
+            c.pos_max  = k.pos_max;
+        } else if (!read_ckpt(f, ckpt_path(dir, k.key), k, c)) {       // its blobs time themselves
             why = "missing or damaged checkpoint";
             fault.ckpt = true;
             fault.key  = k.key;
@@ -3708,7 +3789,8 @@ void server_prompt_cache::disk_convert_v1(const std::string & path) {
             disk_index.size(), disk_bytes / (1024.0 * 1024.0 * 1024.0));
 }
 
-server_prompt_cache_state * server_prompt_cache::load_from_disk(const server_tokens & tokens_new, float & f_keep_best, float & f_sim_best) {
+server_prompt_cache_state * server_prompt_cache::load_from_disk(const server_tokens & tokens_new, float & f_keep_best, float & f_sim_best,
+                                                                ckpt_paged_map * paged) {
     std::unique_lock<std::mutex> lk(disk_mu);
 
     // an entry still on its way to disk may be exactly the one this prompt wants: let it land
@@ -3764,9 +3846,12 @@ server_prompt_cache_state * server_prompt_cache::load_from_disk(const server_tok
     std::string why;
     read_fault fault;
     bool ok = false;
+    // a version 2 entry's checkpoints are objects of their own in the store: when the caller can page them in,
+    // they stay there (a 79K-token conversation carries ~3.3 GB of them; a rewind reads one)
+    const bool lazy = paged && best->version != (int32_t) SPC_V1;
     try {
         spc_stage stage;
-        ok = read_entry(stage, disk_dir, *best, disk_has_mtmd, state, why, fault);
+        ok = read_entry(stage, disk_dir, *best, disk_has_mtmd, state, why, fault, lazy);
     } catch (const std::bad_alloc &) {
         SRV_WRN(" - disk cache: no memory to read %d tokens back, processing the prompt instead\n", (int) best->tokens.size());
         return nullptr;                       // the entry is fine; this time there was no room for it
@@ -3787,6 +3872,25 @@ server_prompt_cache_state * server_prompt_cache::load_from_disk(const server_tok
         disk_cv.notify_all();
         return nullptr;
     }
+    // the checkpoints left on disk are pinned, as a slot pins the ones it pages out: eviction of this entry must not
+    // delete one the restored conversation may still rewind to. One the store no longer has is left out.
+    size_t n_left = 0;
+    if (lazy) {
+        paged->clear();
+        auto it = state.prompt.checkpoints.begin();
+        for (const auto & k : best->ckpts) {
+            GGML_ASSERT(it != state.prompt.checkpoints.end() && it->n_tokens == k.n_tokens);
+            auto stored = disk_ckpts.find(k.key);
+            if (stored == disk_ckpts.end()) {
+                it = state.prompt.checkpoints.erase(it);
+                continue;
+            }
+            stored->second.refs++;
+            (*paged)[{ k.n_tokens, k.pos_min, k.pos_max }] = k;
+            ++n_left;
+            ++it;
+        }
+    }
     f_keep_best = best_keep;
     f_sim_best  = best_sim;
     best->order = ++disk_seq;
@@ -3802,10 +3906,11 @@ server_prompt_cache_state * server_prompt_cache::load_from_disk(const server_tok
         disk_migrate.push_front(best->path);
         disk_cv.notify_all();
     }
-    SRV_INF(" - disk cache: read %d tokens (v%d), %.3f GiB in %.0f ms (file %.0f ms at %.0f MB/s, buffers %.0f ms%s; f_keep = %.3f, f_sim = %.3f)\n",
+    SRV_INF(" - disk cache: read %d tokens (v%d), %.3f GiB in %.0f ms (file %.0f ms at %.0f MB/s, buffers %.0f ms%s%s; f_keep = %.3f, f_sim = %.3f)\n",
             (int) state.prompt.tokens.size(), best->version, g_spc_cost.bytes / (1024.0 * 1024.0 * 1024.0), (ggml_time_us() - t0) / 1000.0,
             g_spc_cost.read_us / 1000.0, g_spc_cost.read_us ? g_spc_cost.bytes / 1048576.0 / (g_spc_cost.read_us / 1e6) : 0.0,
             g_spc_cost.alloc_us / 1000.0, waited_ms >= 1.0 ? (", waited " + std::to_string((int) waited_ms) + " ms for the writer").c_str() : "",
+            lazy ? (", " + std::to_string(n_left) + " checkpoints left on disk").c_str() : "",
             f_keep_best, f_sim_best);
     states.push_back(std::move(state));
     return &states.back();

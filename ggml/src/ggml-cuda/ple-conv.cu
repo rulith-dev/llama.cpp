@@ -1,6 +1,7 @@
 #include "ple-conv.cuh"
 #include "unary.cuh"
 #include <cstdlib>
+#include <type_traits>
 static bool ple_conv_enabled() { static const int v = getenv("LLAMA_PLE_CONV") ? atoi(getenv("LLAMA_PLE_CONV")) : 0; return v != 0; }
 #if defined(__HIP_PLATFORM_AMD__)
 static __device__ __forceinline__ float ple_mul_rn(const float a, const float b) { float r; asm("v_mul_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
@@ -19,15 +20,20 @@ static __global__ void ple_concat_tail(const float * __restrict__ state, const f
     out[(size_t) c * row_stride + j] = (j < H) ? state[c * H + j] : x[(size_t) (j - H) * C + c];
 }
 
-template <int K, int DIL, int TT>
+// strixllama: the conv weight is F16 in the author's file and F32 in Unsloth's; either is widened exactly, so both
+// give the unfused taps' result bit for bit
+template <int K, int DIL, int TT, typename WT>
 static __global__ void __launch_bounds__(256) ple_conv_kernel(const float * __restrict__ state, const float * __restrict__ x,
-        const half * __restrict__ w, float * __restrict__ y, const int C, const int T) {
+        const WT * __restrict__ w, float * __restrict__ y, const int C, const int T) {
     constexpr int H = (K - 1) * DIL, WIN = H + 1;
     const int c = blockIdx.x * 256 + threadIdx.x, t0 = blockIdx.y * TT;
     if (c >= C) return;
     float wr[K];
 #pragma unroll
-    for (int k = 0; k < K; ++k) wr[k] = __half2float(w[c * K + k]);
+    for (int k = 0; k < K; ++k) {
+        if constexpr (std::is_same_v<WT, half>) wr[k] = __half2float(w[c * K + k]);
+        else                                    wr[k] = w[c * K + k];
+    }
     float win[WIN];
     auto ld = [&](int jp) -> float { return (jp < H) ? state[c * H + jp] : ((jp - H) < T ? x[(size_t) (jp - H) * C + c] : 0.0f); };
 #pragma unroll
@@ -47,7 +53,7 @@ static __global__ void __launch_bounds__(256) ple_conv_kernel(const float * __re
 static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv_match & m) {
     if (!ple_conv_enabled() || i < 0 || i + 2 >= cgraph->n_nodes) return false;
     const ggml_tensor * cc = cgraph->nodes[i];
-    if (cc->op != GGML_OP_CONCAT || cc->type != GGML_TYPE_F32 || ggml_get_op_params_i32(cc, 0) != 0) return false;
+    if ((cc->flags & GGML_TENSOR_FLAG_OUTPUT) || cc->op != GGML_OP_CONCAT || cc->type != GGML_TYPE_F32 || ggml_get_op_params_i32(cc, 0) != 0) return false;
     const ggml_tensor * st = cc->src[0]; const ggml_tensor * tr = cc->src[1];
     if (!st || !tr || st->type != GGML_TYPE_F32 || tr->type != GGML_TYPE_F32 || tr->op != GGML_OP_TRANSPOSE || !tr->view_src) return false;
     const ggml_tensor * x = tr->view_src;
@@ -74,19 +80,20 @@ static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv
         }
         if (t->op == GGML_OP_CONT || t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE) continue;
         if (t->op == GGML_OP_MUL) {
-            // MUL(tap_out[k], w_k) with w_k an F32 [C] cast of a view of the F16 model weight
+            // MUL(tap_out[k], w_k) with w_k an F32 [C] view of the model weight: a cast of it when the file has it
+            // in F16, the column itself when the file has it in F32 (Unsloth's)
             const ggml_tensor * a = t->src[0]; const ggml_tensor * b = t->src[1];
             int k = -1; for (int q = 0; q < ntaps; ++q) if (tap_out[q] == a || tap_out[q] == b) k = q;
             if (k < 0) return false;
             const ggml_tensor * wk = (tap_out[k] == a) ? b : a;
             if (wk->type != GGML_TYPE_F32 || ggml_nelements(wk) != C) return false;
-            // resolve the model weight: cast(CPY) <- reshape/view <- cont <- view of W[K, C] F16
+            // resolve the model weight: [cast(CPY) <-] reshape/view <- cont <- view of W[K, C]
             const ggml_tensor * src = wk->src[0]; while (src && (src->op == GGML_OP_RESHAPE || src->op == GGML_OP_VIEW)) src = src->src[0];
             if (!src || src->op != GGML_OP_CONT) return false;
             const ggml_tensor * wv = src->src[0]; if (!wv || wv->op != GGML_OP_VIEW || !wv->view_src) return false;
             const ggml_tensor * W = wv->view_src;
-            if (W->type != GGML_TYPE_F16 || W->ne[0] != 4 || W->ne[1] != C || !ggml_is_contiguous(W)) return false;
-            if (wv->view_offs != (size_t) k * sizeof(ggml_fp16_t) || wv->nb[1] != W->nb[1]) return false;
+            if ((W->type != GGML_TYPE_F16 && W->type != GGML_TYPE_F32) || W->ne[0] != 4 || W->ne[1] != C || !ggml_is_contiguous(W)) return false;
+            if (wv->view_offs != (size_t) k * ggml_type_size(W->type) || wv->nb[1] != W->nb[1]) return false;
             if (wroot && wroot != W) return false; wroot = W;
             if (k == 0) chain = t; else { /* add comes next */ }
             tap_out[k] = t;
@@ -104,6 +111,20 @@ static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv
     if (silu < 0 || ntaps != 4 || !wroot || first_tap < 0) return false;
     const ggml_tensor * su = cgraph->nodes[silu];
     if (su->type != GGML_TYPE_F32 || !ggml_is_contiguous(su) || su->ne[0] != C || su->ne[1] != T) return false;
+    // strixllama: the fusion writes only the concat's tail (what the state update copies out); its body is never
+    // computed. So nothing outside the fused taps may read the concat, or a view of it that reaches before the tail.
+    auto reads_body = [&](const ggml_tensor * s) {
+        if (!s) return false;
+        if (s == cc) return true;
+        if (s->view_src != cc) return false;
+        return !(s->op == GGML_OP_VIEW && s->ne[0] == H && (int64_t) (s->view_offs / sizeof(float)) >= tail_from);
+    };
+    for (int n = i + 1; n < cgraph->n_nodes; ++n) {
+        if (n >= first_tap && n <= silu) continue;
+        const ggml_tensor * t = cgraph->nodes[n];
+        if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_PERMUTE) continue;
+        for (int s = 0; s < GGML_MAX_SRC; ++s) if (reads_body(t->src[s])) return false;
+    }
     m.concat_idx = i; m.first_tap_idx = first_tap; m.silu_idx = silu; m.x = x; m.state = st; m.concat = cc; m.w = wroot; m.out = cgraph->nodes[silu];
     m.C = C; m.T = T; m.H = H; m.K = 4; m.dil = 3; m.tail_from = tail_from;
     return true;
@@ -127,7 +148,13 @@ void ggml_cuda_ple_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_c
 void ggml_cuda_ple_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_ple_conv_match & m) {
     constexpr int TT = 128;
     dim3 grid((unsigned) (m.C / 256), (unsigned) ((m.T + TT - 1) / TT));
-    ple_conv_kernel<4, 3, TT><<<grid, 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.x->data,
-        (const half *) m.w->data, (float *) m.out->data, (int) m.C, (int) m.T);
+    if (m.w->type == GGML_TYPE_F32) {
+        ple_conv_kernel<4, 3, TT, float><<<grid, 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.x->data,
+            (const float *) m.w->data, (float *) m.out->data, (int) m.C, (int) m.T);
+    } else {
+        ple_conv_kernel<4, 3, TT, half><<<grid, 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.x->data,
+            (const half *) m.w->data, (float *) m.out->data, (int) m.C, (int) m.T);
+    }
+    static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "PLE_CONV fused taps + silu: C=%lld T=%lld w=%s\n", (long long) m.C, (long long) m.T, ggml_type_name(m.w->type));
     CUDA_CHECK(cudaGetLastError());
 }

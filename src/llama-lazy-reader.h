@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -261,6 +262,49 @@ struct llama_lazy_reader {
             fprintf(stderr, "PLE_GATHER rows=%lld uniq=%lld workers=%d row_bytes=%zu ms=%.1f\n",
                     (long long) n, (long long) uniq, n_workers, row_size, ms);
         }
+    }
+
+    // strixllama: rows gathered ahead of time for a batch a caller announced (llama_strix_prefetch). The gather for
+    // that batch takes them instead of reading them again, so it costs a copy rather than ~0.2-0.3 s of reads with
+    // the GPU idle. Two slots: the next batch's pregather can finish before this batch takes its own.
+    struct pregathered {
+        std::vector<int32_t> rows;
+        std::vector<uint8_t> data;      // rows.size() * head_dim floats
+    };
+    mutable std::mutex pre_mutex;
+    mutable std::vector<pregathered> pre;
+
+    void pregather(const int32_t * rows, int64_t n) const {
+        pregathered p;
+        p.rows.assign(rows, rows + n);
+        p.data.resize((size_t) n * head_dim * sizeof(float));
+        gather(rows, n, (float *) p.data.data());
+        std::lock_guard<std::mutex> lock(pre_mutex);
+        pre.push_back(std::move(p));
+        if (pre.size() > 2) {
+            pre.erase(pre.begin());
+        }
+    }
+
+    // the gathered rows for `rows`, when a pregather covered them: the batch a caller announced can come out shorter
+    // (it stops at a checkpoint or a message boundary), so a pregather that starts with these rows serves too
+    bool take_pregathered(const int32_t * rows, int64_t n, std::vector<uint8_t> & out) const {
+        std::lock_guard<std::mutex> lock(pre_mutex);
+        for (auto it = pre.begin(); it != pre.end(); ++it) {
+            if ((int64_t) it->rows.size() < n || memcmp(it->rows.data(), rows, (size_t) n * sizeof(int32_t)) != 0) {
+                continue;
+            }
+            const size_t bytes = (size_t) n * head_dim * sizeof(float);
+            if (it->data.size() == bytes) {
+                out.swap(it->data);
+            } else {
+                out.resize(bytes);
+                memcpy(out.data(), it->data.data(), bytes);
+            }
+            pre.erase(it);
+            return true;
+        }
+        return false;
     }
 
     // populate the page cache for the rows a later gather() will read; never writes any output, so a wrong

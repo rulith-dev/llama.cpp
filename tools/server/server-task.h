@@ -638,13 +638,6 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    // strixllama: `before_restore` is called with the token count of the entry about to replace `prompt`, before
-    // its state goes into the KV cache - the caller makes room for it there, and lets go of what the old prompt held
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
-              const std::function<void(size_t)> & before_restore = nullptr);
-
-    void update();
-
     // strixllama: a disk tier under the RAM cache; the files and their formats are described in
     // server-task.cpp. Entries are content-addressed and written by a background thread, so saving a
     // conversation again writes only what changed, never the whole state in one burst.
@@ -657,6 +650,18 @@ struct server_prompt_cache {
         uint64_t size_dft;
         uint64_t size_spec;
     };
+    // a slot's checkpoints handed back to the store: (n_tokens, pos_min, pos_max) -> the ref it is stored under
+    using ckpt_paged_map = std::map<std::tuple<int64_t, int32_t, int32_t>, disk_ckpt_ref>;
+
+    // strixllama: `before_restore` is called with the token count of the entry about to replace `prompt`, before
+    // its state goes into the KV cache - the caller makes room for it there, and lets go of what the old prompt held.
+    // With `paged_out`, an entry restored from the disk tier leaves its checkpoints there: `prompt` gets them without
+    // their bytes and `paged_out` says where they are (pinned), exactly as if the slot had paged them out itself - a
+    // 79K-token conversation carries ~3.3 GB of checkpoints of which a rewind reads one.
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+              const std::function<void(size_t)> & before_restore = nullptr, ckpt_paged_map * paged_out = nullptr);
+
+    void update();
     struct disk_chunk_ref {
         uint64_t hi;                    // XXH3-128 of the chunk's bytes
         uint64_t lo;
@@ -725,8 +730,6 @@ struct server_prompt_cache {
     bool     disk_wants(const server_prompt & prompt) {
         return prompt.tokens.get_text_tokens().size() == prompt.tokens.size() && disk_covered(prompt.tokens) < prompt.tokens.size();
     }
-    // a slot's checkpoints handed back to the store: (n_tokens, pos_min, pos_max) -> the ref it is stored under
-    using ckpt_paged_map = std::map<std::tuple<int64_t, int32_t, int32_t>, disk_ckpt_ref>;
     // hand a gathered state to the writer; `wait` blocks while the queue is full instead of giving up. Checkpoints
     // with no bytes are ones the slot handed back, and `paged` says where they are
     bool     persist(const server_prompt & prompt, std::vector<uint8_t> && data_main, std::vector<uint8_t> && data_drft, bool wait,
@@ -739,8 +742,10 @@ struct server_prompt_cache {
     // a paged-out checkpoint holds a reference in the store, so eviction cannot delete it while the slot may
     // still rewind to it; the slot lets go when it is cleared or takes another conversation
     void     ckpt_release(ckpt_paged_map & paged);
-    // appends the best disk entry to `states` when it beats (f_keep_best, f_sim_best); returns it or nullptr
-    server_prompt_cache_state * load_from_disk(const server_tokens & tokens_new, float & f_keep_best, float & f_sim_best);
+    // appends the best disk entry to `states` when it beats (f_keep_best, f_sim_best); returns it or nullptr. With
+    // `paged`, a version 2 entry's checkpoints stay on disk: pinned and named in `paged`, bytes read on demand
+    server_prompt_cache_state * load_from_disk(const server_tokens & tokens_new, float & f_keep_best, float & f_sim_best,
+                                               ckpt_paged_map * paged = nullptr);
 
     // the writer's side, and helpers that expect disk_mu held
     void   disk_writer();

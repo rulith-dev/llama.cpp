@@ -414,7 +414,8 @@ struct server_slot {
                 make_room_for(n_tokens);
             }
         };
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, before_restore);
+        // an entry restored from the disk tier leaves its checkpoints there, pinned for this slot like paged-out ones
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, before_restore, &ckpt_paged);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -3841,6 +3842,30 @@ private:
                             }
                             if (should_break) {
                                 break;
+                            }
+                        }
+                    }
+
+                    // strixllama: while this batch is on the GPU, gather what the next one needs from disk - the
+                    // model's per-layer-embedding rows, ~0.2-0.7 s a batch otherwise spent before its compute. The
+                    // n-gram lookups reach back two tokens, so those come along as context.
+                    if (slot.prompt.n_tokens() < slot.task->n_tokens()) {
+                        const int64_t nxt = slot.prompt.n_tokens();
+                        const int64_t end = std::min<int64_t>(slot.task->n_tokens(), nxt + n_batch);
+                        const int64_t beg = std::max<int64_t>(0, nxt - 2);
+                        if (end - nxt >= 4096) {
+                            std::vector<llama_token> toks;
+                            toks.reserve(end - beg);
+                            bool media = false;
+                            for (int64_t i = beg; i < end && !media; ++i) {
+                                const llama_token t = input_tokens[i];
+                                media = t == LLAMA_TOKEN_NULL;
+                                if (!media) {
+                                    toks.push_back(t);
+                                }
+                            }
+                            if (!media) {                   // a batch with an image in it gathers for itself
+                                llama_strix_prefetch(ctx_tgt, toks.data(), (int32_t) toks.size(), (int32_t) (nxt - beg));
                             }
                         }
                     }

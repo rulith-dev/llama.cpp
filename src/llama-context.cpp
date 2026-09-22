@@ -13,6 +13,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
@@ -40,6 +41,11 @@ struct strixllama_decode_timing {
     void reset() { prep = graph = inputs = compute = 0; n_ubatch = n_reused = 0; }
 };
 static strixllama_decode_timing g_decode_timing;
+
+// strixllama: set once a caller drives the per-layer-embedding prefetch itself (llama_strix_prefetch); llama_decode
+// then leaves it alone, since a prefetch of the batch it is handed starts no earlier than the gather that reads the
+// same rows, and launching one would wait for the caller's prefetch of the next batch to finish
+static std::atomic<bool> g_strix_prefetch_external { false };
 
 //
 // llama_context
@@ -1753,8 +1759,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     {   // warm the page cache for this batch's per-layer-embedding rows while the first chunk is on the GPU;
         // posix_fadvise only, so a wrong prediction costs readahead and nothing else
-        extern void qwen4exp_ple_prefetch(const llama_model & model, const llama_token * tokens, int32_t n_tokens);
-        if (batch_inp.token && batch_inp.n_tokens >= 4096) { qwen4exp_ple_prefetch(model, batch_inp.token, batch_inp.n_tokens); }
+        extern void qwen4exp_ple_prefetch(const llama_model & model, const llama_token * tokens, int32_t n_tokens, int32_t n_skip, bool pregather);
+        if (batch_inp.token && batch_inp.n_tokens >= 4096 && !g_strix_prefetch_external) { qwen4exp_ple_prefetch(model, batch_inp.token, batch_inp.n_tokens, 0, false); }
     }
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
@@ -3887,6 +3893,14 @@ int32_t llama_n_threads(llama_context * ctx) {
 
 int32_t llama_n_threads_batch(llama_context * ctx) {
     return ctx->n_threads_batch();
+}
+
+void llama_strix_prefetch(llama_context * ctx, const llama_token * tokens, int32_t n_tokens, int32_t n_context) {
+    extern void qwen4exp_ple_prefetch(const llama_model & model, const llama_token * tokens, int32_t n_tokens, int32_t n_skip, bool pregather);
+    g_strix_prefetch_external = true;
+    if (ctx && tokens && n_tokens > n_context && n_context >= 0) {
+        qwen4exp_ple_prefetch(ctx->get_model(), tokens, n_tokens, n_context, true);
+    }
 }
 
 void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void * data), void * abort_callback_data) {

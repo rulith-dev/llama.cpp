@@ -18,24 +18,37 @@ static __device__ __forceinline__ float qsa3_h2f(const uint16_t h) { return (flo
 // rank-sort it into srow[q] and set sflag[q]. Sentinel 0x7FFFFFFF for invalid (-1 / >= nk) entries.
 #define QSA3_SENT 0x7FFFFFFF
 __global__ __launch_bounds__(256) void qsa3_rows_kernel(
-        const int * __restrict__ ids, const size_t i1, const int ns, const int nk, int * __restrict__ srow, int * __restrict__ sflag) {
+        const int * __restrict__ ids, const size_t i1, const int ns, const int nk, int * __restrict__ srow, int * __restrict__ sflag,
+        const int ns_pow2) {
     extern __shared__ int ent[];
     __shared__ int unsorted;
     const int q = blockIdx.x, tid = threadIdx.x;
     const int * row = reinterpret_cast<const int *>(reinterpret_cast<const char *>(ids) + (size_t) q * i1);
     for (int j = tid; j < ns; j += 256) { const int key = row[j]; ent[j] = (key >= 0 && key < nk) ? key : QSA3_SENT; }
+    for (int j = ns + tid; j < ns_pow2; j += 256) { ent[j] = QSA3_SENT; }
     if (tid == 0) { unsorted = 0; }
     __syncthreads();
     for (int j = tid; j + 1 < ns; j += 256) { if (ent[j] > ent[j+1]) { unsorted = 1; } }
     __syncthreads();
     if (unsorted) {
-        int * dst = srow + (size_t) q * ns;
-        for (int j = tid; j < ns; j += 256) {
-            const int e = ent[j];
-            int rank = 0;
-            for (int k = 0; k < ns; ++k) { const int f = ent[k]; rank += (f < e) || (f == e && k < j); }
-            dst[rank] = e;
+        // strixllama: a bitonic sort (after pwilkin/llama.cpp 38477e8c) instead of ranking every entry against every
+        // other: O(ns log^2 ns) against O(ns^2), 4.2M comparisons a row at ns = 2048. The top-k rows arrive in score
+        // order, so nearly every row takes this branch. Equal keys are equal values, so the sort need not be stable
+        // and the row is the one the rank sort wrote; the padding is the sentinel, which sorts to the end.
+        for (int k = 2; k <= ns_pow2; k <<= 1) {
+            for (int j = k >> 1; j > 0; j >>= 1) {
+                for (int i = tid; i < ns_pow2; i += 256) {
+                    const int l = i ^ j;
+                    if (l > i) {
+                        const int a = ent[i], b = ent[l];
+                        if ((a > b) == ((i & k) == 0)) { ent[i] = b; ent[l] = a; }
+                    }
+                }
+                __syncthreads();
+            }
         }
+        int * dst = srow + (size_t) q * ns;
+        for (int j = tid; j < ns; j += 256) { dst[j] = ent[j]; }
     }
     if (tid == 0) { sflag[q] = unsorted; }
 }
@@ -428,8 +441,13 @@ void ggml_cuda_flash_attn_ext_qsa(ggml_backend_cuda_context & ctx, ggml_tensor *
     ggml_cuda_pool_alloc<int>      srow(ctx.pool(), (size_t) n_q * ns);
     ggml_cuda_pool_alloc<int>      sflag(ctx.pool(), (size_t) n_q);
     {
-        const ggml_cuda_kernel_launch_params launch(dim3(n_q), dim3(256), (size_t) ns * sizeof(int), ctx.stream());
-        ggml_cuda_kernel_launch(qsa3_rows_kernel, launch, (const int *) ids->data, ids->nb[1], ns, nk, srow.get(), sflag.get());
+        int ns_pow2 = 1;
+        while (ns_pow2 < ns) { ns_pow2 <<= 1; }
+        // the bitonic sort pads the row to a power of two: up to twice the shared memory the rank sort took
+        GGML_ASSERT((size_t) ns_pow2 * sizeof(int) <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo &&
+                    "QSA selection row too large for the shared memory sort");
+        const ggml_cuda_kernel_launch_params launch(dim3(n_q), dim3(256), (size_t) ns_pow2 * sizeof(int), ctx.stream());
+        ggml_cuda_kernel_launch(qsa3_rows_kernel, launch, (const int *) ids->data, ids->nb[1], ns, nk, srow.get(), sflag.get(), ns_pow2);
         CUDA_CHECK(cudaGetLastError());
         const ggml_cuda_kernel_launch_params launch2(dim3(ngroups), dim3(QSA3_MERGE_LANES), (size_t) QSA3_G * ns * sizeof(int), ctx.stream());
         ggml_cuda_kernel_launch(qsa3_merge_kernel, launch2, (const int *) ids->data, ids->nb[1], n_q, ns, nk,

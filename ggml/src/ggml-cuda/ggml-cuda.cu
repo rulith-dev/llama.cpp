@@ -3948,7 +3948,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_gatemix() && i + 1 < cgraph->n_nodes && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
         // HC gate GEMM [320 -> 10240] whose only consumer is the fused stream mix: run GEMM + sigmoid + mix in one kernel
         const ggml_tensor * w = node->src[0], * lo = node->src[1];
-        if (w->type == GGML_TYPE_IQ4_NL && w->ne[0] == 320 && w->ne[1] == 10240 && ggml_node_has_n_uses(cgraph, i, 1) && ggml_cuda_mmb_supported_mm(w, lo, node)) {
+        // strixllama: Q8_0 as well - Unsloth's file keeps the HC weights at Q8_0
+        if ((w->type == GGML_TYPE_IQ4_NL || w->type == GGML_TYPE_Q8_0) && w->ne[0] == 320 && w->ne[1] == 10240 && ggml_node_has_n_uses(cgraph, i, 1) && ggml_cuda_mmb_supported_mm(w, lo, node)) {
             ggml_cuda_hc_mix_args ma;
             const int count = ggml_cuda_hc_mix_closed(cgraph, i + 1, ma);
             if (count > 0 && ma.gate == node && ggml_cuda_hc_gate_mix(*cuda_ctx, w, lo, ma.xn, ma.dst, ma.hc, ma.scale, ma.bias)) return count;

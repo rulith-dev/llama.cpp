@@ -1003,6 +1003,14 @@ extern "C" {
     // Get the number of threads used for prompt and batch processing (multiple token).
     LLAMA_API int32_t llama_n_threads_batch(struct llama_context * ctx);
 
+    // strixllama: start reading, in the background, whatever the batch tokens[n_context..n_tokens) will read from
+    // disk (the per-layer-embedding rows of models that stream them); the first n_context tokens are the ones that
+    // precede it, which n-gram lookups reach back into. A caller that knows the next batch - a server walking a
+    // long prompt - calls this before decoding the current one, so the reads overlap its compute and that batch's
+    // gather becomes a copy; from then on llama_decode stops prefetching the batch it is handed. No-op for other
+    // models.
+    LLAMA_API void llama_strix_prefetch(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens, int32_t n_context);
+
     // Set whether the context outputs embeddings or not
     // TODO: rename to avoid confusion with llama_get_embeddings()
     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);

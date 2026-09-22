@@ -269,33 +269,47 @@ __device__ __forceinline__ float gm_add_rn(const float a, const float b) { retur
 __device__ __forceinline__ float gm_sigmoid(const float x) { return 1.0f / (1.0f + expf(-x)); }
 __device__ __forceinline__ float gm_bf2f(const uint16_t h) { return __uint_as_float(((uint32_t) h) << 16); }
 
-template <int HC>
+// strixllama: WTYPE 0 is IQ4_NL (the author's file), 1 is Q8_0 (Unsloth's, whose HC weights are Q8_0). XF32 reads
+// the normalised streams as F32 and applies the sigmoid to the F32 accumulator, which is exactly what the unfused
+// MMB GEMM + hc_mix_reduce do when the BF16 intermediates (LLAMA_MMB_HC16) are off - so it is bitwise the same
+// result, only without writing the [hc*E, T] gate out and reading it back.
+template <int HC, int WTYPE = 0, bool XF32 = false>
 __global__ void __launch_bounds__(MMB_NT, 2)
-hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__ Lo, const uint16_t * __restrict__ Xn, float * __restrict__ Out,
+hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__ Lo, const uint16_t * __restrict__ Xn,
+        const float * __restrict__ XnF, float * __restrict__ Out,
         uint16_t * __restrict__ OutH, const bool store_f32,
         const int E, const int K, const int T, const float scale, const float bias) {
     constexpr int CH = 32, BN = 128, BM = HC * CH;
     static_assert(BM <= MMB_NT, "one A row per thread");
+    static_assert(WTYPE == 0 || WTYPE == 1, "IQ4_NL or Q8_0");
     __shared__ __align__(16) uint16_t As[BM * MMB_LDS_STRIDE];
     __shared__ __align__(16) uint16_t Bs[BN * MMB_LDS_STRIDE];
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
     const int wm = wave & 1, wn = wave >> 1;                 // wave: 16 channels (all HC streams) x 32 tokens
     const int e0 = blockIdx.x * CH, t0 = blockIdx.y * BN;
-    const size_t wrow_bytes = (size_t)(K / 32) * 18;
+    const size_t wrow_bytes = (size_t)(K / 32) * (WTYPE == 0 ? 18 : 34);
     constexpr int B_ITEMS = (BN * 8) / MMB_NT;
-    uint4 a0 = make_uint4(0,0,0,0), a1 = make_uint4(0,0,0,0); uint32_t a2 = 0; uint4 bst[B_ITEMS]; int brow[B_ITEMS];
+    uint4 a0 = make_uint4(0,0,0,0), a1 = make_uint4(0,0,0,0), a3 = make_uint4(0,0,0,0), a4 = make_uint4(0,0,0,0); uint32_t a2 = 0;
+    uint4 bst[B_ITEMS]; int brow[B_ITEMS];
     const uint8_t * arow = W;
     if (tid < BM) { const int c = tid / CH, i = tid - c * CH; arow = W + (size_t)(c * E + e0 + i) * wrow_bytes; }
 #pragma unroll
     for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; const int t = t0 + (c >> 3); brow[i] = t < T ? t : -1; }
     auto load_regs = [&](const int ks) {
-        if (tid < BM) { const uint8_t * p = arow + (size_t)ks * 36; a0 = *(const uint4 *)(p); a1 = *(const uint4 *)(p + 16); a2 = *(const uint32_t *)(p + 32); }
+        if (tid < BM) {
+            if constexpr (WTYPE == 0) { const uint8_t * p = arow + (size_t)ks * 36; a0 = *(const uint4 *)(p); a1 = *(const uint4 *)(p + 16); a2 = *(const uint32_t *)(p + 32); }
+            else { const uint8_t * p = arow + (size_t)ks * 68;
+                   a0 = *(const uint4 *)(p); a1 = *(const uint4 *)(p + 16); a3 = *(const uint4 *)(p + 32); a4 = *(const uint4 *)(p + 48); a2 = *(const uint32_t *)(p + 64); }
+        }
 #pragma unroll
         for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; const int off = (c & 7) * 8;
             bst[i] = (brow[i] >= 0) ? *(const uint4 *)(Lo + (size_t)brow[i] * K + ks * MMB_BK + off) : make_uint4(0,0,0,0); }
     };
     auto store_lds = [&]() {
-        if (tid < BM) mmb_dq_row36(a0, a1, a2, (uint32_t *)(As + tid * MMB_LDS_STRIDE));
+        if (tid < BM) {
+            if constexpr (WTYPE == 0) mmb_dq_row36(a0, a1, a2, (uint32_t *)(As + tid * MMB_LDS_STRIDE));
+            else                      mmb_dq_row68(a0, a1, a3, a4, a2, (uint32_t *)(As + tid * MMB_LDS_STRIDE));
+        }
 #pragma unroll
         for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; *(uint4 *)(Bs + (c >> 3) * MMB_LDS_STRIDE + (c & 7) * 8) = bst[i]; }
     };
@@ -336,13 +350,22 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
         for (int e = 0; e < 8; ++e) {
             const int t = t0 + wn * 32 + j * 16 + 2 * e + cn;
             if (t >= T) continue;
-            const uint16_t * xr = Xn + (size_t)t * ((size_t)HC * E) + ch;
             float s = 0.f;
+            if constexpr (XF32) {
+                const float * xr = XnF + (size_t)t * ((size_t)HC * E) + ch;
 #pragma unroll
-            for (int c = 0; c < HC; ++c) {
-                const float g = __uint_as_float(((uint32_t) mmb_f2bf(acc[c][j][e])) << 16);   // the gate GEMM's BF16 epilogue rounding
-                const float term = gm_mul_rn(gm_bf2f(xr[(size_t)c * E]), gm_sigmoid(g));
-                s = (c == 0) ? term : gm_add_rn(s, term);
+                for (int c = 0; c < HC; ++c) {
+                    const float term = gm_mul_rn(xr[(size_t)c * E], gm_sigmoid(acc[c][j][e]));
+                    s = (c == 0) ? term : gm_add_rn(s, term);
+                }
+            } else {
+                const uint16_t * xr = Xn + (size_t)t * ((size_t)HC * E) + ch;
+#pragma unroll
+                for (int c = 0; c < HC; ++c) {
+                    const float g = __uint_as_float(((uint32_t) mmb_f2bf(acc[c][j][e])) << 16);   // the gate GEMM's BF16 epilogue rounding
+                    const float term = gm_mul_rn(gm_bf2f(xr[(size_t)c * E]), gm_sigmoid(g));
+                    s = (c == 0) ? term : gm_add_rn(s, term);
+                }
             }
             const float o = scale * s + bias;
             if (store_f32) Out[(size_t)t * E + ch] = o;
@@ -825,12 +848,20 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     }
     const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) T * K, stream);
     const uint8_t * W = (const uint8_t *) src0->data; float * D = (float *) dst->data;
-    if (mmb_tall() && src0->type == GGML_TYPE_IQ4_NL && M <= 384 && K >= 4096 && T >= 2048) {   // tall-M tile: HC down|inject [10240 -> 324], activations read once
+    // tall-M tile: HC down|inject [10240 -> 324], activations read once. strixllama: Q8_0 as well as IQ4_NL - Unsloth's
+    // HC weights are Q8_0. Every output element sees the same WMMA sequence as in the 128-row tile, so the result is
+    // bitwise the one the separate down and inject GEMMs give.
+    if (mmb_tall() && (src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_Q8_0) && M <= 384 && K >= 4096 && T >= 2048) {
         static const int wide = mmb_tall_mode() >= 2;
-        if (wide) { dim3 grid(1, (T + 63) / 64); mmb_dense_kernel<384, 64, 96, 32, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
-        else      { dim3 grid(1, (T + 31) / 32); mmb_dense_kernel<384, 32, 96, 16, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
+        const bool q8 = src0->type == GGML_TYPE_Q8_0;
+        if (wide) { dim3 grid(1, (T + 63) / 64);
+            if (q8) mmb_dense_kernel<384, 64, 96, 32, 1><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T);
+            else    mmb_dense_kernel<384, 64, 96, 32, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
+        else      { dim3 grid(1, (T + 31) / 32);
+            if (q8) mmb_dense_kernel<384, 32, 96, 16, 1><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T);
+            else    mmb_dense_kernel<384, 32, 96, 16, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
         CUDA_CHECK(cudaGetLastError());
-        static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_TALL%s dense M=%d K=%d T=%d\n", wide ? "(wide 384x64)" : "(384x32)", M, K, T);
+        static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_TALL%s dense M=%d K=%d T=%d type=%s\n", wide ? "(wide 384x64)" : "(384x32)", M, K, T, ggml_type_name(src0->type));
         return;
     }
     const uint16_t * shadow_pre = ((src0->type == GGML_TYPE_IQ4_NL && mmb_shadow()) || src0->type == GGML_TYPE_Q6_K) ? mmb_shadow_lookup(src0) : nullptr;
@@ -866,19 +897,30 @@ bool ggml_cuda_mmb_blk16() { static const int v = getenv("LLAMA_HC_BLK16") ? ato
 bool ggml_cuda_mmb_res16()  { static const int v = getenv("LLAMA_HC_RES16") ? atoi(getenv("LLAMA_HC_RES16")) : 0; return v != 0; }
 bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst,
         const int hc, const float scale, const float bias) {
-    if (!mmb_gatemix_flag() || hc != 4 || w->type != GGML_TYPE_IQ4_NL || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
+    // strixllama: Q8_0 too - Unsloth's file keeps the HC weights at Q8_0, so with IQ4_NL only this never fired there
+    const bool q8 = w->type == GGML_TYPE_Q8_0;
+    if (!mmb_gatemix_flag() || hc != 4 || (w->type != GGML_TYPE_IQ4_NL && !q8) || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
     const int K = (int) w->ne[0], M = (int) w->ne[1], E = (int) dst->ne[0]; const int T = (int) ggml_nrows(dst);
     if (K % MMB_BK != 0 || M != hc * E || E % 32 != 0 || lo->ne[0] != K || ggml_nrows(lo) != T || xn->ne[0] != M || ggml_nrows(xn) != T || T < mmb_min_t()) return false;
-    const uint16_t * xn16 = ggml_cuda_mmb_cache_lookup(xn);
-    if (!xn16) return false;
+    // the Q8_0 kernel reads the streams in F32 and keeps the gate in F32: the unfused path's own numerics, so it can
+    // only be taken when the F32 streams are there - i.e. when xn is not a BF16-only tensor (LLAMA_MMB_HC16)
+    const bool xf32 = q8 && xn->type == GGML_TYPE_F32 && ggml_is_contiguous(xn) && !ggml_cuda_mmb_is_bf16_only(xn);
+    const uint16_t * xn16 = xf32 ? nullptr : ggml_cuda_mmb_cache_lookup(xn);
+    if (!xf32 && !xn16) return false;
     cudaStream_t stream = ctx.stream();
     const uint16_t * lo16 = mmb_bf16_activation(ctx, lo, (size_t) T * K, stream);
     uint16_t * outh = ggml_cuda_mmb_slot_reserve(ctx, 3, dst, (size_t) T * E);
     const bool store_f32 = !(outh && ggml_cuda_mmb_is_bf16_only(dst));
     dim3 grid(E / 32, (T + 127) / 128);
-    hc_gate_mix_kernel<4><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) w->data, lo16, xn16, (float *) dst->data, outh, store_f32, E, K, T, scale, bias);
+    if (xf32) {
+        hc_gate_mix_kernel<4, 1, true><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) w->data, lo16, nullptr, (const float *) xn->data, (float *) dst->data, outh, store_f32, E, K, T, scale, bias);
+    } else if (q8) {
+        hc_gate_mix_kernel<4, 1, false><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) w->data, lo16, xn16, nullptr, (float *) dst->data, outh, store_f32, E, K, T, scale, bias);
+    } else {
+        hc_gate_mix_kernel<4, 0, false><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) w->data, lo16, xn16, nullptr, (float *) dst->data, outh, store_f32, E, K, T, scale, bias);
+    }
     CUDA_CHECK(cudaGetLastError());
-    static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "HC_GATEMIX fused gate GEMM + sigmoid + mix: E=%d K=%d T=%d\n", E, K, T);
+    static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "HC_GATEMIX fused gate GEMM + sigmoid + mix: E=%d K=%d T=%d type=%s%s\n", E, K, T, ggml_type_name(w->type), xf32 ? " f32-streams" : "");
     return true;
 }
 

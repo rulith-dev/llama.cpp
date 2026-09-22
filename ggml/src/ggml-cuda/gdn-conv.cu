@@ -67,6 +67,8 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
             tail_from = std::min(tail_from, col); continue;
         }
         if (t->op == GGML_OP_CONT && t->src[0]->op == GGML_OP_VIEW && t->src[0]->view_src == cc) continue;
+        // strixllama: the state update copies the tail straight out of the concat now, without a cont first
+        if (t->op == GGML_OP_CPY && t->src[0]->op == GGML_OP_VIEW && t->src[0]->view_src == cc) continue;
         return false;
     }
     if (conv < 0) return false;

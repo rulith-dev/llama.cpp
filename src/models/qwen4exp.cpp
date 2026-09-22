@@ -1939,8 +1939,13 @@ public:
 // Prefetch hook: the chunk-boundary stall is the PLE row gather (257k-393k scattered 90-byte reads, ~300 ms with the
 // GPU idle). Given the whole batch up front we can compute the same row indices and warm the page cache for them while
 // the previous chunk is still on the GPU. Prefetch only warms the file cache; it does not change gathered rows.
-void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_token * tokens, int32_t n_tokens) {
-    if (!tokens || n_tokens < 4096) { return; }
+// strixllama: `n_skip` leading tokens are context only (the n-gram lookups of the first real token reach back into
+// them); with `pregather` the rows are gathered and dequantized for the gather of exactly that batch to take, rather
+// than only warmed in the file cache
+void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_token * tokens, int32_t n_tokens,
+                           int32_t n_skip, bool pregather) {
+    // strixllama: llama_decode calls this for every model; the cast below is only valid for this one
+    if (!tokens || n_tokens - n_skip < 4096 || model_base.arch != LLM_ARCH_QWEN4EXP) { return; }
     const auto & pmodel = static_cast<const llama_model_qwen4exp &>(model_base);
     if (!pmodel.ple_reader) { return; }
     static const bool off = getenv("LLAMA_PLE_PREFETCH") && atoi(getenv("LLAMA_PLE_PREFETCH")) == 0;
@@ -1950,7 +1955,7 @@ void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_token * t
     const int64_t eos = hp.ple_eos_token_id, n_prev = n_gram - 1;
     if (n_heads <= 0 || n_gram < 2) { return; }
     std::vector<llama_token> toks(tokens, tokens + n_tokens);
-    auto prefetch = [reader = pmodel.ple_reader, toks = std::move(toks), n_gram, n_heads, per_gram, eos, n_prev, hp]() {
+    auto prefetch = [reader = pmodel.ple_reader, toks = std::move(toks), n_gram, n_heads, per_gram, eos, n_prev, hp, n_skip, pregather]() {
         const int64_t n = (int64_t) toks.size();
         std::vector<int32_t> idx((size_t) n_heads * n);
         std::vector<int64_t> ctx(n_gram);
@@ -1973,7 +1978,13 @@ void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_token * t
                 }
             }
         }
-        reader->prefetch(idx.data(), (int64_t) idx.size());
+        const int32_t * first = idx.data() + (size_t) n_skip * n_heads;
+        const int64_t   count = (int64_t) idx.size() - (int64_t) n_skip * n_heads;
+        if (pregather) {
+            reader->pregather(first, count);
+        } else {
+            reader->prefetch(first, count);
+        }
     };
 #ifdef _WIN32
     pmodel.ple_reader->launch_prefetch(std::move(prefetch));
@@ -2043,8 +2054,11 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     }
 
     if (pmodel.ple_reader) {
-        staging.resize(idx.size() * pmodel.ple_reader->head_dim * sizeof(float));
-        pmodel.ple_reader->gather(idx.data(), (int64_t) idx.size(), (float *) staging.data());
+        // strixllama: rows a caller had gathered while the previous batch was on the GPU (llama_strix_prefetch)
+        if (!pmodel.ple_reader->take_pregathered(idx.data(), (int64_t) idx.size(), staging)) {
+            staging.resize(idx.size() * pmodel.ple_reader->head_dim * sizeof(float));
+            pmodel.ple_reader->gather(idx.data(), (int64_t) idx.size(), (float *) staging.data());
+        }
         ggml_backend_tensor_set(data, staging.data(), 0, staging.size());
     } else {
         ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
@@ -2101,7 +2115,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                 conv_states_all->nb[1],
                 (slot * mem_size + kv_head) * row_size);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        // strixllama: the copy reads the strided tail itself; a cont first was one more dispatch per slot, 144 of the
+        // ~2500 in a 4-token verify pass
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
     }
 
     return conv_input;
