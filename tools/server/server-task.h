@@ -7,6 +7,15 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <tuple>
+#include <utility>
+#include <vector>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -629,39 +638,121 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    // strixllama: `before_restore` is called with the token count of the entry about to replace `prompt`, before
+    // its state goes into the KV cache - the caller makes room for it there, and lets go of what the old prompt held
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+              const std::function<void(size_t)> & before_restore = nullptr);
 
     void update();
 
-    // strixllama: a disk tier under the RAM cache. Every entry that goes into the RAM cache is also
-    // written to disk_dir (tokens, state, checkpoints - the checkpoints are what let a hybrid model
-    // resume at all), and a miss in RAM is looked up on disk with the same prefix criteria before the
-    // prompt is processed from scratch. A 34K-token session of Qwen3.8-Flash-Next is ~1.3 GB and reads
-    // back in well under a second against ~40 s of prefill. Entries with media are not persisted.
+    // strixllama: a disk tier under the RAM cache; the files and their formats are described in
+    // server-task.cpp. Entries are content-addressed and written by a background thread, so saving a
+    // conversation again writes only what changed, never the whole state in one burst.
+    struct disk_ckpt_ref {
+        uint64_t key;
+        int64_t  n_tokens;
+        int32_t  pos_min;
+        int32_t  pos_max;
+        uint64_t size_tgt;
+        uint64_t size_dft;
+        uint64_t size_spec;
+    };
+    struct disk_chunk_ref {
+        uint64_t hi;                    // XXH3-128 of the chunk's bytes
+        uint64_t lo;
+        uint32_t size;
+    };
     struct disk_entry {
         std::string   path;
         server_tokens tokens;
-        size_t        bytes;
-        int64_t       order;    // larger = more recently written or used
+        uint64_t      bytes     = 0;    // the entry's own file
+        int64_t       order     = 0;    // larger = more recently written or used
+        int32_t       version   = 0;    // 1: one self-contained file, 2: a manifest over chunks/ and ckpt/
+        uint64_t      main_size = 0;
+        uint64_t      drft_size = 0;
+        std::vector<disk_chunk_ref> main;
+        std::vector<disk_chunk_ref> drft;
+        std::vector<disk_ckpt_ref>  ckpts;
+    };
+    struct disk_object {                // a chunk or checkpoint file, shared between entries
+        uint64_t bytes = 0;
+        int32_t  refs  = 0;
+    };
+    struct disk_job {                   // a gathered state on its way to disk
+        server_tokens tokens;
+        std::vector<uint8_t> main;
+        std::vector<uint8_t> drft;
+        std::vector<disk_ckpt_ref> ckpts;                                      // every checkpoint of the prompt
+        std::vector<std::pair<uint64_t, common_prompt_checkpoint>> ckpt_data;  // copies of the ones not stored yet
+        std::vector<uint64_t> pinned;                                          // stored ones it names: held until counted
     };
 
-    std::string             disk_dir;
-    size_t                  disk_limit = 0;      // bytes, 0 = no disk tier
-    bool                    disk_has_mtmd = false;
-    int64_t                 disk_seq = 0;
-    std::vector<disk_entry> disk_index;
+    std::string disk_dir;
+    uint64_t    disk_limit    = 0;      // bytes, 0 = no disk tier
+    bool        disk_has_mtmd = false;
+    int32_t     disk_block    = 4096;   // tokens a conversation grows by before it is written again
+    int64_t     disk_seq      = 0;
+    uint64_t    disk_bytes    = 0;      // entries, and every object once
 
-    void set_disk(const std::string & dir, size_t limit_mib, bool has_mtmd);
-    size_t disk_size() const;
-    bool has_disk() const { return disk_limit > 0; }
-    // false when the disk tier already holds this prompt or a longer one, so a caller that would have
-    // to gather the state first (see prompt_save) can skip the work
-    bool disk_wants(const server_prompt & prompt) const;
-    void persist(const server_prompt_cache_state & state);
-    // the same, from buffers the RAM tier does not own: this is what lets --cache-ram stay small
-    void persist(const server_prompt & prompt, const std::vector<uint8_t> & data_main, const std::vector<uint8_t> & data_drft);
+    // guarded by disk_mu; only the writer thread deletes files
+    std::mutex                                           disk_mu;
+    std::condition_variable                              disk_cv;
+    std::vector<disk_entry>                              disk_index;
+    std::map<std::pair<uint64_t, uint64_t>, disk_object> disk_chunks;
+    std::map<uint64_t, disk_object>                      disk_ckpts;
+    std::deque<std::unique_ptr<disk_job>>                disk_queue;
+    std::deque<std::string>                              disk_migrate;   // version 1 entries to convert
+    std::vector<disk_entry>                              disk_doomed;    // unreadable, for the writer to remove
+    std::vector<std::pair<uint64_t, uint64_t>>           disk_bad_chunks;   // found damaged or missing by a read
+    std::vector<uint64_t>                                disk_bad_ckpts;
+    std::vector<uint64_t>                                disk_unpin;        // pins to release, by the writer
+    std::function<void()>                                disk_on_written;   // called by the writer after each job
+    disk_job *                                           disk_current = nullptr;
+    bool                                                 disk_stop    = false;
+    std::thread                                          disk_thread;
+
+    ~server_prompt_cache();
+
+    // entries live in <root>/<model_tag>: a state is only meaningful to the model that computed it
+    void     set_disk(const std::string & root, size_t limit_mib, bool has_mtmd, const std::string & model_tag = "");
+    bool     has_disk() const { return disk_limit > 0; }
+    uint64_t disk_size();
+    bool     disk_busy();                  // a job is waiting: a save that would not wait can skip its work
+    // how much of `tokens` is on disk or on its way there: the longest stored prompt it starts with, or all
+    // of it when a stored prompt starts with it
+    size_t   disk_covered(const server_tokens & tokens, bool with_jobs = true);
+    // never for a prompt with media in it: the disk tier does not store those
+    bool     disk_wants(const server_prompt & prompt) {
+        return prompt.tokens.get_text_tokens().size() == prompt.tokens.size() && disk_covered(prompt.tokens) < prompt.tokens.size();
+    }
+    // a slot's checkpoints handed back to the store: (n_tokens, pos_min, pos_max) -> the ref it is stored under
+    using ckpt_paged_map = std::map<std::tuple<int64_t, int32_t, int32_t>, disk_ckpt_ref>;
+    // hand a gathered state to the writer; `wait` blocks while the queue is full instead of giving up. Checkpoints
+    // with no bytes are ones the slot handed back, and `paged` says where they are
+    bool     persist(const server_prompt & prompt, std::vector<uint8_t> && data_main, std::vector<uint8_t> && data_drft, bool wait,
+                     const ckpt_paged_map * paged = nullptr);
+    // checkpoints are cold data - only a rewind reads one - so an idle slot drops the bytes of those the store
+    // holds; returns the bytes freed
+    uint64_t ckpt_page_out(const server_tokens & tokens, std::list<common_prompt_checkpoint> & ckpts, ckpt_paged_map & paged);
+    // and reads one back when a rewind picks it. False when it is not this conversation's any more, or unreadable
+    bool     ckpt_page_in(const server_tokens & tokens, const ckpt_paged_map & paged, common_prompt_checkpoint & c);
+    // a paged-out checkpoint holds a reference in the store, so eviction cannot delete it while the slot may
+    // still rewind to it; the slot lets go when it is cleared or takes another conversation
+    void     ckpt_release(ckpt_paged_map & paged);
     // appends the best disk entry to `states` when it beats (f_keep_best, f_sim_best); returns it or nullptr
     server_prompt_cache_state * load_from_disk(const server_tokens & tokens_new, float & f_keep_best, float & f_sim_best);
+
+    // the writer's side, and helpers that expect disk_mu held
+    void   disk_writer();
+    void   disk_write(disk_job & job);
+    void   disk_convert_v1(const std::string & path);
+    void   disk_drop(const disk_entry & e, bool remove_file = true);
+    void   disk_evict(const std::string & keep);
+    void   disk_retire_bad();
+    void   disk_release_pins();
+    size_t disk_covered_locked(const server_tokens & tokens, bool with_jobs);
+    bool   disk_in_flight(const server_tokens & tokens, float f_sim_base);
+    bool   disk_ckpt_in_flight(uint64_t key);
 };
 
 // used exclusively by router mode
