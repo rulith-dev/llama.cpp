@@ -336,6 +336,25 @@ struct server_slot {
 
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
+            // strixllama: alloc() declines a state larger than --cache-ram, and this machine keeps that
+            // limit small on purpose - the KV cache lives in the GPU carve, and the prompt cache should
+            // not take system memory the rest of the desktop needs. The disk tier is what carries a long
+            // conversation across a restart, so write it from a temporary the RAM tier does not own.
+            if (prompt_cache.has_disk() && prompt_cache.disk_wants(prompt)) {
+                try {
+                    std::vector<uint8_t> tmp_tgt(cur_size_tgt);
+                    std::vector<uint8_t> tmp_dft(cur_size_dft);
+                    llama_state_seq_get_data_ext(ctx_tgt, tmp_tgt.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                    if (ctx_dft) {
+                        llama_state_seq_get_data_ext(ctx_dft, tmp_dft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                    }
+                    prompt_cache.persist(prompt, tmp_tgt, tmp_dft);
+                    return true;
+                } catch (const std::bad_alloc &) {
+                    SRV_WRN(" - disk cache: not enough memory to gather %.3f MiB of state\n",
+                            (cur_size_tgt + cur_size_dft) / (1024.0 * 1024.0));
+                }
+            }
             return false;
         }
 

@@ -653,7 +653,13 @@ struct server_prompt_cache {
 
     void set_disk(const std::string & dir, size_t limit_mib, bool has_mtmd);
     size_t disk_size() const;
+    bool has_disk() const { return disk_limit > 0; }
+    // false when the disk tier already holds this prompt or a longer one, so a caller that would have
+    // to gather the state first (see prompt_save) can skip the work
+    bool disk_wants(const server_prompt & prompt) const;
     void persist(const server_prompt_cache_state & state);
+    // the same, from buffers the RAM tier does not own: this is what lets --cache-ram stay small
+    void persist(const server_prompt & prompt, const std::vector<uint8_t> & data_main, const std::vector<uint8_t> & data_drft);
     // appends the best disk entry to `states` when it beats (f_keep_best, f_sim_best); returns it or nullptr
     server_prompt_cache_state * load_from_disk(const server_tokens & tokens_new, float & f_keep_best, float & f_sim_best);
 };

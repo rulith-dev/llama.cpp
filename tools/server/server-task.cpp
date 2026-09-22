@@ -14,6 +14,15 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#ifdef _WIN32
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#endif
 
 //
 // task_params
@@ -1833,6 +1842,16 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
+    // strixllama: an entry written while MTP was off carries no draft state, and nothing here can
+    // build one for a sequence the target is already deep into. Restoring the target alone would
+    // leave the draft context empty and drafting from it would not match. Cheaper to be wrong about
+    // the cache than about the tokens: process the prompt instead.
+    if (it_best != states.end() && ctx_dft && it_best->data.drft.empty()) {
+        SRV_WRN("%s", " - cached prompt carries no draft state and this server drafts: processing the prompt instead\n");
+        states.erase(it_best);
+        it_best = states.end();
+    }
+
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
@@ -1854,9 +1873,17 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         {
             auto & data = it_best->data.drft;
 
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
+            // strixllama: this server may have MTP off while the entry was written with it on. There is
+            // then no draft context to restore into and no drafting either, so the target state is
+            // complete on its own - drop the draft half rather than assert on it, which is what aborted
+            // the server the first time a cached conversation was reopened with MTP turned off.
+            if (!data.empty() && !ctx_dft) {
+                SRV_INF("%s", " - cached prompt carries a draft state and this server does not draft: keeping the target state\n");
+                data.clear();
+                data.shrink_to_fit();
+            }
 
+            if (!data.empty()) {
                 const size_t size = data.size();
                 const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
                 if (n != size) {
@@ -1920,18 +1947,96 @@ namespace {
 const char STRIX_SPC_MAGIC[8] = {'S','T','R','I','X','S','P','C'};
 const uint32_t STRIX_SPC_VERSION = 1;
 
+// strixllama: entries are read once and handed straight to the GPU, so the page cache only gets in
+// the way - it copies every GiB twice and evicts whatever the desktop was using. On Windows the file
+// is opened unbuffered and served through one aligned staging buffer; measured 505 -> ~3400 MB/s.
+#ifdef _WIN32
+struct spc_file {
+    static constexpr size_t STAGE = 8u << 20;   // a multiple of every sector size in use
+
+    HANDLE    h    = INVALID_HANDLE_VALUE;
+    uint8_t * stage = nullptr;
+    size_t    have = 0;     // valid bytes in stage
+    size_t    used = 0;     // consumed from stage
+    bool      bad  = false;
+
+    ~spc_file() {
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        if (stage) VirtualFree(stage, 0, MEM_RELEASE);
+    }
+
+    bool open(const std::string & path) {
+        const std::wstring w = std::filesystem::path(path).wstring();
+        h = CreateFileW(w.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                        FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (h == INVALID_HANDLE_VALUE) {
+            // not every volume serves unbuffered reads; a buffered handle is slower, not broken
+            h = CreateFileW(w.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                            FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        }
+        if (h == INVALID_HANDLE_VALUE) return false;
+        stage = (uint8_t *) VirtualAlloc(nullptr, STAGE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!stage) { CloseHandle(h); h = INVALID_HANDLE_VALUE; return false; }
+        return true;
+    }
+
+    bool refill() {
+        DWORD got = 0;
+        if (!ReadFile(h, stage, (DWORD) STAGE, &got, nullptr)) { bad = true; return false; }
+        have = got;
+        used = 0;
+        return got > 0;
+    }
+
+    // sequential read; dst may be null to skip
+    bool read(void * dst, size_t n) {
+        uint8_t * out = (uint8_t *) dst;
+        while (n > 0) {
+            if (used == have && !refill()) return false;
+            const size_t take = std::min(n, have - used);
+            if (out) { memcpy(out, stage + used, take); out += take; }
+            used += take;
+            n    -= take;
+        }
+        return true;
+    }
+
+    explicit operator bool() const { return h != INVALID_HANDLE_VALUE && !bad; }
+};
+#else
+struct spc_file {
+    std::ifstream f;
+    bool open(const std::string & path) { f.open(path, std::ios::binary); return (bool) f; }
+    bool read(void * dst, size_t n) {
+        if (dst) { f.read((char *) dst, n); } else { f.seekg((std::streamoff) n, std::ios::cur); }
+        return (bool) f;
+    }
+    explicit operator bool() const { return (bool) f; }
+};
+#endif
+
 template <typename T> void spc_put(std::ofstream & f, const T & v) { f.write((const char *) &v, sizeof(v)); }
-template <typename T> bool spc_get(std::ifstream & f, T & v) { f.read((char *) &v, sizeof(v)); return (bool) f; }
+template <typename T> bool spc_get(spc_file & f, T & v) { return f.read(&v, sizeof(v)); }
 void spc_put_blob(std::ofstream & f, const std::vector<uint8_t> & v) { spc_put(f, (uint64_t) v.size()); if (!v.empty()) f.write((const char *) v.data(), v.size()); }
-bool spc_get_blob(std::ifstream & f, std::vector<uint8_t> & v, uint64_t limit) {
+// strixllama: an entry is 92 blobs (target state, draft state, three per context checkpoint) and a long
+// conversation is several GiB of them, so it is worth knowing which half of "read" is the file and which
+// is the buffer it goes into
+struct spc_read_cost { int64_t alloc_us; int64_t read_us; uint64_t bytes; };
+spc_read_cost g_spc_cost = {};
+bool spc_get_blob(spc_file & f, std::vector<uint8_t> & v, uint64_t limit) {
     uint64_t n = 0;
     if (!spc_get(f, n) || n > limit) return false;
+    const int64_t t0 = ggml_time_us();
     v.resize(n);
-    if (n) f.read((char *) v.data(), n);
-    return (bool) f;
+    const int64_t t1 = ggml_time_us();
+    const bool ok = n == 0 || f.read(v.data(), n);
+    g_spc_cost.alloc_us += t1 - t0;
+    g_spc_cost.read_us  += ggml_time_us() - t1;
+    g_spc_cost.bytes    += n;
+    return ok;
 }
 // tokens as the serialized bytes, reinterpreted the way slot restore does
-bool spc_read_tokens(std::ifstream & f, server_tokens & out, bool has_mtmd) {
+bool spc_read_tokens(spc_file & f, server_tokens & out, bool has_mtmd) {
     std::vector<uint8_t> raw;
     if (!spc_get_blob(f, raw, 1ull << 30) || raw.size() % sizeof(llama_token) != 0) return false;
     llama_tokens packed(raw.size() / sizeof(llama_token));
@@ -1953,14 +2058,27 @@ void server_prompt_cache::set_disk(const std::string & dir, size_t limit_mib, bo
     disk_index.clear();
     for (const auto & entry : std::filesystem::directory_iterator(dir, ec)) {
         if (!entry.is_regular_file() || entry.path().extension() != ".spc") continue;
-        std::ifstream f(entry.path(), std::ios::binary);
+        spc_file f;
         char magic[8]; uint32_t version = 0, mtmd = 0;
-        if (!f.read(magic, 8) || memcmp(magic, STRIX_SPC_MAGIC, 8) != 0 || !spc_get(f, version) || version != STRIX_SPC_VERSION || !spc_get(f, mtmd)) {
+        if (!f.open(entry.path().string()) || !f.read(magic, 8) || memcmp(magic, STRIX_SPC_MAGIC, 8) != 0 || !spc_get(f, version) || version != STRIX_SPC_VERSION || !spc_get(f, mtmd)) {
             SRV_WRN(" - disk cache: skipping %s (not a cache file)\n", entry.path().string().c_str());
             continue;
         }
         disk_entry e { entry.path().string(), server_tokens(), (size_t) entry.file_size(ec), 0 };
-        if (!spc_read_tokens(f, e.tokens, disk_has_mtmd)) continue;
+        std::string why;
+        try {
+            if (!spc_read_tokens(f, e.tokens, disk_has_mtmd)) { why = "truncated or malformed token state"; }
+        } catch (const std::exception & ex) {
+            why = ex.what();
+        }
+        if (!why.empty()) {
+            // unreadable here is unreadable for good: no lookup can ever restore it, and leaving it
+            // in place keeps charging the limit for bytes nothing can use
+            SRV_WRN(" - disk cache: dropping %s (%.2f GiB): %s\n",
+                    entry.path().filename().string().c_str(), e.bytes / (1024.0 * 1024.0 * 1024.0), why.c_str());
+            std::filesystem::remove(entry.path(), ec);
+            continue;
+        }
         // order by the file's own write time, so the index survives restarts in LRU order
         e.order = std::chrono::duration_cast<std::chrono::milliseconds>(entry.last_write_time(ec).time_since_epoch()).count();
         disk_seq = std::max(disk_seq, e.order);
@@ -1970,6 +2088,14 @@ void server_prompt_cache::set_disk(const std::string & dir, size_t limit_mib, bo
             disk_index.size(), disk_size() / (1024.0 * 1024.0 * 1024.0), dir.c_str(), disk_limit / (1024.0 * 1024.0 * 1024.0));
 }
 
+bool server_prompt_cache::disk_wants(const server_prompt & prompt) const {
+    if (disk_limit == 0 || prompt.tokens.size() == 0) return false;
+    for (const auto & e : disk_index) {
+        if (e.tokens.get_common_prefix(prompt.tokens) == prompt.tokens.size()) return false;
+    }
+    return true;
+}
+
 size_t server_prompt_cache::disk_size() const {
     size_t res = 0;
     for (const auto & e : disk_index) res += e.bytes;
@@ -1977,29 +2103,35 @@ size_t server_prompt_cache::disk_size() const {
 }
 
 void server_prompt_cache::persist(const server_prompt_cache_state & state) {
-    if (disk_limit == 0 || state.prompt.tokens.size() == 0) return;
-    const llama_tokens text = state.prompt.tokens.get_text_tokens();
-    for (llama_token t : text) {
-        if (t == LLAMA_TOKEN_NULL) return;      // media in the prompt: not persisted
-    }
+    persist(state.prompt, state.data.main, state.data.drft);
+}
+
+void server_prompt_cache::persist(const server_prompt & prompt, const std::vector<uint8_t> & data_main, const std::vector<uint8_t> & data_drft) {
+    if (disk_limit == 0 || prompt.tokens.size() == 0) return;
+    // media in the prompt is not persisted: the chunks would have to come back through an mmproj this
+    // server may not have. get_text_tokens() drops the placeholders, so a short result is the tell -
+    // scanning it for LLAMA_TOKEN_NULL never found one, because it had just removed them all.
+    if (prompt.tokens.get_text_tokens().size() != prompt.tokens.size()) return;
+
     // entries that are a prefix of this one are obsolete, on disk as in RAM
     std::error_code ec;
     for (auto it = disk_index.begin(); it != disk_index.end();) {
-        const size_t lcp = it->tokens.get_common_prefix(state.prompt.tokens);
+        const size_t lcp = it->tokens.get_common_prefix(prompt.tokens);
         if (lcp == it->tokens.size()) {
             std::filesystem::remove(it->path, ec);
             it = disk_index.erase(it);
-        } else if (lcp == state.prompt.tokens.size()) {
+        } else if (lcp == prompt.tokens.size()) {
             return;                              // already covered by a longer entry on disk
         } else {
             ++it;
         }
     }
-    const std::vector<char> tok_bytes = state.prompt.tokens.serialize();
+
+    const std::vector<char> tok_bytes = prompt.tokens.serialize();
     uint64_t h = 1469598103934665603ull;
     for (char c : tok_bytes) { h ^= (uint8_t) c; h *= 1099511628211ull; }
     char name[64];
-    snprintf(name, sizeof(name), "%016llx-%d.spc", (unsigned long long) h, (int) state.prompt.tokens.size());
+    snprintf(name, sizeof(name), "%016llx-%d.spc", (unsigned long long) h, (int) prompt.tokens.size());
     const std::string path = (std::filesystem::path(disk_dir) / name).string();
     const std::string part = path + ".part";
     {
@@ -2010,10 +2142,10 @@ void server_prompt_cache::persist(const server_prompt_cache_state & state) {
         spc_put(f, (uint32_t) (disk_has_mtmd ? 1 : 0));
         spc_put(f, (uint64_t) tok_bytes.size());
         f.write(tok_bytes.data(), tok_bytes.size());
-        spc_put_blob(f, state.data.main);
-        spc_put_blob(f, state.data.drft);
-        spc_put(f, (uint32_t) state.prompt.checkpoints.size());
-        for (const auto & c : state.prompt.checkpoints) {
+        spc_put_blob(f, data_main);
+        spc_put_blob(f, data_drft);
+        spc_put(f, (uint32_t) prompt.checkpoints.size());
+        for (const auto & c : prompt.checkpoints) {
             spc_put(f, (int64_t) c.n_tokens);
             spc_put(f, (int32_t) c.pos_min);
             spc_put(f, (int32_t) c.pos_max);
@@ -2025,8 +2157,9 @@ void server_prompt_cache::persist(const server_prompt_cache_state & state) {
     }
     std::filesystem::rename(part, path, ec);
     if (ec) { std::filesystem::remove(part, ec); SRV_WRN(" - disk cache: cannot place %s\n", path.c_str()); return; }
-    disk_entry e { path, state.prompt.tokens.clone(), (size_t) std::filesystem::file_size(path, ec), ++disk_seq };
-    disk_index.push_back(std::move(e));
+
+    const size_t bytes = (size_t) std::filesystem::file_size(path, ec);
+    disk_index.push_back(disk_entry { path, prompt.tokens.clone(), bytes, ++disk_seq });
     // least recently written or used goes first
     while (disk_index.size() > 1 && disk_size() > disk_limit) {
         auto oldest = disk_index.begin();
@@ -2038,26 +2171,62 @@ void server_prompt_cache::persist(const server_prompt_cache_state & state) {
         disk_index.erase(oldest);
     }
     SRV_INF(" - disk cache: wrote %d tokens, %.3f GiB (%zu entries, %.1f GiB on disk)\n",
-            (int) state.prompt.tokens.size(), (double) e.bytes / (1024.0 * 1024.0 * 1024.0), disk_index.size(), disk_size() / (1024.0 * 1024.0 * 1024.0));
+            (int) prompt.tokens.size(), (double) bytes / (1024.0 * 1024.0 * 1024.0), disk_index.size(), disk_size() / (1024.0 * 1024.0 * 1024.0));
 }
 
 server_prompt_cache_state * server_prompt_cache::load_from_disk(const server_tokens & tokens_new, float & f_keep_best, float & f_sim_best) {
     auto best = disk_index.end();
+    auto closest = disk_index.end();          // closest entry whether or not it was taken, for the miss line
+    int  closest_lcp = -1;
+    int  best_lcp = -1;
+    float best_keep = 0.0f, best_sim = 0.0f;
     for (auto it = disk_index.begin(); it != disk_index.end(); ++it) {
         const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
         const float f_keep_cur = float(lcp_cur) / it->tokens.size();
         const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
-        if (f_keep_cur < 0.25f) continue;
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
-            f_keep_best = f_keep_cur;
-            f_sim_best  = f_sim_cur;
-            best = it;
+        if (lcp_cur > closest_lcp) { closest_lcp = lcp_cur; closest = it; }
+        // f_keep guards against dragging a long state in to serve a short prefix; f_sim has to beat
+        // what the slot or the RAM tier already offers, or the read buys nothing
+        if (f_keep_cur < 0.25f || f_sim_cur <= f_sim_best) continue;
+        // among what is left, take the entry that skips the most tokens. Ranking by f_keep the way
+        // the RAM tier does lets a short entry that happens to be a complete prefix (f_keep = 1.000)
+        // shadow a much longer one for the same conversation, because nothing can then exceed it:
+        // measured here as a 49370-token entry beating the 79441-token entry of the same chat and
+        // costing 30071 tokens of prefill, about 40 s.
+        if (lcp_cur > best_lcp) {
+            best_lcp  = lcp_cur;
+            best_keep = f_keep_cur;
+            best_sim  = f_sim_cur;
+            best      = it;
         }
     }
-    if (best == disk_index.end()) return nullptr;
+    if (best != disk_index.end()) {
+        f_keep_best = best_keep;
+        f_sim_best  = best_sim;
+    }
+    if (best == disk_index.end()) {
+        // the prefill that follows costs a minute or two on a long conversation, so name what was on
+        // the shelf and how it lost: f_keep below 0.25 means the conversation forked away from the
+        // entry, a base that already beats it means RAM or the slot covers more of the prompt
+        if (closest != disk_index.end()) {
+            SRV_INF(" - disk cache: nothing taken for %d tokens (%zu on disk; closest has %d tokens, lcp = %d, f_keep = %.3f, f_sim = %.3f; base f_keep = %.3f, f_sim = %.3f)\n",
+                    (int) tokens_new.size(), disk_index.size(), (int) closest->tokens.size(), closest_lcp,
+                    closest->tokens.size() ? float(closest_lcp) / closest->tokens.size() : 0.0f,
+                    tokens_new.size() ? float(closest_lcp) / tokens_new.size() : 0.0f, f_keep_best, f_sim_best);
+        } else {
+            SRV_INF(" - disk cache: empty, %d tokens will be processed from scratch\n", (int) tokens_new.size());
+        }
+        return nullptr;
+    }
 
     const int64_t t0 = ggml_time_us();
-    std::ifstream f(best->path, std::ios::binary);
+    g_spc_cost = {};
+    spc_file f;
+    if (!f.open(best->path)) {
+        // a file that will not open is not a file that is corrupt: leave it alone
+        SRV_WRN(" - disk cache: cannot open %s, skipping it this time\n", best->path.c_str());
+        return nullptr;
+    }
     char magic[8]; uint32_t version = 0, mtmd = 0;
     server_prompt_cache_state state;
     bool ok = f.read(magic, 8) && memcmp(magic, STRIX_SPC_MAGIC, 8) == 0 && spc_get(f, version) && version == STRIX_SPC_VERSION && spc_get(f, mtmd)
@@ -2083,8 +2252,10 @@ server_prompt_cache_state * server_prompt_cache::load_from_disk(const server_tok
         return nullptr;
     }
     best->order = ++disk_seq;
-    SRV_INF(" - disk cache: read %d tokens, %.3f GiB in %.0f ms (f_keep = %.3f, f_sim = %.3f)\n",
-            (int) state.prompt.tokens.size(), best->bytes / (1024.0 * 1024.0 * 1024.0), (ggml_time_us() - t0) / 1000.0, f_keep_best, f_sim_best);
+    SRV_INF(" - disk cache: read %d tokens, %.3f GiB in %.0f ms (file %.0f ms at %.0f MB/s, buffers %.0f ms; f_keep = %.3f, f_sim = %.3f)\n",
+            (int) state.prompt.tokens.size(), best->bytes / (1024.0 * 1024.0 * 1024.0), (ggml_time_us() - t0) / 1000.0,
+            g_spc_cost.read_us / 1000.0, g_spc_cost.read_us ? g_spc_cost.bytes / 1048576.0 / (g_spc_cost.read_us / 1e6) : 0.0,
+            g_spc_cost.alloc_us / 1000.0, f_keep_best, f_sim_best);
     states.push_back(std::move(state));
     return &states.back();
 }
