@@ -1761,7 +1761,11 @@ private:
             }
 
             if (ret != nullptr) {
-                const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
+                // strixllama: a slot named by id that holds nothing has nothing to keep - 0/0 here was a NaN, which
+                // compares false, so such a slot skipped the prompt cache and a long conversation sent back to its
+                // emptied slot was processed again from its first token instead of read back from the disk tier
+                const float f_keep = ret->prompt.tokens.empty() ? 0.0f :
+                    (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
 
                 if (task.id_slot == -1) {
                     SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
