@@ -5173,11 +5173,69 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     }
 };
 
+// strixllama: STRIX_MOE_IDS_FILE (lines of "n_rows n_experts count0 count1 ..." as STRIX_MMB_GLU_DUMP writes them) replaces
+// the uniform routing with recorded ones: the lines whose n_rows is a multiple of this test's token count and whose expert
+// count matches, one per call in turn, each expert repeated count times and shuffled over the token slots
+static bool init_recorded_ids(ggml_tensor * t, int n_mats) {
+    static const char * path = getenv("STRIX_MOE_IDS_FILE");
+    if (!path) {
+        return false;
+    }
+    static std::vector<std::vector<int>> lines;
+    static bool loaded = false;
+    if (!loaded) {
+        loaded = true;
+        std::ifstream f(path);
+        std::string l;
+        while (std::getline(f, l)) {
+            std::istringstream is(l);
+            std::vector<int> v;
+            int x;
+            while (is >> x) {
+                v.push_back(x);
+            }
+            if (v.size() > 2) {
+                lines.push_back(v);
+            }
+        }
+    }
+    const int64_t n = t->ne[1];
+    std::vector<const std::vector<int> *> cand;
+    for (const auto & v : lines) {
+        if (v[1] == n_mats && (int64_t) v.size() == 2 + n_mats && v[0] % n == 0 && v[0] / n <= t->ne[0]) {
+            cand.push_back(&v);
+        }
+    }
+    if (cand.empty()) {
+        return false;
+    }
+    static size_t turn = 0;
+    const std::vector<int> & v = *cand[turn++ % cand.size()];
+    const int n_used = (int) (v[0] / n);
+    std::vector<int32_t> pool;
+    for (int e = 0; e < n_mats; e++) {
+        pool.insert(pool.end(), v[2 + e], e);
+    }
+    std::default_random_engine rng(1234 + (unsigned) turn);
+    std::shuffle(pool.begin(), pool.end(), rng);
+    std::vector<int32_t> data(t->ne[0]);
+    for (int64_t r = 0; r < n; r++) {
+        for (int i = 0; i < t->ne[0]; i++) {
+            data[i] = i < n_used ? pool[r * n_used + i] : i % n_mats;
+        }
+        ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+    }
+    return true;
+}
+
 static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats) {
     std::random_device rd;
     std::default_random_engine rng(rd());
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+            continue;
+        }
+        if (init_recorded_ids(t, n_mats)) {
             continue;
         }
         for (int64_t r = 0; r < ggml_nrows(t); r++) {
@@ -5348,6 +5406,69 @@ struct test_mul_mat_id_fusion : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_ID_FUSION";
+    }
+};
+
+// strixllama: a MoE layer's gate and up projections and their SwiGLU, built the way build_moe_ffn builds them
+// (up, then gate, then swiglu_split; the token activations broadcast across the used experts), so a backend's
+// fused GLU path takes it as it would in the model. STRIX_MOE_GLU_PERF=8192,16384.
+struct test_moe_glu : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const int64_t m;    // n_ff
+    const int64_t n;    // tokens
+    const int64_t k;    // n_embd
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, n_mats, n_used, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * 2 * m * k * n * n_used;
+    }
+
+    test_moe_glu(ggml_type type_a, int n_mats, int n_used, int64_t m, int64_t n, int64_t k)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_w = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(gate_w, "gate_w");
+        ggml_tensor * up_w = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(up_w, "up_w");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+        ggml_set_name(ids, "view_of_ids");
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
+        ggml_set_name(x, "x");
+        ggml_tensor * up = ggml_mul_mat_id(ctx, up_w, x, ids);
+        ggml_set_name(up, "up");
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_w, x, ids);
+        ggml_set_name(gate, "gate");
+        ggml_tensor * out = ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        init_mul_mat_id_ids(ctx, n_mats);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_GLU";
     }
 };
 
@@ -11253,6 +11374,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
         return test_cases;
     }
+    // strixllama: the prefill-sized MoE work of this model as the model builds it: the fused gate/up SwiGLU (IQ3_S in the
+    // file, and IQ4_NL / IQ4_XS for comparison) and the down projection (IQ4_NL, and the five Q8_0 layers).
+    // STRIX_MOE_GLU_PERF=8192 or a token list.
+    if (const char * glu = getenv("STRIX_MOE_GLU_PERF")) {
+        std::vector<int> ns = {8192};
+        if (strchr(glu, ',') || atoi(glu) > 1) {
+            ns.clear();
+            for (const char * c = glu; *c; ) { ns.push_back(atoi(c)); c = strchr(c, ','); if (!c) break; ++c; }
+        }
+        const char * types = getenv("STRIX_MOE_GLU_TYPES");   // "iq3_s" by default; "all" adds the others
+        const bool all = types && strcmp(types, "all") == 0;
+        for (int n : ns) {
+            for (ggml_type t : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
+                if (t != GGML_TYPE_IQ3_S && !all) continue;
+                test_cases.emplace_back(new test_moe_glu(t, 512, 10, 640, n, 2560));
+            }
+            for (ggml_type t : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0}) {
+                if (t != GGML_TYPE_IQ4_NL && !all) continue;
+                test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));   // down
+            }
+        }
+        return test_cases;
+    }
     if (const char * moe = getenv("STRIX_MOE_PERF")) {
         std::vector<int> ns = {1, 4, 8, 16, 32};
         if (strchr(moe, ',') || atoi(moe) > 1) {           // STRIX_MOE_PERF=8,16,24,32,48,64
@@ -11913,7 +12057,8 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         case MODE_TEST:
         case MODE_GRAD:
         case MODE_SUPPORT:
-            test_cases = make_test_cases_eval();
+            // strixllama: STRIX_MOE_GLU_PERF also checks the prefill-sized MoE cases against the CPU in test mode
+            test_cases = getenv("STRIX_MOE_GLU_PERF") ? make_test_cases_perf() : make_test_cases_eval();
             break;
         case MODE_PERF:
             test_cases = make_test_cases_perf();

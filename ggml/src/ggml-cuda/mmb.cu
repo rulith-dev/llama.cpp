@@ -6,12 +6,15 @@
 #include "mmid.cuh"
 #include <cstdlib>
 #include <vector>
+#include <type_traits>
 #include <unordered_set>
 
 namespace {
 
 typedef short v16s __attribute__((ext_vector_type(16)));
 typedef float v8f  __attribute__((ext_vector_type(8)));
+typedef uint32_t mmb_u32x2 __attribute__((ext_vector_type(2)));
+typedef uint32_t mmb_u32x4 __attribute__((ext_vector_type(4)));
 constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
 
 __device__ __forceinline__ uint16_t mmb_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
@@ -564,6 +567,181 @@ mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restric
         [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, Ag, Au, Bs);
 }
 
+// strixllama: the IQ3_S gate/up tile. BM = 64 and the step's dequantization is spread over the whole block, four
+// threads per row with 16 of its 64 weights each (one thread per row left six of the eight waves waiting at the
+// barrier). On RDNA3.5 the VALU and the WMMA unit do not run at the same time on a SIMD, so every instruction of
+// the dequantization costs WMMA time; the rest is about spending fewer of them and never waiting on a load:
+// - weight = bf16(d * (+-g)): g and -g are exact in F16 and d * g is exact in F32 (at most 20 significant bits),
+//   so the sign goes onto the F16 grid value (an LDS copy of iq3s_grid with each byte as an F16) and the product
+//   is one v_fma_mix: the same bits as bf16(+-(d * (float) g)) with no byte convert and no compare/select;
+// - a thread's raw bytes stay whole in registers until it dequantizes them after the step's WMMAs: split into
+//   bytes at the load, they made every step wait for its weight loads before the first WMMA;
+// - the loads address the tile from a uniform base (the superblock of row 0, the step's column 0 of the
+//   activations) with 32-bit per-thread offsets, and the prefetch registers are native vectors (a HIP uint4 array
+//   here was not promoted to registers and went through scratch);
+// - a column past the expert's tokens reads token 0: finite values in a column that is never stored, instead of
+//   a branch and a zero fill per load;
+// - the step loop is instantiated per count of this wave's valid fragments (a uniform branch outside the loop,
+//   where a test per fragment branched around every WMMA pair), and a scheduling barrier keeps one 16-deep slice
+//   of fragments in registers at a time.
+// Each output element is the same WMMA chain over K as in mmb_tile_gemm_glu, so the results are bitwise the same.
+template <int N, typename F> __device__ __forceinline__ void mmb_with_na0(const int na, F && f) {
+    if (na == N) { f(std::integral_constant<int, N>{}); return; }
+    if constexpr (N > 0) { mmb_with_na0<N - 1>(na, f); }
+}
+template <int BN, int WTM, int WTN, typename XRowFn, typename DRowFn>
+__device__ __forceinline__ void mmb_tile_gemm_glu3(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const uint32_t wrow_bytes,
+        const uint16_t * __restrict__ Xh, const int K, XRowFn xrow, float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32,
+        const int M, DRowFn drow, const int m0, const int n_cols, uint16_t * Ag, uint16_t * Au, uint16_t * Bs, const mmb_u32x2 * grid16) {
+    constexpr int BM = 64, WAVES_M = BM / WTM, TM = WTM / 16, TN = WTN / 16;
+    constexpr int B_ITEMS = (BN * 8) / MMB_NT;
+    static_assert(BM * 4 == MMB_NT, "four threads per row of a 64-row tile");
+    const int tid = threadIdx.x, lane = tid & 31, wave = __builtin_amdgcn_readfirstlane(tid >> 5);
+    const int wm = wave % WAVES_M, wn = wave / WAVES_M;
+    // this thread's row, and its 16 weights of a step: half ph of the quarter superblock, grid pairs pil and pil + 1
+    const int prow = tid >> 2, ph = (tid & 3) >> 1, pil = (tid & 1) * 2;
+    const uint32_t ro = (uint32_t) prow * wrow_bytes;
+    const uint32_t o_qs = ro + 2 + 8 * ph + 2 * pil, o_qh = ro + 66 + ph, o_sg = ro + 74 + 4 * ph + pil, o_sc = ro + 106;
+    struct raw3 { uint32_t qs; uint16_t d, sg; uint8_t qh, sc; };
+    raw3 rg, ru;
+    auto ld3 = [&](const uint8_t * __restrict__ sb, const int q, raw3 & r) __attribute__((always_inline)) {   // sb: the step's superblock of row 0
+        r.d = *(const uint16_t *)(sb + ro);
+        __builtin_memcpy(&r.qs, (sb + 16 * q) + o_qs, 4);
+        r.qh = (sb + 2 * q)[o_qh];
+        r.sg = *(const uint16_t *)((sb + 8 * q) + o_sg);
+        r.sc = (sb + q)[o_sc];
+    };
+    auto dq3 = [&](const raw3 & r, uint32_t * arow) __attribute__((always_inline)) {
+        typedef uint16_t u16x2 __attribute__((ext_vector_type(2)));
+        const float d0 = mmb_h2f(r.d);
+        const float d = d0 * (float) (1 + 2 * ((r.sc >> (4 * ph)) & 0xf));
+        const uint32_t qhb = r.qh;
+#pragma unroll
+        for (int t = 0; t < 2; ++t) {
+            const int il = pil + t;
+            const mmb_u32x2 g1 = grid16[((r.qs >> (16 * t)) & 0xff) | ((qhb << (8 - 2 * il)) & 256)];
+            const mmb_u32x2 g2 = grid16[((r.qs >> (16 * t + 8)) & 0xff) | ((qhb << (7 - 2 * il)) & 256)];
+            const uint32_t sgn = (r.sg >> (8 * t)) & 0xff;
+            const u16x2 s2 = __builtin_bit_cast(u16x2, sgn | (sgn << 15));   // lanes: the signs, and the signs >> 1
+            const uint32_t gp[4] = {g1.x, g1.y, g2.x, g2.y};
+            uint32_t * out = arow + (32 * ph + 8 * il) / 2;
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const uint16_t sh = (uint16_t)(15 - 2 * q);
+                const uint32_t m = __builtin_bit_cast(uint32_t, s2 << (u16x2){sh, sh});   // bits 15, 31: signs 2q, 2q + 1
+                const uint32_t gs = (m & 0x80008000u) | (gp[q] & 0x7fff7fffu);
+                const float a = d * (float) __builtin_bit_cast(_Float16, (uint16_t)(gs & 0xffff));
+                const float b = d * (float) __builtin_bit_cast(_Float16, (uint16_t)(gs >> 16));
+                out[q] = mmb_pack2(a, b);
+            }
+        }
+    };
+    uint32_t boff[B_ITEMS];   // byte offset of this thread's 16 bytes of a step from the step's column 0 of token 0
+#pragma unroll
+    for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; const int t = xrow(c >> 3);
+        boff[i] = ((uint32_t) (t >= 0 ? t : 0) * (uint32_t) K + (uint32_t) (c & 7) * 8) * 2; }
+    mmb_u32x4 bst[B_ITEMS];
+    uint32_t * const agr = (uint32_t *)(Ag + prow * MMB_LDS_STRIDE), * const aur = (uint32_t *)(Au + prow * MMB_LDS_STRIDE);
+    auto load_regs = [&](const int ks) __attribute__((always_inline)) {
+        const size_t sbo = (size_t)(ks >> 2) * 110;
+        ld3(Wg + sbo, ks & 3, rg);
+        ld3(Wu + sbo, ks & 3, ru);
+        const uint8_t * xb = (const uint8_t *)(Xh + ks * MMB_BK);
+#pragma unroll
+        for (int i = 0; i < B_ITEMS; ++i) { bst[i] = *(const mmb_u32x4 *)(xb + boff[i]); }
+    };
+    auto store_lds = [&]() __attribute__((always_inline)) {
+        dq3(rg, agr); dq3(ru, aur);
+#pragma unroll
+        for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; *(mmb_u32x4 *)(Bs + (c >> 3) * MMB_LDS_STRIDE + (c & 7) * 8) = bst[i]; }
+    };
+    v8f accg[TM][TN], accu[TM][TN];
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j)
+#pragma unroll
+            for (int e = 0; e < 8; ++e) { accg[i][j][e] = 0.f; accu[i][j][e] = 0.f; }
+    // this wave's fragments that hold valid columns: a prefix of its TN (the rest are never computed or stored)
+    const int rem = n_cols - wn * WTN;
+    const int na = rem <= 0 ? 0 : rem >= WTN ? TN : (rem + 15) / 16;
+    const int nks = K / MMB_BK;
+    mmb_with_na0<TN>(na, [&](auto nac) __attribute__((always_inline)) {
+        constexpr int NA = decltype(nac)::value;
+        load_regs(0); store_lds(); __syncthreads();
+        for (int ks = 0; ks < nks; ++ks) {
+            if (ks + 1 < nks) load_regs(ks + 1);
+            if constexpr (NA > 0) {
+#pragma unroll
+                for (int kk = 0; kk < MMB_BK; kk += 16) {
+                    v16s ag[TM], au[TM], b[NA]; const int r = lane & 15;
+#pragma unroll
+                    for (int i = 0; i < TM; ++i) { const int off = (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
+                        ag[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Ag + off), *(const uint4 *)(Ag + off + 8)});
+                        au[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Au + off), *(const uint4 *)(Au + off + 8)}); }
+#pragma unroll
+                    for (int j = 0; j < NA; ++j) { const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
+                        b[j] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)p, *(const uint4 *)(p + 8)}); }
+#pragma unroll
+                    for (int i = 0; i < TM; ++i)
+#pragma unroll
+                        for (int j = 0; j < NA; ++j) {
+                            accg[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], ag[i], accg[i][j]);
+                            accu[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], au[i], accu[i][j]);
+                        }
+                    __builtin_amdgcn_sched_barrier(0);
+                }
+            }
+            __syncthreads();
+            if (ks + 1 < nks) store_lds();
+            __syncthreads();
+        }
+    });
+    float * stg = (float *)((BN * MMB_LDS_STRIDE * 2 >= MMB_NT / 32 * 1024) ? Bs : Ag) + wave * 256;
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        const int ml = wm * WTM + i * 16; const bool ok = ml < M - m0;
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            if (ok && j < na) {
+                v8f v;
+#pragma unroll
+                for (int e = 0; e < 8; ++e) { v[e] = ggml_cuda_op_silu_single(accg[i][j][e]) * accu[i][j][e]; }
+                mmb_store_tile(v, stg, D, Dh, store_f32, M, drow, wn * WTN + j * 16, m0 + ml, lane);
+            } else { __syncthreads(); __syncthreads(); }
+        }
+    }
+}
+
+template <int BN, int WTM, int WTN>
+__global__ void __launch_bounds__(MMB_NT, 2)
+mmb_routed_glu3_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const size_t expert_bytes, const uint16_t * __restrict__ Xh,
+        float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32,
+        const int32_t * __restrict__ ids_src, const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ bounds,
+        const uint32_t * __restrict__ desc, const int M, const int K) {
+    constexpr int BM = 64;
+    __shared__ __align__(16) uint16_t Ag[BM * MMB_LDS_STRIDE];
+    __shared__ __align__(16) uint16_t Au[BM * MMB_LDS_STRIDE];
+    __shared__ __align__(16) uint16_t Bs[BN * MMB_LDS_STRIDE];
+    __shared__ mmb_u32x2 grid16[512];   // iq3s_grid with each byte as an F16
+    const uint32_t dsc = desc[blockIdx.y];
+    if (dsc == UINT32_MAX) return;
+    for (int i = threadIdx.x; i < 512; i += MMB_NT) {
+        const uint32_t g = iq3s_grid[i];
+        uint32_t h[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) { h[j] = __builtin_bit_cast(uint16_t, (_Float16) (float) ((g >> (8 * j)) & 0xff)); }
+        grid16[i] = (mmb_u32x2){h[0] | (h[1] << 16), h[2] | (h[3] << 16)};
+    }
+    __syncthreads();
+    const int e = dsc & 0xffff, jt = dsc >> 16;
+    const int r0 = bounds[e] + jt * BN, cnt = bounds[e + 1] - r0;
+    const int m0 = blockIdx.x * BM;
+    const uint32_t wrow_bytes = (uint32_t)(K / 256) * 110;
+    mmb_tile_gemm_glu3<BN, WTM, WTN>(Wg + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, Wu + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, Xh, K,
+        [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, Ag, Au, Bs, grid16);
+}
+
 // F32 x F32 -> F32 GEMM with F32-equivalent precision on WMMA: each operand is split into F16 hi + F16 lo at tile load and
 // the product is accumulated as hi*hi + hi*lo + lo*hi in F32 (lo*lo ~2^-22 relative, dropped). Used for the F32 MoE router.
 __device__ __forceinline__ void mmb_split2(float x, uint16_t & hi, uint16_t & lo) {
@@ -991,19 +1169,43 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
             E, T, n_used, ne11, si1, sis1, /*write_inverse=*/false, stream);
     }
-    constexpr int BN_SMALL = 32, THRESH = 128;
+    const bool iq3s = gw->type == GGML_TYPE_IQ3_S;
+    // strixllama: IQ3_S goes through mmb_tile_gemm_glu3; STRIX_MMB_GLU3=0 goes back to mmb_tile_gemm_glu (same results,
+    // for A/B). glu3's tiles cost little besides their dequantization, so an expert of 32 rows or more is cheaper as one
+    // big tile than as several small ones, each dequantizing the same weights again: its threshold is 32, not 128.
+    static const bool glu3 = !getenv("STRIX_MMB_GLU3") || atoi(getenv("STRIX_MMB_GLU3")) != 0;
+    const bool use3 = iq3s && glu3;
+    constexpr int BN_SMALL = 32;
+    const int thresh = use3 ? 32 : 128;
     const int nbig_max   = n_rows / BN + E + 1;
-    const int nsmall_max = E * ((THRESH + BN_SMALL - 1) / BN_SMALL) + 1;
+    const int nsmall_max = E * ((thresh + BN_SMALL - 1) / BN_SMALL) + 1;
     ggml_cuda_pool_alloc<uint32_t> desc_big(ctx.pool(), nbig_max);
     ggml_cuda_pool_alloc<uint32_t> desc_small(ctx.pool(), nsmall_max);
-    mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds.get(), desc_big.get(), desc_small.get(), E, nbig_max, nsmall_max, BN, BN_SMALL, THRESH);
+    mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds.get(), desc_big.get(), desc_small.get(), E, nbig_max, nsmall_max, BN, BN_SMALL, thresh);
+    // strixllama: STRIX_MMB_GLU_DUMP=<file> appends every call's rows per expert ("n_rows n_experts count0 count1 ...",
+    // what test-backend-ops' STRIX_MOE_IDS_FILE replays); it synchronises the stream, so it is for recording only
+    static const char * dump = getenv("STRIX_MMB_GLU_DUMP");
+    if (dump) {
+        std::vector<int32_t> hb(E + 1);
+        CUDA_CHECK(cudaMemcpyAsync(hb.data(), bounds.get(), (E + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (FILE * f = fopen(dump, "a")) {
+            fprintf(f, "%d %d", n_rows, E);
+            for (int e = 0; e < E; ++e) { fprintf(f, " %d", hb[e + 1] - hb[e]); }
+            fputc('\n', f);
+            fclose(f);
+        }
+    }
     uint16_t * Dh = ggml_cuda_mmb_slot_reserve(ctx, 2, glu, (size_t) n_rows * M);
     const bool store_f32 = !ggml_cuda_mmb_is_bf16_only(glu);
-    const bool iq3s = gw->type == GGML_TYPE_IQ3_S;
     static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_GLU fused gate/up+swiglu: M=%d K=%d rows=%d store_f32=%d type=%s\n", M, K, n_rows, (int) store_f32, iq3s ? "IQ3_S" : "IQ4_NL");
     const uint8_t * Wg = (const uint8_t *) gw->data, * Wu = (const uint8_t *) uw->data; float * D = (float *) glu->data; const size_t eb = (size_t) gw->nb[2];
     dim3 gbig((M + 63) / 64, nbig_max), gsmall((M + 63) / 64, nsmall_max);
-    if (iq3s) {
+    if (use3) {
+        GGML_ASSERT((size_t) n_rows_x * K * 2 < ((size_t) 1 << 32));   // glu3's 32-bit activation offsets
+        mmb_routed_glu3_kernel<BN, 32, 32><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+        mmb_routed_glu3_kernel<BN_SMALL, 16, 16><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+    } else if (iq3s) {
         mmb_routed_glu_kernel<64, BN, 32, 32, 3><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
         mmb_routed_glu_kernel<64, BN_SMALL, 16, 16, 3><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
     } else {

@@ -14,8 +14,9 @@ What the delta does, in one line each (details in that repository's `patches/MAN
 - per-layer-embedding table read with unbuffered, overlapped direct I/O instead of the pager (`--load-mode none --lazy-mode on-direct`), so a 93.7 GB model runs in a 96 GB carve with the table on disk; the server gathers the next prompt batch's rows while the current one computes (`llama_strix_prefetch`)
 - a disk tier under the server's prompt cache: a content-addressed store kept per model, written a block at a time by a background writer and read straight from the device rather than through the page cache; idle conversations stay in their slots and page their checkpoints out to it, and a restore reads the chunks in parallel and leaves the checkpoints there; usable whether or not the server drafts
 - a few fused HIP kernels (chain fusion, getrows cast, an IQ3_S vec-dot, RDNA 3.5 row tiles for mmvq, a vector path for few-row matmuls past 8 columns), and the base's hyper-connection gate and PLE conv fusions extended to Unsloth's weight types (Q8_0, F32) with the unfused path's numerics
+- the routed IQ3_S expert gate/up + SwiGLU, prefill's largest kernel, rebuilt for gfx1151, where the VALU and the WMMA unit never overlap: its dequantization spread over the block and cut to fewer instructions per weight, its loads kept off the critical path - 1.8x, bitwise the same output
 - smaller: a bitonic sort for the QSA3 selection rows, conv-state tails copied without a cont
 
-Measured on the target machine at 85K tokens of context: prefill 886 tok/s, decode 34.9 tok/s (MTP acceptance 68%). Numbers, method and the ways we measured it wrong first: `docs/results.md` and `docs/measuring.md` in the main repository.
+Measured on the target machine: prefill 983 tok/s over 95.6K tokens of real text, decode 34.9 tok/s at 85K tokens of context (MTP acceptance 68%). Numbers, method and the ways we measured it wrong first: `docs/results.md` and `docs/measuring.md` in the main repository.
 
 Licence: upstream's (MIT). The patch set is MIT as well.
