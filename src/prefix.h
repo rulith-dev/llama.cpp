@@ -5,12 +5,15 @@
 #include <cstdint>
 #include <vector>
 
-static bool qsa_single_sequence_prefix(const llama_kv_cells & cells, uint32_t count, llama_seq_id seq) {
+// strixllama: active_only = the block list holds this sequence's blocks alone, so the other sequences' cells
+// do not break the prefix; the sequence's own cells must still be its alone
+static bool qsa_single_sequence_prefix(const llama_kv_cells & cells, uint32_t count, llama_seq_id seq, bool active_only = false) {
     if (count>cells.size()) { return false; }
     std::vector<llama_pos> positions;
     positions.reserve(count);
     for (uint32_t i=0;i<count;++i) {
         if (cells.is_empty(i)) { continue; }
+        if (active_only && !cells.seq_has(i,seq)) { continue; }
         if (cells.seq_get_all(i).count()!=1 || !cells.seq_has(i,seq) || cells.pos_get(i)<0) { return false; }
         positions.push_back(cells.pos_get(i));
     }

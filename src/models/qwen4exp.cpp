@@ -859,7 +859,8 @@ static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream);
 // cell permutations do not invalidate that upper bound. Blocks past it are -inf in the visibility metadata
 // anyway, so trimming them must not change the selection.
 static std::vector<int64_t> qwen4exp_score_key_limits(const llama_memory_hybrid_idx_context * mctx,
-        const llama_ubatch & ubatch, int64_t blocks, int64_t strip, int64_t ratio, int64_t budget, bool compact) {
+        const llama_ubatch & ubatch, int64_t blocks, int64_t strip, int64_t ratio, int64_t budget, bool compact,
+        bool active_only = false) {
     // llama_context::graph_reserve builds a worst-case graph from a synthetic ubatch whose positions are all 0.
     // Bounding that graph would reserve compute buffers for a 4%-wide scorer and then execute full-width ones, so a
     // many-token ubatch whose positions are all identical is treated as synthetic and left unbounded.
@@ -868,11 +869,11 @@ static std::vector<int64_t> qwen4exp_score_key_limits(const llama_memory_hybrid_
         if (ubatch.pos[i] != ubatch.pos[0]) { degenerate_pos = false; }
     }
     if (!compact || ubatch.n_tokens<128 || degenerate_pos || !qwen4exp_qsa_flag("LLAMA_QSA_SCORE_BOUNDS") ||
-            !mctx->qsa_position_prefix(ubatch)) {
+            !mctx->qsa_position_prefix(ubatch, active_only)) {
         static unsigned off = 0;
         if (off++ < 2) { fprintf(stderr,"QSA_SCORE_BOUNDS inactive (compact=%d tokens=%u flag=%d prefix=%d)\n",
                 (int) compact, ubatch.n_tokens, (int) qwen4exp_qsa_flag("LLAMA_QSA_SCORE_BOUNDS"),
-                (int) mctx->qsa_position_prefix(ubatch)); }
+                (int) mctx->qsa_position_prefix(ubatch, active_only)); }
         return {};
     }
     auto limits = qsa_prefix_limits(ubatch.pos,ubatch.n_tokens,strip,ratio,blocks,budget);
@@ -904,7 +905,7 @@ public:
         if (tail_idxs) {
             llama_memory_hybrid_idx::qsa_mixed_inputs mx;
             mx.seq_blk = seq_blk; mx.seq_tok = seq_tok;
-            mctx->set_input_qsa_blocks(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, kbp, seq_blk ? &mx : nullptr);
+            mctx->set_input_qsa_blocks(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, kbp, seq_blk ? &mx : nullptr, active_only);
         } else {
             mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, kbp);
         }
@@ -925,9 +926,17 @@ public:
 
         const int64_t n_kv     = idx->get_n_kv();
         const int64_t n_stream = mctx->get_n_stream();
-        const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
+        const bool blocks=qwen4exp_use_block_selection(blk_bias,n_stream,ratio,n_kv,
+                params.ubatch,params.cparams,params.hparams);
+        const bool scalar=blocks && params.hparams.n_swa==0 && mctx->qsa_scalar_visibility(params.ubatch);
+        // strixllama: a compact graph's block list may cover only the ubatch's sequences (qsa_active_blocks)
+        const int64_t n_active = scalar && qwen4exp_qsa_flag("LLAMA_QSA_COMPACT_METADATA") ?
+                mctx->qsa_active_blocks(params.ubatch, ratio, params.hparams.indexer_top_k/ratio) : 0;
+        const int64_t n_blocks = n_active > 0 ? n_active : (n_kv + ratio - 1)/ratio;
 
         bool res = true;
+
+        res &= active_only == (n_active > 0);
 
         res &= params.ubatch.n_tokens % n_stream == 0;
 
@@ -938,10 +947,7 @@ public:
         res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
         res &= bias->ne[0] == (compact ? n_blocks+params.ubatch.n_tokens : (blk_bias ? n_blocks : n_kv));
         res &= compact || bias->ne[1] == params.ubatch.n_tokens/n_stream;
-        const bool blocks=qwen4exp_use_block_selection(blk_bias,n_stream,ratio,n_kv,
-                params.ubatch,params.cparams,params.hparams);
         res &= (tail_idxs != nullptr) == blocks;
-        const bool scalar=blocks && params.hparams.n_swa==0 && mctx->qsa_scalar_visibility(params.ubatch);
         res &= compact == (scalar && qwen4exp_qsa_flag("LLAMA_QSA_COMPACT_METADATA"));
         res &= maskless == (scalar && qwen4exp_qsa_flag("LLAMA_QSA_NO_DENSE_MASK") &&
                 params.ubatch.n_tokens/n_stream >= 128);
@@ -955,7 +961,7 @@ public:
         // [QSA_SCORE_BOUNDS] the trimmed widths are baked into the graph, so a reused graph must agree on them
         const int64_t next_strip=qwen4exp_query_strip(params.ubatch.n_tokens/n_stream,n_stream);
         const auto next_limits=qwen4exp_score_key_limits(mctx,params.ubatch,n_blocks,next_strip,ratio,
-                params.hparams.indexer_top_k/ratio,scalar && compact);
+                params.hparams.indexer_top_k/ratio,scalar && compact,active_only);
         res &= score_strip==next_strip;
         res &= score_key_limits==next_limits;
         // strixllama: block-key cache shapes and mode are baked into the graph
@@ -992,6 +998,7 @@ public:
     ggml_tensor * seq_tok = nullptr;   // F32 [n_seqs_unq, n_tokens/n_stream]
     bool compact = false;
     bool maskless = false;
+    bool active_only = false;   // the block list covers only the ubatch's own sequences
     int64_t score_strip = 0;
     std::vector<int64_t> score_key_limits;       // [QSA_SCORE_BOUNDS] per strip, empty = no bound
 
@@ -1096,8 +1103,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     GGML_ASSERT(r > 0);
 
-    const int64_t n_blocks = (n_kv + r - 1)/r;
-
     // build_attn_qsa and the KQ mask need the tokens to divide evenly across the streams
     const int64_t n_stream = mctx_hyb->get_n_stream();
     GGML_ASSERT(n_tokens % n_stream == 0);
@@ -1110,6 +1115,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     const bool blk_bias = kq_mask != nullptr &&
         kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
         cparams.causal_attn && !hparams.use_alibi;
+
+    // strixllama: a compact ubatch's block list covers only its own sequences when the memory allows it
+    // (llama_memory_hybrid_idx_context::qsa_active_blocks); otherwise every cell of the pool
+    const bool qsa_compact = qwen4exp_use_block_selection(blk_bias,n_stream,r,n_kv,ubatch,cparams,hparams) &&
+        hparams.n_swa==0 && mctx_hyb->qsa_scalar_visibility(ubatch) && qwen4exp_qsa_flag("LLAMA_QSA_COMPACT_METADATA");
+    const int64_t n_active = qsa_compact ? mctx_hyb->qsa_active_blocks(ubatch, r, hparams.indexer_top_k/r) : 0;
+    const int64_t n_blocks = n_active > 0 ? n_active : (n_kv + r - 1)/r;
 
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
@@ -1127,6 +1139,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const bool scalar = qwen4exp_use_block_selection(blk_bias,n_stream,r,n_kv,ubatch,cparams,hparams) &&
             hparams.n_swa==0 && mctx_hyb->qsa_scalar_visibility(ubatch);
         qsa->compact = scalar && qwen4exp_qsa_flag("LLAMA_QSA_COMPACT_METADATA");
+        qsa->active_only = n_active > 0;
         // strixllama: only the qsa3 kernel honours the indices without a mask, and it declines batches under
         // 128 queries. On HIP the generic flash-attention kernels ignore the indices (sparse gather is
         // CUDA-only), so a maskless op there runs dense attention over the whole batch with no causal
@@ -1136,7 +1149,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         qsa->maskless = scalar && qwen4exp_qsa_flag("LLAMA_QSA_NO_DENSE_MASK") && n_tps >= 128;
         qsa->score_strip=qwen4exp_query_strip(n_tps,n_stream);
         qsa->score_key_limits=qwen4exp_score_key_limits(mctx_hyb,ubatch,n_blocks,qsa->score_strip,r,
-                hparams.indexer_top_k/r,qsa->compact);
+                hparams.indexer_top_k/r,qsa->compact,qsa->active_only);
         qsa->bias = qsa->compact ? ggml_new_tensor_1d(ctx0,GGML_TYPE_I32,n_blocks+n_tps) :
             ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
 

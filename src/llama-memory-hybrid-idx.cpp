@@ -439,8 +439,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
 void llama_memory_hybrid_idx::set_input_qsa_blocks(
         ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-        ggml_tensor * bias, ggml_tensor * tail_idxs, const llama_ubatch * ubatch, uint32_t ratio, const qsa_kb_inputs * kb, const qsa_mixed_inputs * mixed) const {
-    set_input_qsa_impl(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, true, kb, mixed);
+        ggml_tensor * bias, ggml_tensor * tail_idxs, const llama_ubatch * ubatch, uint32_t ratio, const qsa_kb_inputs * kb, const qsa_mixed_inputs * mixed,
+        bool active_only) const {
+    set_input_qsa_impl(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, true, kb, mixed, active_only);
 }
 
 void llama_memory_hybrid_idx::set_input_qsa_impl(
@@ -453,7 +454,8 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
         uint32_t ratio,
         bool blk_bias,
         const qsa_kb_inputs * kb,
-        const qsa_mixed_inputs * mixed) const {
+        const qsa_mixed_inputs * mixed,
+        bool active_only) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
 
@@ -464,6 +466,20 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
     const int64_t n_blocks = blk_pos->ne[0]/(4*n_ns);
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t r        = ratio;
+
+    // strixllama: n_blocks is the length of the block list the graph was built for; n_pb is the window of
+    // position buckets the cells are grouped by. They are one number unless the list covers only the
+    // ubatch's own sequences (active_only, llama_memory_hybrid_idx_context::qsa_active_blocks): then the
+    // list is shorter than the window, and every cell of another sequence is left out of the grouping -
+    // its blocks were enumerated before only to be marked invisible to every query of the ubatch.
+    GGML_ASSERT(!active_only || (tail_idxs && bias->type == GGML_TYPE_I32 && n_ns == 1));
+    const int64_t n_pb = active_only ? std::max(n_blocks, (n_kv + r - 1)/r) : n_blocks;
+    std::bitset<LLAMA_MAX_SEQ> active_seqs;
+    if (active_only) {
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            for (int32_t k = 0; k < ubatch->n_seq_id[i]; ++k) { active_seqs.set(ubatch->seq_id[i][k]); }
+        }
+    }
 
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
@@ -516,7 +532,7 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
     //       is the per-cell scan rather than these allocations, so hoisting them buys nothing
     std::vector<int32_t>  blk_of(n_kv);
     std::vector<int32_t>  cell_grp(n_kv);
-    std::vector<int32_t>  grp_head(n_blocks);
+    std::vector<int32_t>  grp_head(n_pb);
     std::vector<int32_t>  grp_next;
     std::vector<int32_t>  grp_first;
     std::vector<int32_t>  grp_slot0;
@@ -582,11 +598,14 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
                 if (cells.is_empty(j)) {
                     continue;
                 }
+                if (active_only && (cells.seq_get_all(j) & active_seqs).none()) {
+                    continue;
+                }
 
                 const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
                 const int64_t pb  = idx/r;
 
-                if (pb >= n_blocks) {
+                if (pb >= n_pb) {
                     oor = true;
                     continue;
                 }
@@ -672,7 +691,7 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
 
         int32_t n_bid = 0;
 
-        for (int64_t pb = 0; pb < n_blocks; ++pb) {
+        for (int64_t pb = 0; pb < n_pb; ++pb) {
             for (int32_t g = grp_head[pb]; g >= 0; g = grp_next[g]) {
                 if (grp_slots[g] != slots_full) {
                     continue;
@@ -860,7 +879,7 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
             const int64_t tail_start = (q + 1)/r*r;
             if (dst_tail && q+1>tail_start) {
                 const int64_t pb=tail_start/r;
-                if (pb>=0 && pb<n_blocks) {
+                if (pb>=0 && pb<n_pb) {
                     int32_t * tail=dst_tail+(s*n_tps+ii)*(r-1);
                     for (int32_t g=grp_head[pb];g>=0;g=grp_next[g]) {
                         if (!cells.seq_has((uint32_t)grp_first[g],seq_id)) { continue; }
@@ -1044,15 +1063,72 @@ void llama_memory_hybrid_idx_context::set_input_qsa_blocks(
         ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
         ggml_tensor * bias, ggml_tensor * tail_idxs, const llama_ubatch * ubatch, uint32_t ratio,
         const llama_memory_hybrid_idx::qsa_kb_inputs * kb,
-        const llama_memory_hybrid_idx::qsa_mixed_inputs * mixed) const {
+        const llama_memory_hybrid_idx::qsa_mixed_inputs * mixed,
+        bool active_only) const {
     GGML_ASSERT(mem != nullptr);
-    mem->set_input_qsa_blocks(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, kb, mixed);
+    mem->set_input_qsa_blocks(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, kb, mixed, active_only);
 }
 
-bool llama_memory_hybrid_idx_context::qsa_position_prefix(const llama_ubatch & ubatch) const {
+bool llama_memory_hybrid_idx_context::qsa_position_prefix(const llama_ubatch & ubatch, bool active_only) const {
     if (!qsa_scalar_visibility(ubatch)) { return false; }
     const llama_seq_id seq=ubatch.seq_id[0][0];
-    return qsa_single_sequence_prefix(mem->get_mem_idx()->get_cells(seq),get_idx()->get_n_kv(),seq);
+    // a list of the ubatch's own sequences is one sequence's position prefix only if the ubatch has one sequence
+    if (active_only) {
+        for (uint32_t i=0;i<ubatch.n_tokens;++i) {
+            if (ubatch.n_seq_id[i]!=1 || ubatch.seq_id[i][0]!=seq) { return false; }
+        }
+    }
+    return qsa_single_sequence_prefix(mem->get_mem_idx()->get_cells(seq),get_idx()->get_n_kv(),seq,active_only);
+}
+
+// strixllama: in a unified cache every slot's conversation sits in one pool of cells and the graph spans the
+// pool (n_kv), so the block list of a compact ubatch used to hold every conversation's blocks, the idle ones
+// marked invisible: a decoded token paid for the block keys, the scores and the enumeration of conversations
+// that were not running. The list can hold the ubatch's own sequences alone: a block's cells share one
+// sequence set, every block of another set was invisible to every query here, and the visible ones keep
+// their order, so the same blocks are selected in the same order. A sequence with at least the selection's
+// budget of visible blocks gets bitwise the same result; a shorter one fills the budget with invisible
+// entries, which now sit after its own blocks rather than among them, and that can move the last bits of its
+// attention (towards what a single-slot server computes, which has no other conversation to fill it with).
+// The length is an upper bound: at most one cell per position per sequence while no image has been written
+// (kb_pos_dup), so a sequence holds at most pos_max - pos_min + 1 cells; rounded up to a multiple of 64
+// blocks (256 cells at ratio 4, the step of n_kv) so a graph is rebuilt as rarely as before, and never below
+// the budget. A graph that rewrites every block key (kb_needs_full) keeps the whole pool: it is the one that
+// refreshes the idle sequences' keys too. So does the reserve graph (positions all equal), which sizes the
+// buffers for the widest graph. LLAMA_QSA_ACTIVE_BLOCKS=0 turns this off.
+int64_t llama_memory_hybrid_idx_context::qsa_active_blocks(const llama_ubatch & ubatch, uint32_t ratio, int64_t min_blocks) const {
+    static const bool on = !getenv("LLAMA_QSA_ACTIVE_BLOCKS") || atoi(getenv("LLAMA_QSA_ACTIVE_BLOCKS")) != 0;
+    if (!on || mem == nullptr || get_idx() == nullptr || ratio == 0 || get_n_stream() != 1 ||
+            mem->kb_needs_full() || mem->kb_pos_dup() || !qsa_scalar_visibility(ubatch)) {
+        return 0;
+    }
+    bool same_pos = ubatch.n_tokens > 1;
+    for (uint32_t i = 1; same_pos && i < ubatch.n_tokens; ++i) {
+        if (ubatch.pos[i] != ubatch.pos[0]) { same_pos = false; }
+    }
+    if (same_pos) {
+        return 0;
+    }
+    std::bitset<LLAMA_MAX_SEQ> seqs;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        for (int32_t k = 0; k < ubatch.n_seq_id[i]; ++k) { seqs.set(ubatch.seq_id[i][k]); }
+    }
+    const auto & cells = mem->get_mem_idx()->get_cells(ubatch.seq_id[0][0]);
+    int64_t n_cells = 0;
+    for (int32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+        if (!seqs.test(s)) {
+            continue;
+        }
+        const llama_pos p0 = cells.seq_pos_min(s);
+        const llama_pos p1 = cells.seq_pos_max(s);
+        if (p0 < 0 || p1 < p0) {
+            return 0;
+        }
+        n_cells += (int64_t) p1 - p0 + 1;
+    }
+    const int64_t full   = ((int64_t) get_idx()->get_n_kv() + ratio - 1)/ratio;
+    const int64_t blocks = std::max(min_blocks, ((n_cells + ratio - 1)/ratio + 63)/64*64);
+    return blocks < full ? blocks : 0;
 }
 
 bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch & ubatch) const {

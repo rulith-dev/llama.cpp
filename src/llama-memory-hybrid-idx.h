@@ -118,7 +118,7 @@ public:
     void set_input_qsa_blocks(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                              ggml_tensor * bias, ggml_tensor * tail_idxs,
                              const llama_ubatch * ubatch, uint32_t ratio, const qsa_kb_inputs * kb = nullptr,
-                             const qsa_mixed_inputs * mixed = nullptr) const;
+                             const qsa_mixed_inputs * mixed = nullptr, bool active_only = false) const;
 
     ggml_tensor * get_kb(int32_t il) const;   // F16 [idx_dim, kv_size + 1]; null when off or no indexer on il
     uint32_t      kb_scratch_row() const;     // the spare row: kv_size of the indexer cache
@@ -133,7 +133,8 @@ private:
     void set_input_qsa_impl(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                             ggml_tensor * bias, ggml_tensor * tail_idxs,
                             const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias,
-                            const qsa_kb_inputs * kb, const qsa_mixed_inputs * mixed = nullptr) const;
+                            const qsa_kb_inputs * kb, const qsa_mixed_inputs * mixed = nullptr,
+                            bool active_only = false) const;
 
     // strixllama: block-key cache storage, one tensor per indexer layer, in the layer's device buffer
     std::vector<ggml_context_ptr>        kb_ctxs;
@@ -198,7 +199,10 @@ public:
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
     bool qsa_scalar_visibility(const llama_ubatch & ubatch) const;
-    bool qsa_position_prefix(const llama_ubatch & ubatch) const;
+    bool qsa_position_prefix(const llama_ubatch & ubatch, bool active_only = false) const;
+    // strixllama: the length of a block list that covers only the ubatch's own sequences, at least min_blocks
+    // (the selection's budget), or 0 when the list must cover every cell of the pool (see the definition)
+    int64_t qsa_active_blocks(const llama_ubatch & ubatch, uint32_t ratio, int64_t min_blocks) const;
 
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
@@ -207,7 +211,8 @@ public:
                              ggml_tensor * bias, ggml_tensor * tail_idxs,
                              const llama_ubatch * ubatch, uint32_t ratio,
                              const llama_memory_hybrid_idx::qsa_kb_inputs * kb = nullptr,
-                             const llama_memory_hybrid_idx::qsa_mixed_inputs * mixed = nullptr) const;
+                             const llama_memory_hybrid_idx::qsa_mixed_inputs * mixed = nullptr,
+                             bool active_only = false) const;
 
     // strixllama: block-key cache pass-throughs (see llama_memory_hybrid_idx)
     ggml_tensor * get_kb(int32_t il) const;
