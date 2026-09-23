@@ -499,6 +499,9 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
 
+    // strixllama: the cache views start at the window's first cell
+    res &= kv_off == mctx->get_kv_off();
+
     return res;
 }
 
@@ -1133,6 +1136,9 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+
+    // strixllama: the cache views start at the window's first cell
+    res &= inp_attn->kv_off == mctx->get_attn()->get_kv_off();
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2847,6 +2853,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
+
+    inp->kv_off = mctx_cur->get_kv_off();
 
     return inp;
 }

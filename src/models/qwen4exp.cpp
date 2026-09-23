@@ -450,6 +450,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
     if (mctx_idx) {
         GGML_ASSERT(mctx_idx->get_n_kv() == inp->mctx->get_attn()->get_n_kv() &&
+                mctx_idx->get_kv_off() == inp->mctx->get_attn()->get_kv_off() &&
                 "the indexer cache must track the attention cache cell for cell");
     }
 
@@ -607,6 +608,9 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         if (m->get_idx() != nullptr) {
             mctx_hyb = m;
             inp_attn = inp_hyb->get_attn();
+            GGML_ASSERT(m->get_idx()->get_n_kv() == m->get_attn()->get_n_kv() &&
+                    m->get_idx()->get_kv_off() == m->get_attn()->get_kv_off() &&
+                    "the indexer cache must track the attention cache cell for cell");
             // the MTP graph has no recurrent layers, so the hybrid input's recurrent tensors are never used and the
             // allocator skips them -- set_input would then hit a null buffer. Give them a trivial use.
             auto * rs = inp_hyb->get_recr();
@@ -912,7 +916,7 @@ public:
         // a graph that rewrites every block key refreshes the cache when it runs, not when it is built:
         // llama_context::graph_reserve builds graphs that never execute
         if (kbp && kb_full) {
-            mctx->kb_mark_full();
+            mctx->kb_mark_full(*ubatch);
         }
     }
 
@@ -969,7 +973,7 @@ public:
         // before one arrived cannot be reused after (it would take the ranked path and abort)
         res &= kb_dup == mctx->kb_pos_dup();
         if (kb_bid_rows) {
-            res &= kb_full == mctx->kb_needs_full();
+            res &= kb_full == mctx->kb_needs_full(params.ubatch);
             res &= kb_bid_rows->ne[0] == n_blocks;
             if (kb_dirty_dst) { res &= kb_dirty_dst->ne[0] == params.ubatch.n_tokens/n_stream/ratio + 2*(int64_t) params.ubatch.n_seqs_unq + 2; }
         }
@@ -1181,7 +1185,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             // strixllama: a ubatch of several sequences can complete up to two blocks per sequence
             const int64_t dirty_max = n_tps/r + 2*(int64_t) ubatch.n_seqs_unq + 2;
             // an input no node reads is never allocated, so a full-rebuild graph gets only the rows tensor
-            qsa->kb_full        = mctx_hyb->kb_needs_full();
+            qsa->kb_full        = mctx_hyb->kb_needs_full(ubatch);
             qsa->kb_bid_rows    = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_blocks);
             if (!qsa->kb_full) {
                 qsa->kb_dirty_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*dirty_max, 1);

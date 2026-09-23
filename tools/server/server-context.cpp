@@ -63,6 +63,32 @@ struct strixllama_spec_timing {
 };
 static strixllama_spec_timing g_spec_timing;
 
+// strixllama: a failing operator new reports the size it asked for and its call stack as module+offset before the
+// std::bad_alloc surfaces as "bad allocation". That message alone could not tell an out-of-memory machine from a
+// size computed out of garbage; on this machine it was the first (the commit limit, see docs/measuring.md).
+#if defined(_WIN32)
+#include <new.h>
+static int strixllama_new_handler(size_t size) {
+    void * frames[48];
+    const USHORT n = CaptureStackBackTrace(1, 48, frames, nullptr);
+    fprintf(stderr, "NEW_FAILED size=%zu (0x%zx)\n", size, size);
+    for (USHORT i = 0; i < n; ++i) {
+        HMODULE mod = nullptr;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    (LPCSTR) frames[i], &mod) && mod) {
+            GetModuleFileNameA(mod, name, MAX_PATH);
+        }
+        const char * base = strrchr(name, '\\');
+        fprintf(stderr, "NEW_FAILED   #%u %s+0x%llx\n", (unsigned) i, base ? base + 1 : name,
+                (unsigned long long) ((const char *) frames[i] - (const char *) mod));
+    }
+    fflush(stderr);
+    return 0;
+}
+static const int strixllama_new_handler_installed = [] { _set_new_handler(strixllama_new_handler); return 1; }();
+#endif
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {

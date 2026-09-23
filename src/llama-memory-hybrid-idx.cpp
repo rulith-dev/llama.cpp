@@ -127,6 +127,34 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         }
         LLAMA_LOG_INFO("%s: QSA block-key cache: %zu layers, %.1f MiB\n", __func__, kb_map.size(), bytes/1024.0/1024.0);
     }
+
+    // strixllama: regions (llama_kv_cache::set_regions) - with several sequences in one unified pool, each
+    // conversation keeps one run of cells and a batch's graph views only its own. The indexer mirrors the
+    // attention cells, so both caches take the window, and the moves, together. LLAMA_KV_REGIONS=0 turns it off.
+    {
+        const char * env = getenv("LLAMA_KV_REGIONS");
+        const bool on = unified && n_seq_max > 1 && (env == nullptr || atoi(env) != 0);
+        get_mem_attn()->set_regions(on);
+        if (mem_idx) {
+            mem_idx->set_regions(on);
+            if (get_mem_attn()->get_regions() != mem_idx->get_regions()) {
+                get_mem_attn()->set_regions(false);
+                mem_idx->set_regions(false);
+            }
+        }
+        if (get_mem_attn()->get_regions()) {
+            // every move of the attention cells - a rebalance for a batch or for a restore - moves the indexer's
+            // cells and the block keys with them, in the same step
+            get_mem_attn()->set_move_hook([this](const llama_kv_cache::cell_move_vec_t & moves, bool sync) {
+                if (mem_idx) {
+                    GGML_ASSERT(mem_idx->can_move());
+                    mem_idx->move_cells(moves, sync);
+                }
+                kb_move_rows(moves);
+            });
+            fprintf(stderr, "kv regions: on, one run of cells per conversation, %u sequences, %u cells\n", n_seq_max, kv_size);
+        }
+    }
 }
 
 ggml_tensor * llama_memory_hybrid_idx::get_kb(int32_t il) const {
@@ -138,16 +166,62 @@ uint32_t llama_memory_hybrid_idx::kb_scratch_row() const {
     return mem_idx ? mem_idx->get_size() : 0;
 }
 
-bool llama_memory_hybrid_idx::kb_needs_full() const {
-    return kb_full_gen != kb_gen;
+bool llama_memory_hybrid_idx::kb_needs_full(const llama_ubatch & ubatch) const {
+    if (kb_stale.none() || !ubatch.seq_id || !ubatch.n_seq_id) {
+        return false;
+    }
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        for (int32_t k = 0; k < ubatch.n_seq_id[i]; ++k) {
+            const llama_seq_id s = ubatch.seq_id[i][k];
+            if (s >= 0 && s < LLAMA_MAX_SEQ && kb_stale.test(s)) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
-void llama_memory_hybrid_idx::kb_mark_full() const {
-    kb_full_gen = kb_gen;
+void llama_memory_hybrid_idx::kb_mark_full(const llama_ubatch & ubatch) const {
+    if (!ubatch.seq_id || !ubatch.n_seq_id) {
+        return;
+    }
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        for (int32_t k = 0; k < ubatch.n_seq_id[i]; ++k) {
+            const llama_seq_id s = ubatch.seq_id[i][k];
+            if (s >= 0 && s < LLAMA_MAX_SEQ) {
+                kb_stale.reset(s);
+            }
+        }
+    }
+}
+
+void llama_memory_hybrid_idx::kb_mark_stale(llama_seq_id seq_id) {
+    if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ) {
+        kb_stale.set();
+    } else {
+        kb_stale.set(seq_id);
+    }
 }
 
 bool llama_memory_hybrid_idx::kb_pos_dup() const {
     return kb_dup;
+}
+
+// A block's key sits at the row of its first cell. The moves lay a sequence out in position order, so its keys
+// can follow their cells only if its cells were in that order already (then every block keeps its first cell);
+// a sequence whose cells were not has its keys rebuilt once instead.
+void llama_memory_hybrid_idx::kb_move_rows(const llama_kv_cache::cell_move_vec_t & moves) {
+    llama_kv_cache::cell_move_vec_t rows;
+    for (const auto & m : moves) {
+        if (m.ordered) {
+            rows.push_back(m);
+        } else {
+            kb_mark_stale(m.seq);
+        }
+    }
+    for (const auto & [il, t] : kb_map) {
+        get_mem_attn()->copy_rows(t, rows);
+    }
 }
 
 // strixllama: does this ubatch carry a position per axis, i.e. an image under M-RoPE? A text token has
@@ -250,6 +324,12 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
             }
         }
 
+        // strixllama: regions - when the batch does not fit after its conversations' last cells, the pool is
+        // rebalanced first; the hook set in the constructor moves the indexer and the block keys along
+        if (get_mem_attn()->can_move() && (!mem_idx || mem_idx->can_move())) {
+            get_mem_attn()->move_cells(get_mem_attn()->plan_layout(ubatches));
+        }
+
         // prepare the recurrent batches first
         if (!hybrid_idx_no_recr(get_mem_recr()) && !get_mem_recr()->prepare(ubatches)) {
             // TODO: will the recurrent cache be in an undefined context at this point?
@@ -286,7 +366,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lc
 }
 
 void llama_memory_hybrid_idx::clear(bool data) {
-    kb_gen++;   // strixllama: block keys depend on positions and cell contents; rebuild them all once
+    kb_mark_stale(-1);   // strixllama: block keys depend on positions and cell contents; rebuild them once
     kb_dup = false;   // strixllama: no cells left, so no image cells either
     llama_memory_hybrid::clear(data);
 
@@ -317,6 +397,11 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
 }
 
 void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    // strixllama: the copy shares the source's cells, and with them block keys that may still have to be rebuilt
+    if (seq_id_src >= 0 && seq_id_src < LLAMA_MAX_SEQ && kb_stale.test(seq_id_src)) {
+        kb_mark_stale(seq_id_dst);
+    }
+
     llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
 
     if (mem_idx) {
@@ -333,7 +418,7 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
-    kb_gen++;   // strixllama: block keys depend on positions and cell contents; rebuild them all once
+    kb_mark_stale(-1);   // strixllama: block keys depend on positions; a shifted cell can be shared, so all of them
     llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
 
     if (mem_idx) {
@@ -342,7 +427,7 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
 }
 
 void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
-    kb_gen++;   // strixllama: block keys depend on positions and cell contents; rebuild them all once
+    kb_mark_stale(-1);   // strixllama: block keys depend on positions; a shifted cell can be shared, so all of them
     llama_memory_hybrid::seq_div(seq_id, p0, p1, d);
 
     if (mem_idx) {
@@ -379,7 +464,7 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
 }
 
 void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    kb_gen++;   // strixllama: block keys depend on positions and cell contents; rebuild them all once
+    kb_mark_stale(seq_id);   // strixllama: the restored cells' block keys were never written; rebuild them once
     // note: repeats llama_memory_hybrid::state_read
     // the indexer needs the attention cache's cells, and a half-failed restore must leave all three caches alike
 
@@ -390,6 +475,12 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
 
     try {
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+            // strixllama: the attention restore drops the sequence's old cells and may rebalance the pool before
+            // it places the new ones (regions); the move hook repeats that rebalance on the indexer, which must
+            // then hold the same cells - so the indexer drops them first too (its own restore would, later)
+            if (mem_idx && seq_id >= 0 && get_mem_attn()->get_regions()) {
+                mem_idx->seq_rm(seq_id, -1, -1);
+            }
             get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
         }
 
@@ -433,16 +524,30 @@ llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
 
 void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias, const qsa_kb_inputs * kb) const {
-    set_input_qsa_impl(cell_blk, blk_cells, blk_pos, bias, nullptr, ubatch, ratio, blk_bias, kb);
+        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias, const qsa_kb_inputs * kb,
+        uint32_t kv_off) const {
+    set_input_qsa_impl(cell_blk, blk_cells, blk_pos, bias, nullptr, ubatch, ratio, blk_bias, kb, nullptr, false, kv_off);
 }
 
 void llama_memory_hybrid_idx::set_input_qsa_blocks(
         ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
         ggml_tensor * bias, ggml_tensor * tail_idxs, const llama_ubatch * ubatch, uint32_t ratio, const qsa_kb_inputs * kb, const qsa_mixed_inputs * mixed,
-        bool active_only) const {
-    set_input_qsa_impl(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, true, kb, mixed, active_only);
+        bool active_only, uint32_t kv_off) const {
+    set_input_qsa_impl(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, true, kb, mixed, active_only, kv_off);
 }
+
+// strixllama: the indexer cells as the graph's view sees them, from its first cell (llama_kv_cache::get_kv_window)
+struct hybrid_idx_cells_view {
+    const llama_kv_cells & cells;
+    const uint32_t         off;
+
+    bool                              is_empty   (uint32_t j)                 const { return cells.is_empty(off + j); }
+    const llama_kv_cells::seq_set_t & seq_get_all(uint32_t j)                 const { return cells.seq_get_all(off + j); }
+    bool                              seq_has    (uint32_t j, llama_seq_id s) const { return cells.seq_has(off + j, s); }
+    llama_pos                         pos_get    (uint32_t j)                 const { return cells.pos_get(off + j); }
+    const llama_kv_cell_ext &         ext_get    (uint32_t j)                 const { return cells.ext_get(off + j); }
+    llama_pos                         seq_pos_min(llama_seq_id s)             const { return cells.seq_pos_min(s); }
+};
 
 void llama_memory_hybrid_idx::set_input_qsa_impl(
         ggml_tensor * cell_blk,
@@ -455,7 +560,8 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
         bool blk_bias,
         const qsa_kb_inputs * kb,
         const qsa_mixed_inputs * mixed,
-        bool active_only) const {
+        bool active_only,
+        uint32_t kv_off) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
 
@@ -475,11 +581,13 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
     GGML_ASSERT(!active_only || (tail_idxs && bias->type == GGML_TYPE_I32 && n_ns == 1));
     const int64_t n_pb = active_only ? std::max(n_blocks, (n_kv + r - 1)/r) : n_blocks;
     std::bitset<LLAMA_MAX_SEQ> active_seqs;
-    if (active_only) {
-        for (int64_t i = 0; i < n_tokens; ++i) {
-            for (int32_t k = 0; k < ubatch->n_seq_id[i]; ++k) { active_seqs.set(ubatch->seq_id[i][k]); }
-        }
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        for (int32_t k = 0; k < ubatch->n_seq_id[i]; ++k) { active_seqs.set(ubatch->seq_id[i][k]); }
     }
+    // strixllama: a cell of no sequence of this ubatch is invisible to every query in it, and its block key is
+    // rebuilt by its own sequence's graph when it goes stale (kb_needs_full), so it is left out of the blocks.
+    // That also keeps a window's foreign cells - the neighbours of the run a window views, whose positions have
+    // nothing to do with it - out of the position buckets.
 
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
@@ -550,7 +658,9 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
     for (int64_t s = 0; s < n_ns; ++s) {
         // ubatch index s*n_tps belongs to this stream; ask which cells array it uses
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
-        const auto & cells = get_mem_idx()->get_cells(seq_of_stream);
+        // strixllama: every index below is relative to the view's first cell
+        GGML_ASSERT(kv_off == 0 || n_ns == 1);
+        const hybrid_idx_cells_view cells = { get_mem_idx()->get_cells(seq_of_stream), kv_off };
 
         int32_t * cur_cell_blk  = dst_cell_blk ? dst_cell_blk + s*n_kv : nullptr;
         int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
@@ -598,7 +708,7 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
                 if (cells.is_empty(j)) {
                     continue;
                 }
-                if (active_only && (cells.seq_get_all(j) & active_seqs).none()) {
+                if ((cells.seq_get_all(j) & active_seqs).none()) {
                     continue;
                 }
 
@@ -793,7 +903,7 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
             const int32_t scratch = (int32_t) kb_scratch_row();
             int32_t * br = (int32_t *) kb->bid_rows->data;
             for (int64_t b = 0; b < n_blocks; ++b) {
-                br[b] = b < n_bid ? bid_cell[b] : scratch;
+                br[b] = b < n_bid ? (int32_t) kv_off + bid_cell[b] : scratch;
             }
         }
         // the dirty list exists only in incremental graphs (a full-rebuild graph reads no such input)
@@ -835,7 +945,7 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
                 if (n_dirty >= dirty_max) { continue; }
                 for (int64_t slot = 0; slot < r; ++slot) { dc[n_dirty*r + slot] = cur_blk_cells[b*r + slot]; }
                 for (int64_t sec = 0; sec < 4; ++sec) { dp[sec*dirty_max + n_dirty] = dst_blk_pos[sec*n_blocks + b]; }
-                dd[n_dirty] = bid_cell[b];
+                dd[n_dirty] = (int32_t) kv_off + bid_cell[b];
                 ++n_dirty;
             }
             GGML_ASSERT(n_dirty_total <= dirty_max && "qsa block-key cache: more blocks completed than the graph can refresh");
@@ -1036,7 +1146,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         const llama_memory_hybrid_idx::qsa_kb_inputs * kb) const {
     GGML_ASSERT(mem != nullptr);
 
-    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, kb);
+    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, kb, get_idx()->get_kv_off());
 }
 
 ggml_tensor * llama_memory_hybrid_idx_context::get_kb(int32_t il) const {
@@ -1047,16 +1157,16 @@ uint32_t llama_memory_hybrid_idx_context::kb_scratch_row() const {
     return mem ? mem->kb_scratch_row() : 0;
 }
 
-bool llama_memory_hybrid_idx_context::kb_needs_full() const {
-    return mem ? mem->kb_needs_full() : false;
+bool llama_memory_hybrid_idx_context::kb_needs_full(const llama_ubatch & ubatch) const {
+    return mem ? mem->kb_needs_full(ubatch) : false;
 }
 
 bool llama_memory_hybrid_idx_context::kb_pos_dup() const {
     return mem ? mem->kb_pos_dup() : false;
 }
 
-void llama_memory_hybrid_idx_context::kb_mark_full() const {
-    if (mem) { mem->kb_mark_full(); }
+void llama_memory_hybrid_idx_context::kb_mark_full(const llama_ubatch & ubatch) const {
+    if (mem) { mem->kb_mark_full(ubatch); }
 }
 
 void llama_memory_hybrid_idx_context::set_input_qsa_blocks(
@@ -1066,7 +1176,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa_blocks(
         const llama_memory_hybrid_idx::qsa_mixed_inputs * mixed,
         bool active_only) const {
     GGML_ASSERT(mem != nullptr);
-    mem->set_input_qsa_blocks(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, kb, mixed, active_only);
+    mem->set_input_qsa_blocks(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, kb, mixed, active_only,
+            get_idx()->get_kv_off());
 }
 
 bool llama_memory_hybrid_idx_context::qsa_position_prefix(const llama_ubatch & ubatch, bool active_only) const {
@@ -1078,7 +1189,10 @@ bool llama_memory_hybrid_idx_context::qsa_position_prefix(const llama_ubatch & u
             if (ubatch.n_seq_id[i]!=1 || ubatch.seq_id[i][0]!=seq) { return false; }
         }
     }
-    return qsa_single_sequence_prefix(mem->get_mem_idx()->get_cells(seq),get_idx()->get_n_kv(),seq,active_only);
+    // strixllama: set_input_qsa_impl leaves other sequences' cells out of the blocks, so they cannot break the
+    // prefix; the window starts at get_kv_off()
+    return qsa_single_sequence_prefix(mem->get_mem_idx()->get_cells(seq),get_idx()->get_n_kv(),seq,true,
+            get_idx()->get_kv_off());
 }
 
 // strixllama: in a unified cache every slot's conversation sits in one pool of cells and the graph spans the
@@ -1093,13 +1207,12 @@ bool llama_memory_hybrid_idx_context::qsa_position_prefix(const llama_ubatch & u
 // The length is an upper bound: at most one cell per position per sequence while no image has been written
 // (kb_pos_dup), so a sequence holds at most pos_max - pos_min + 1 cells; rounded up to a multiple of 64
 // blocks (256 cells at ratio 4, the step of n_kv) so a graph is rebuilt as rarely as before, and never below
-// the budget. A graph that rewrites every block key (kb_needs_full) keeps the whole pool: it is the one that
-// refreshes the idle sequences' keys too. So does the reserve graph (positions all equal), which sizes the
-// buffers for the widest graph. LLAMA_QSA_ACTIVE_BLOCKS=0 turns this off.
+// the budget. The reserve graph (positions all equal) keeps the whole pool: it sizes the buffers for the widest
+// graph. LLAMA_QSA_ACTIVE_BLOCKS=0 turns this off.
 int64_t llama_memory_hybrid_idx_context::qsa_active_blocks(const llama_ubatch & ubatch, uint32_t ratio, int64_t min_blocks) const {
     static const bool on = !getenv("LLAMA_QSA_ACTIVE_BLOCKS") || atoi(getenv("LLAMA_QSA_ACTIVE_BLOCKS")) != 0;
     if (!on || mem == nullptr || get_idx() == nullptr || ratio == 0 || get_n_stream() != 1 ||
-            mem->kb_needs_full() || mem->kb_pos_dup() || !qsa_scalar_visibility(ubatch)) {
+            mem->kb_pos_dup() || !qsa_scalar_visibility(ubatch)) {
         return 0;
     }
     bool same_pos = ubatch.n_tokens > 1;
@@ -1160,7 +1273,8 @@ bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch &
     }
     if (ubatch.is_pos_2d()) {
         const auto & cells=mem->get_mem_idx()->get_cells(seq);
-        for (uint32_t j=0;j<get_idx()->get_n_kv();++j) {
+        const uint32_t off=get_idx()->get_kv_off();   // strixllama: the window's first cell
+        for (uint32_t j=off;j<off+get_idx()->get_n_kv();++j) {
             if (!cells.is_empty(j) && (cells.seq_get_all(j) & seqs).any() && cells.ext_get(j).is_2d_gt(cells.pos_get(j),cells.pos_get(j))) { return false; }
         }
     }

@@ -5,6 +5,8 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <functional>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -93,6 +95,19 @@ public:
 
     using slot_info_vec_t = std::vector<slot_info>;
 
+    // strixllama: n cells of sequence seq moved from [src, src + n) to [dst, dst + n), data and state. A list of
+    // them is applied in order: a later piece may take cells an earlier one vacated. `ordered`: the sequence's
+    // cells were in position order, so a block's first cell stays its first cell (see llama_memory_hybrid_idx)
+    struct cell_move {
+        uint32_t     src;
+        uint32_t     dst;
+        uint32_t     n;
+        llama_seq_id seq;
+        bool         ordered;
+    };
+
+    using cell_move_vec_t = std::vector<cell_move>;
+
     // TODO: refactor the memory instances to not depend on `llama_model`
     //       instead pass all necessary info (e.g. hparams, dev layers, arch, etc.) directly
     //       likely through `struct llama_memory_params`
@@ -168,6 +183,32 @@ public:
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
+    // strixllama: regions. A unified cache with several sequences keeps each conversation in one run of cells,
+    // and the pool compact: a conversation's tokens go after its last cell (find_slot), a new one after the last
+    // conversation in the pool, with room left to the one before it. When the batch's tokens do not fit that
+    // way, the layout is rebalanced first (plan_layout, move_cells): the conversations slide towards the start
+    // or the end of the pool, in their order, so that every one in the batch has the same room after it and
+    // the idle ones none. The graph of a batch then views only the run of its own conversations
+    // (get_kv_window), so a conversation costs what it would on a cache of its own. Only for a cache whose
+    // owner handles the window offset in every graph input it builds (llama_memory_hybrid_idx); what no layout
+    // can hold falls back to the plain search, which is always correct and only makes the window wider.
+    void set_regions(bool on);
+    bool get_regions() const;
+
+    // the moves that rebalance the pool so that every sequence of these ubatches fits after its last cell and a
+    // new one after the last conversation; empty when they fit already or no layout can hold them
+    cell_move_vec_t plan_layout(const std::vector<llama_ubatch> & ubatches) const;
+
+    // move the cells' data and state: the copies are queued on the stream the context's graphs run on, after
+    // them and before the next one; `sync` waits for them (a restore writes cells next). A cache that mirrors
+    // another one (the qwen4exp indexer) is given the other's moves through its owner's hook.
+    bool can_move() const;
+    void move_cells(const cell_move_vec_t & moves, bool sync = false);
+    void set_move_hook(std::function<void(const cell_move_vec_t &, bool)> hook);
+
+    // copy the rows of the moves' pieces of a tensor on this cache's device, in order, queued as above
+    void copy_rows(ggml_tensor * t, const cell_move_vec_t & moves) const;
+
     // state_read, plus the cells the restored tokens were placed in
     // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
     //   sinfos_out: if set, filled with the layout used; a stream with no cells leaves an empty entry
@@ -185,9 +226,14 @@ public:
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
+    // strixllama: the cells [off, off + n_kv) the graph of this ubatch views: the run that holds the ubatch's
+    // own sequences when regions are on (see set_regions), else [0, get_n_kv())
+    void get_kv_window(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t & off, uint32_t & n_kv) const;
+
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    // strixllama: off = the first cell of the view (get_kv_window)
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t off = 0) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t off = 0) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -226,7 +272,8 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    // strixllama: off = the first cell of the graph's view (get_kv_window)
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t off = 0) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -313,6 +360,28 @@ private:
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
+    // strixllama: regions (see set_regions)
+    bool regions = false;
+    // the context that runs this cache's graphs, from init_update (llama_context::decode calls it before
+    // init_batch): move_cells queues its copies on that context's backend
+    llama_context * lctx_sync = nullptr;
+    // the owner's mirror of every move (see set_move_hook)
+    std::function<void(const cell_move_vec_t &, bool)> move_hook;
+    // where plan_layout put the sequences of its batch that hold no cell yet, for find_slot_regions
+    mutable std::map<llama_seq_id, uint32_t> planned_start;
+
+    // the slot of a ubatch under regions: each sequence after its last cell, a new one where plan_layout or
+    // region_start puts it; empty if any of it does not fit, and find_slot searches instead
+    slot_info find_slot_regions(const llama_ubatch & ubatch) const;
+
+    // where a sequence with no cell yet starts, `tail` being the first cell after all the others; -1 if not there
+    int64_t region_start(uint32_t need, uint32_t tail) const;
+
+    // the backend of the device a tensor of this cache lives on, in the context that uses the cache
+    ggml_backend_t backend_for(const ggml_tensor * t) const;
+
+    void apply_moves(const cell_move_vec_t & moves);
+
     size_t total_size() const;
 
     size_t size_k_bytes() const;
@@ -391,6 +460,9 @@ public:
 
     uint32_t get_n_kv() const;
 
+    // strixllama: the first cell of the graph's view of the cache (llama_kv_cache::get_kv_window)
+    uint32_t get_kv_off() const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -461,4 +533,7 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // strixllama: the view is [kv_off, kv_off + n_kv)
+    uint32_t kv_off = 0;
 };

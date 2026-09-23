@@ -349,6 +349,10 @@ public:
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
 
+    // strixllama: the first cell of the cache view the graph was built with (llama_kv_cache::get_kv_window);
+    // the views carry it as an offset, so a graph is reusable only for the same one
+    uint32_t kv_off = 0;
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return

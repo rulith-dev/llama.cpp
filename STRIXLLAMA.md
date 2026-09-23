@@ -1,6 +1,6 @@
 # Strix Llama branch
 
-This branch is `pwilkin/llama.cpp` at `f5daaa3` plus the Strix Llama patch set: 35 files (31 modified, 4 added) that make Qwen3.8-Flash-Next fast on one AMD Strix Halo machine (Ryzen AI Max+ 395, Radeon 8060S / gfx1151) on Windows, built with HIP against TheRock ROCm 10.1.
+This branch is `pwilkin/llama.cpp` at `f5daaa3` plus the Strix Llama patch set: 40 files (36 modified, 4 added) that make Qwen3.8-Flash-Next fast on one AMD Strix Halo machine (Ryzen AI Max+ 395, Radeon 8060S / gfx1151) on Windows, built with HIP against TheRock ROCm 10.1.
 
 Each release adds one commit, so the delta can be read either whole or a step at a time. The patches themselves, the build (`bootstrap/bootstrap.py`), a replay that rebuilds this exact tree from clean upstream and checks every file by hash, the manager, the desktop app, and the measurements live in the main repository:
 
@@ -11,6 +11,8 @@ What the delta does, in one line each (details in that repository's `patches/MAN
 - sparse-attention (QSA) block-key cache, decode-time gather, compact metadata, an image guard for M-RoPE cells
 - mixed-sequence batches stay on the sparse path, so several conversations at depth share a step instead of falling back to dense attention over the whole pool
 - with several slots in one pool, a batch's sparse-attention block list covers only its own conversations, so idle ones cost a decoding conversation nothing per step; a slot's state is read from the device one run of cell ranges at a time rather than one range at a time (a conversation decoded alongside others had stalled the server 6-10 s at every save)
+- with several slots, every conversation keeps one run of the pool and a batch's graph views only the runs of its own conversations, so a conversation beside idle ones computes, and costs, what it does on a single slot - the MTP draft's dense attention included; a batch that does not fit has the pool laid out again on the device first (conversations kept in order, the same room after each one of the batch)
+- compute buffers get a little headroom, so a graph a few MiB larger no longer frees and reallocates one: ROCm on Windows keeps a freed buffer's commit, and four long conversations ran the machine into its commit limit ("bad allocation")
 - MTP speculative decoding: the draft context's ubatch capped separately, the draft's own sparse-attention prefill, shape-keyed HIP graphs
 - per-layer-embedding table read with unbuffered, overlapped direct I/O instead of the pager (`--load-mode none --lazy-mode on-direct`), so a 93.7 GB model runs in a 96 GB carve with the table on disk; the server gathers the next prompt batch's rows while the current one computes (`llama_strix_prefetch`)
 - a disk tier under the server's prompt cache: a content-addressed store kept per model, written a block at a time by a background writer and read straight from the device rather than through the page cache; idle conversations stay in their slots and page their checkpoints out to it, and a restore reads the chunks in parallel and leaves the checkpoints there; usable whether or not the server drafts

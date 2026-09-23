@@ -429,6 +429,23 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
 
     for (int n = 0; n < talloc->n_chunks; n++) {
         size_t chunk_size = talloc->chunks[n]->max_size;
+        // strixllama: headroom for compute buffers. A graph a few MiB larger than the one reserved made gallocr free and
+        // reallocate the whole buffer (3.4 GiB for the qwen4exp target), and ROCm on Windows keeps a freed device buffer's
+        // commit in its cache, where a request a few MiB larger than it can never be served again: every such
+        // reallocation cost ~3.4 GiB of the machine's commit limit for the rest of the process. 3% + 16 MiB absorbs the
+        // growth measured between graphs; GGML_ALLOC_COMPUTE_PAD=0 turns it off.
+        if (usage == GGML_BACKEND_BUFFER_USAGE_COMPUTE && chunk_size > 0) {
+            static int pad_on = -1;
+            if (pad_on < 0) {
+                const char * e = getenv("GGML_ALLOC_COMPUTE_PAD");
+                pad_on = e == NULL || atoi(e) != 0;
+            }
+            if (pad_on) {
+                const size_t max_size = ggml_backend_buft_get_max_size(buft);
+                const size_t padded   = chunk_size + chunk_size/32 + ((size_t) 16 << 20);
+                chunk_size = padded <= max_size ? padded : (chunk_size > max_size ? chunk_size : max_size);
+            }
+        }
         buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, chunk_size);
         if (buf->chunks[n] == NULL) {
             ggml_vbuffer_free(buf);
@@ -968,6 +985,19 @@ static bool ggml_gallocr_reserve_n_impl(
             }
         }
         if (realloc) {
+            // strixllama: GGML_ALLOC_DEBUG=1 reports every compute buffer (re)allocation, also in release builds
+            {
+                static int dbg = -1;
+                if (dbg < 0) {
+                    const char * e = getenv("GGML_ALLOC_DEBUG");
+                    dbg = e != NULL && atoi(e) != 0;
+                }
+                if (dbg) {
+                    const size_t cur_size_dbg = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
+                    fprintf(stderr, "ggml-alloc: %s buffer %.2f -> %.2f MiB\n", ggml_backend_buft_name(galloc->bufts[i]),
+                            cur_size_dbg / 1048576.0, new_size / 1048576.0);
+                }
+            }
 #ifndef NDEBUG
             {
                 size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;

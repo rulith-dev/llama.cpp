@@ -112,36 +112,46 @@ public:
         ggml_tensor * seq_blk = nullptr;
         ggml_tensor * seq_tok = nullptr;
     };
+    // strixllama: kv_off = the first cell of the graph's view of the caches (llama_kv_cache::get_kv_window).
+    // Every cell index these inputs carry is relative to it, except the block-key cache rows, which address
+    // the whole cache tensor.
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias, const qsa_kb_inputs * kb = nullptr) const;
+                       bool blk_bias, const qsa_kb_inputs * kb = nullptr, uint32_t kv_off = 0) const;
     void set_input_qsa_blocks(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                              ggml_tensor * bias, ggml_tensor * tail_idxs,
                              const llama_ubatch * ubatch, uint32_t ratio, const qsa_kb_inputs * kb = nullptr,
-                             const qsa_mixed_inputs * mixed = nullptr, bool active_only = false) const;
+                             const qsa_mixed_inputs * mixed = nullptr, bool active_only = false, uint32_t kv_off = 0) const;
 
     ggml_tensor * get_kb(int32_t il) const;   // F16 [idx_dim, kv_size + 1]; null when off or no indexer on il
     uint32_t      kb_scratch_row() const;     // the spare row: kv_size of the indexer cache
-    bool          kb_needs_full() const;      // positions moved (shift, restore, clear) since the last full write
-    void          kb_mark_full() const;
+    // strixllama: a sequence's block keys go stale when its positions move or its cells are restored or moved out
+    // of order; the next graph of a ubatch holding it rebuilds every key of that ubatch's sequences
+    bool          kb_needs_full(const llama_ubatch & ubatch) const;
+    void          kb_mark_full(const llama_ubatch & ubatch) const;
     // strixllama: true once a ubatch with per-axis positions (an image under M-RoPE) has been written.
     // Such cells repeat one position across the image, so set_input_qsa ranks cells instead of using
     // the position, which the block-key cache cannot track - the graph must not wire the cache in.
     bool          kb_pos_dup() const;
+
 
 private:
     void set_input_qsa_impl(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                             ggml_tensor * bias, ggml_tensor * tail_idxs,
                             const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias,
                             const qsa_kb_inputs * kb, const qsa_mixed_inputs * mixed = nullptr,
-                            bool active_only = false) const;
+                            bool active_only = false, uint32_t kv_off = 0) const;
 
     // strixllama: block-key cache storage, one tensor per indexer layer, in the layer's device buffer
     std::vector<ggml_context_ptr>        kb_ctxs;
     std::vector<ggml_backend_buffer_ptr> kb_bufs;
     std::map<int32_t, ggml_tensor *>     kb_map;
-    uint64_t                             kb_gen      = 1;
-    mutable uint64_t                     kb_full_gen = 0;
+    // the sequences whose block keys have to be rebuilt (see kb_needs_full). All of them at the start and after
+    // a clear, so the first graph of every sequence builds its keys the way it always has
+    mutable std::bitset<LLAMA_MAX_SEQ>   kb_stale = std::bitset<LLAMA_MAX_SEQ>().set();
+    void kb_mark_stale(llama_seq_id seq_id);   // < 0: every sequence
+    // strixllama: regions - block-key rows follow their cells (llama_kv_cache::move_cells)
+    void kb_move_rows(const llama_kv_cache::cell_move_vec_t & moves);
     // set in init_batch when an image ubatch or a position gap arrives, cleared only when every
     // sequence is dropped - see kb_pos_dup() and the reset in seq_rm()
     bool                                 kb_dup      = false;
@@ -217,8 +227,8 @@ public:
     // strixllama: block-key cache pass-throughs (see llama_memory_hybrid_idx)
     ggml_tensor * get_kb(int32_t il) const;
     uint32_t      kb_scratch_row() const;
-    bool          kb_needs_full() const;
-    void          kb_mark_full() const;
+    bool          kb_needs_full(const llama_ubatch & ubatch) const;
+    void          kb_mark_full(const llama_ubatch & ubatch) const;
     bool          kb_pos_dup() const;
 
 private:
