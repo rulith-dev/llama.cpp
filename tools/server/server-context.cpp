@@ -89,6 +89,21 @@ static int strixllama_new_handler(size_t size) {
 static const int strixllama_new_handler_installed = [] { _set_new_handler(strixllama_new_handler); return 1; }();
 #endif
 
+// strixllama: fault injection for the paths an exhausted commit limit takes (STRIX_FAULT=<site>:<n>: the n-th pass
+// through <site> - ckpt, decode or post - throws std::bad_alloc). For tests of the error handling only.
+static void strixllama_fault(const char * site) {
+    static const std::string spec = [] { const char * e = getenv("STRIX_FAULT"); return std::string(e ? e : ""); }();
+    const size_t colon = spec.find(':');
+    if (colon == std::string::npos || spec.compare(0, colon, site) != 0) {
+        return;
+    }
+    static int n = 0;
+    if (++n == atoi(spec.c_str() + colon + 1)) {
+        fprintf(stderr, "STRIX_FAULT: %s #%d throws std::bad_alloc\n", site, n);
+        throw std::bad_alloc();
+    }
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -242,6 +257,27 @@ struct server_batch {
 
     int32_t size() const {
         return (int32_t)tokens.size();
+    }
+
+    // strixllama: the tokens of one slot out of a batch that is still being built (the slot failed part way)
+    void drop_slot(int32_t id_slot) {
+        GGML_ASSERT(!batch_rendered);
+        std::vector<token> keep;
+        std::vector<float> keep_embd;
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            if (tokens[i].id_slot == id_slot) {
+                continue;
+            }
+            if (has_embd) {
+                keep_embd.insert(keep_embd.end(), embd.begin() + i*n_embd, embd.begin() + (i + 1)*n_embd);
+            }
+            keep.push_back(tokens[i]);
+        }
+        tokens.swap(keep);
+        if (has_embd) {
+            embd.swap(keep_embd);
+            has_embd = !tokens.empty();
+        }
     }
 
     void set_output(int32_t idx, bool output) {
@@ -465,9 +501,11 @@ struct server_slot {
         }
 
         // the recurrent state is the part of a conversation that changes, so the store gets it only as the conversation
-        // leaves: the state at the end, and the last two checkpoints of its last prompt - just before its end, where a
+        // leaves: the state at the end; the last two checkpoints of its last prompt - just before its end, where a
         // regenerated answer or a template that drops the thinking goes back to, and for a short turn its last user
-        // message. Checkpoints the store has already are named whenever; the older ones in memory are not written.
+        // message; and before them one every disk_ckpt_step tokens, so a deeper rewind once the conversation is back
+        // (an edited earlier message, an agent trimming old tool output) replays at most that much. Checkpoints the
+        // store has already are named and count towards the spacing; nothing is written twice.
         std::set<const common_prompt_checkpoint *> writable;
         if (leaving) {
             int id_last = -1;
@@ -479,6 +517,18 @@ struct server_slot {
             for (auto it = prompt.checkpoints.rbegin(); it != prompt.checkpoints.rend() && writable.size() < 2; ++it) {
                 if (!it->data_tgt.empty() && it->n_tokens <= n_entry && it->id_task == id_last) {
                     writable.insert(&*it);
+                }
+            }
+            int64_t prev = -cache.disk_ckpt_step;          // the last checkpoint the entry keeps, in position order
+            for (const auto & c : prompt.checkpoints) {
+                if (c.n_tokens > n_entry || writable.count(&c)) {
+                    continue;
+                }
+                if (c.n_tokens >= prev + cache.disk_ckpt_step) {
+                    if (!c.data_tgt.empty()) {
+                        writable.insert(&c);
+                    }
+                    prev = c.n_tokens;
                 }
             }
         }
@@ -2748,6 +2798,7 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        strixllama_fault("ckpt");
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -3198,14 +3249,31 @@ private:
         return true;
     }
 
+    // strixllama: a slot that threw part way through its turn - adding to the batch, or changing its cache; an
+    // exhausted commit limit throws std::bad_alloc from anywhere that allocates. Its tokens no longer say what its
+    // memory holds, and a conversation that went on from there fed the recurrent state positions it had seen already,
+    // or skipped some (GitHub issue #1); with one slot, its tokens left in a batch no slot owned aborted the server.
+    // Its tokens leave the batch if that is still being built, and its conversation leaves the cache: the next
+    // request for it is processed again, or read back from the disk tier.
+    void slot_failed(server_slot & slot, const std::string & what) {
+        SLT_ERR(slot, "got exception: %s\n", what.c_str());
+        send_error(slot, std::string("got exception: ") + what, ERROR_TYPE_SERVER);
+        slot.release();
+        if (!batch.batch_rendered) {
+            batch.drop_slot(slot.id);
+            if (batch.slot_batched == &slot) {
+                batch.slot_batched = batch.size() > 0 ? get_slot_by_id(batch.tokens[0].id_slot) : nullptr;
+            }
+        }
+        slot.prompt_clear();
+    }
+
     void iterate(std::vector<server_slot> & slots, std::function<void(server_slot &)> callback) {
         for (auto & slot : slots) {
             try {
                 callback(slot);
             } catch (const std::exception & e) {
-                SLT_ERR(slot, "got exception: %s\n", e.what());
-                send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
-                slot.release();
+                slot_failed(slot, e.what());
             }
         }
     }
@@ -3215,18 +3283,19 @@ private:
             try {
                 callback(*slot);
             } catch (const std::exception & e) {
-                SLT_ERR(*slot, "got exception: %s\n", e.what());
-                send_error(*slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
-                slot->release();
+                slot_failed(*slot, e.what());
             }
         }
     }
 
+    // strixllama: as for one slot that failed, every slot that was in the batch loses its conversation - how much of
+    // the batch reached its memory is not known (the decode error path below does the same)
     void abort_all_slots(const std::string & reason) {
         for (auto & slot : slots) {
             if (slot.is_processing()) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
                 slot.release();
+                slot.prompt_clear();
             }
         }
     }
@@ -3953,6 +4022,23 @@ private:
 
                     slot.mem.seq_rm(slot.id, p0, -1);
 
+                    // strixllama: the slot's tokens and its memory must agree before anything is added - the memory holds
+                    // positions up to p0 - 1 and the recurrent state is at p0 - 1 (for a hybrid memory the lowest position
+                    // is the recurrent one, the highest the lower of the two). If they do not, going on feeds the
+                    // recurrent state positions it has seen already, or skips some (GitHub issue #1): the conversation
+                    // is processed again from its start instead. Not checked with images, whose positions run ahead
+                    // of their cells.
+                    if (!slot.prompt.tokens.has_mtmd) {
+                        auto * mem_tgt = llama_get_memory(ctx_tgt);
+                        const llama_pos pos_max = llama_memory_seq_pos_max(mem_tgt, slot.id);
+                        const llama_pos pos_min = llama_memory_seq_pos_min(mem_tgt, slot.id);
+                        if (pos_max != p0 - 1 || pos_min > p0 - 1) {
+                            SLT_WRN(slot, "the cache is out of step with its tokens: %d tokens, but the memory holds positions [%d, %d]; "
+                                    "processing the prompt from its start\n", slot.prompt.n_tokens(), pos_min, pos_max);
+                            slot.prompt_clear();
+                        }
+                    }
+
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
                     // tokens before the invocation sequence need to be
@@ -4215,6 +4301,7 @@ private:
         const bool st = strixllama_spec_timing::enabled();
         const int64_t t_dec0 = st ? ggml_time_us() : 0;
         queue_tasks.yield_to_queue([&]() {
+            strixllama_fault("decode");
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
@@ -4321,6 +4408,7 @@ private:
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
+        strixllama_fault("post");
         // for checking if a given batch index is inside batch_view
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;

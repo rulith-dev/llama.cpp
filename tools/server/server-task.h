@@ -737,6 +737,7 @@ struct server_prompt_cache {
     int32_t     disk_version  = 2;      // the manifest format this server writes; the store holds no older one
     int32_t     disk_block    = 4096;   // tokens a conversation grows by before it is written again
     int32_t     disk_run      = 4096;   // version 3: positions in a run (STRIX_PROMPT_CACHE_RUN)
+    int64_t     disk_ckpt_step = 32768; // version 3: a leaving conversation's older checkpoints kept this far apart
     int64_t     disk_seq      = 0;
     uint64_t    disk_bytes    = 0;      // entries, and every object once
 
