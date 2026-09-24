@@ -2881,7 +2881,7 @@ server_prompt_cache::~server_prompt_cache() {
 }
 
 void server_prompt_cache::set_disk(const std::string & root, size_t limit_mib, bool has_mtmd, const std::string & model_tag,
-                                   int32_t version) {
+                                   int32_t version, uint64_t row_tgt, uint64_t row_dft) {
     std::error_code ec;
     // one directory per model: a state is only meaningful to the model that computed it, and two quants of
     // one model have identical state shapes, so the restore would take the other's without a word
@@ -2957,7 +2957,14 @@ void server_prompt_cache::set_disk(const std::string & root, size_t limit_mib, b
         e.order = mtime_ms(de);
         std::string why;
         bool foreign = false, old = false;
-        if (!scan_entry(stage, e, disk_has_mtmd, disk_version, why, foreign, old)) {
+        bool ok = scan_entry(stage, e, disk_has_mtmd, disk_version, why, foreign, old);
+        // rows of another size - a K/V cache of another type, or no draft where this server drafts - are as
+        // unusable as an older format, and go the same way
+        if (ok && e.version == (int32_t) SPC_V3 && row_tgt > 0 && (e.row_tgt != row_tgt || (row_dft > 0 && e.row_dft != row_dft))) {
+            ok = false;
+            old = true;
+        }
+        if (!ok) {
             if (old) {
                 fs::remove(de.path(), ec);
                 ++n_old;
@@ -4438,6 +4445,16 @@ bool server_prompt_cache::load_runs(server_prompt & prompt, const server_tokens 
             ok = llama_strix_kv_set_rows(items[i].ctx, id_slot, items[i].r.pos0, items[i].take, buf[i % 2].data(), items[i].r.n);
             if (!ok) {
                 why = "the cache took no rows";
+            }
+            // STRIX_V3_VERIFY: read a whole run back out of the cache and check it against the hash it is named by
+            if (ok && items[i].take == items[i].r.n && getenv("STRIX_V3_VERIFY")) {
+                std::vector<uint8_t> back((size_t) items[i].row * (size_t) items[i].r.n);
+                const bool got = llama_strix_kv_get_rows(items[i].ctx, id_slot, items[i].r.pos0, items[i].r.n, back.data(), back.size());
+                const XXH128_hash_t h = XXH3_128bits(back.data(), back.size());
+                if (!got || h.high64 != items[i].r.hi || h.low64 != items[i].r.lo) {
+                    SRV_WRN(" - disk cache: VERIFY run at %d (%d rows, %s) reads back different%s\n", items[i].r.pos0, items[i].r.n,
+                            items[i].ctx == ctx_tgt ? "target" : "draft", got ? "" : " (no rows)");
+                }
             }
             ++n_read;
         }

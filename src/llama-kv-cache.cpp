@@ -332,8 +332,14 @@ llama_kv_cache::llama_kv_cache(
             attn_rot_k = true;
         }
 
+        // strixllama: qwen4exp keeps V as it is. Its sparse-attention prefill kernel (qsa3) sums P*V on the matrix
+        // cores, and those sums move in the last bit with the V of keys they weight by zero - the free cells after
+        // a conversation's last one, which hold whatever an earlier conversation left there. The inverse rotation
+        // of the output spreads that bit over 64 dimensions, far enough to reach the tokens, so a conversation read
+        // back from disk parted from the same one kept in memory; unrotated it does not. K rotated alone: mean KLD
+        // against f16 0.0139 +/- 0.0007, both rotated 0.0137.
         attn_rot_v =
-            !attn_rot_disable &&
+            !attn_rot_disable && model.arch != LLM_ARCH_QWEN4EXP &&
             n_embd_head_v_all > 0 &&
             ggml_is_quantized(type_v) &&
             hparams.n_embd_head_v() % 64 == 0;

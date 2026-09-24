@@ -763,9 +763,11 @@ struct server_prompt_cache {
     ~server_prompt_cache();
 
     // entries live in <root>/<model_tag>: a state is only meaningful to the model that computed it. `version`
-    // is the format this server writes (3 where its contexts serve rows by position, else 2): entries of an
-    // earlier one are deleted as the store is opened
-    void     set_disk(const std::string & root, size_t limit_mib, bool has_mtmd, const std::string & model_tag, int32_t version);
+    // is the format this server writes (3 where its contexts serve rows by position, else 2), and row_tgt /
+    // row_dft its rows' sizes (0 without a draft): entries of an earlier format, or with rows this server cannot
+    // take, are deleted as the store is opened
+    void     set_disk(const std::string & root, size_t limit_mib, bool has_mtmd, const std::string & model_tag, int32_t version,
+                      uint64_t row_tgt = 0, uint64_t row_dft = 0);
     bool     has_disk() const { return disk_limit > 0; }
     uint64_t disk_size();
     bool     disk_busy();                  // a job is waiting: a save that would not wait can skip its work

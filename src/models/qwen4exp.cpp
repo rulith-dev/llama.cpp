@@ -1416,7 +1416,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 // This makes decode sparse, which is what the model intends and what prefill already does; it is not
 // bit-identical to the dense decode it replaces.
 static ggml_tensor * qwen4exp_get_rows_f16(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b) {
-    GGML_ASSERT(a->type == GGML_TYPE_F16 && b->type == GGML_TYPE_I32 && b->ne[1] == 1 && b->ne[2] == 1 && b->ne[3] == 1);
+    // strixllama: a Q8_0 cache is dequantized by the same kernel on the way out
+    GGML_ASSERT((a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_Q8_0) && b->type == GGML_TYPE_I32 && b->ne[1] == 1 && b->ne[2] == 1 && b->ne[3] == 1);
     ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, a->ne[0], b->ne[0]);
     result->op     = GGML_OP_GET_ROWS;
     result->src[0] = a;
@@ -1516,8 +1517,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     const int64_t strip=layout_prefill && whole_option && atoi(whole_option)!=0 ? n_tps : qwen4exp_query_strip(n_tps,n_stream);
     ggml_tensor * packed_keys=nullptr;
     const char * pack_option=getenv("LLAMA_QSA_PACK_KEYS");
+    // strixllama: the sparse prefill kernel reads K and V only through these packed f16 layouts, so a Q8_0 cache is
+    // dequantized into them here and the kernel does not change
+    auto kv_for_packing = [&](ggml_tensor * t) {
+        return t->type == GGML_TYPE_Q8_0 ? ggml_cast(ctx0, t, GGML_TYPE_F16) : t;
+    };
     if (layout_prefill && pack_option && atoi(pack_option)!=0) {
-        auto * original_keys=ggml_permute(ctx0,mctx_cur->get_k(ctx0,il),0,2,1,3);
+        auto * original_keys=ggml_permute(ctx0,kv_for_packing(mctx_cur->get_k(ctx0,il)),0,2,1,3);
         if (original_keys->type==GGML_TYPE_F16 && original_keys->ne[0]==256 && original_keys->ne[1]%4==0 && original_keys->ne[3]==1) {
             packed_keys=qsa_pack_keys(ctx0,original_keys);
             ggml_build_forward_expand(gf,packed_keys);
@@ -1528,7 +1534,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * packed_values=nullptr;
     const char * packv_option=getenv("LLAMA_QSA_PACK_VALUES");
     if (layout_prefill && packv_option && atoi(packv_option)!=0) {
-        auto * original_values=ggml_permute(ctx0,mctx_cur->get_v(ctx0,il),0,2,1,3);
+        auto * original_values=ggml_permute(ctx0,kv_for_packing(mctx_cur->get_v(ctx0,il)),0,2,1,3);
         if (original_values->type==GGML_TYPE_F16 && original_values->ne[0]==256 && original_values->ne[1]%4==0 && original_values->ne[3]==1) {
             packed_values=qsa_pack_values(ctx0,original_values);
             ggml_build_forward_expand(gf,packed_values);
@@ -1599,7 +1605,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         }();
         const bool gather = gather_on && n_query <= gather_max_t && n_stream == 1 &&
             cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap &&
-            k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && v->nb[1] <= v->nb[2] &&
+            (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0) && (v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_Q8_0) &&
+            v->nb[1] <= v->nb[2] &&
             q->ne[0] == 256 &&
             // only worth it when the selection is a real reduction: gathering 2304 of 2329 cells costs
             // more than reading them in place (measured 42.9 vs 41.1 ms/token at 2.3K context)
@@ -1613,7 +1620,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
             cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
             ggml_build_forward_expand(gf, cur);
         } else if (direct_indices) {
-            GGML_ASSERT(q->ne[0] == 256 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
+            GGML_ASSERT(q->ne[0] == 256 && (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0) &&
+                                           (v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_Q8_0));
             const bool v_trans = v->nb[1] > v->nb[2];
             ggml_tensor * q_view = ggml_permute(ctx0, q, 0, 2, 1, 3);
             ggml_tensor * k_view = ggml_permute(ctx0, k, 0, 2, 1, 3);

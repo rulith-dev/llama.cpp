@@ -407,6 +407,12 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
 
 static bool enabled(const char * name) { const char * value = getenv(name); return value && atoi(value) != 0; }
 
+// strixllama: the kernel reads K and V only through their packed f16 copies (src 6 and 7), so the cache itself may
+// be Q8_0 as well - the graph dequantizes it into them
+static bool qsa3_kv_type_ok(const ggml_tensor * t) {
+    return (t->type == GGML_TYPE_F16 && t->nb[0] == 2) || t->type == GGML_TYPE_Q8_0;
+}
+
 bool ggml_cuda_flash_attn_ext_qsa_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
     const auto * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * m = dst->src[3], * ids = dst->src[5];
     const auto * packed = dst->src[6], * pv = dst->src[7];
@@ -414,11 +420,11 @@ bool ggml_cuda_flash_attn_ext_qsa_supported(ggml_backend_cuda_context & ctx, con
         !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc)) { return false; }
     if (q->ne[1] < 128 && !enabled("QSA3_FORCE")) { return false; }
     float bias, softcap; memcpy(&bias, (const char *) dst->op_params + 4, 4); memcpy(&softcap, (const char *) dst->op_params + 8, 4);
-    if (bias != 0 || softcap != 0 || q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
+    if (bias != 0 || softcap != 0 || q->type != GGML_TYPE_F32 || !qsa3_kv_type_ok(k) || !qsa3_kv_type_ok(v) ||
         dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || q->ne[0] != 256 || k->ne[0] != 256 || v->ne[0] != 256 ||
         q->ne[1] < 1 || q->ne[1] > INT_MAX || k->ne[1] < 1 || k->ne[1] > 262140 || k->ne[1] % 4 ||
         k->ne[2] < 1 || q->ne[2] != 12*k->ne[2] || v->ne[2] != k->ne[2] || v->ne[1] != k->ne[1] ||
-        q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 || q->nb[0] != 4 || k->nb[0] != 2 || v->nb[0] != 2 ||
+        q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 || q->nb[0] != 4 ||
         ids->nb[0] != 4 || ids->ne[1] < q->ne[1] || ids->ne[2] != 1 || ids->ne[3] != 1 || ids->ne[0] < 1 || ids->ne[0] > 2560 ||
         ids->nb[1] % 4 || uintptr_t(ids->data) % 4 || q->nb[1] % 16 || q->nb[2] % 16 || uintptr_t(q->data) % 16 ||
         !ggml_is_contiguous(dst)) { return false; }
