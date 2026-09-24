@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -3930,6 +3931,42 @@ void llama_strix_prefetch(llama_context * ctx, const llama_token * tokens, int32
     if (ctx && tokens && n_tokens > n_context && n_context >= 0) {
         qwen4exp_ple_prefetch(ctx->get_model(), tokens, n_tokens, n_context, true);
     }
+}
+
+static llama_memory_hybrid_idx * llama_strix_kv_memory(const llama_context * ctx) {
+    return ctx ? dynamic_cast<llama_memory_hybrid_idx *>(ctx->get_memory()) : nullptr;
+}
+
+size_t llama_strix_kv_row_size(const llama_context * ctx) {
+    const auto * mem = llama_strix_kv_memory(ctx);
+    return mem ? mem->kv_row_size() : 0;
+}
+
+bool llama_strix_kv_get_rows(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, int32_t n, void * dst, size_t size) {
+    const auto * mem = llama_strix_kv_memory(ctx);
+    if (!mem || n < 0 || dst == nullptr || size != (size_t) n*mem->kv_row_size()) {
+        return false;
+    }
+    ctx->synchronize();                             // the graphs that wrote these rows may still be running
+    return mem->kv_rows_get(seq_id, p0, (uint32_t) n, (uint8_t *) dst);
+}
+
+bool llama_strix_kv_alloc(llama_context * ctx, llama_seq_id seq_id, const llama_token * tokens, int32_t n) {
+    auto * mem = llama_strix_kv_memory(ctx);
+    if (!mem || n < 0) {
+        return false;
+    }
+    ctx->synchronize();
+    return mem->kv_alloc(seq_id, tokens, (uint32_t) n);
+}
+
+bool llama_strix_kv_set_rows(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, int32_t n, const void * src, int32_t src_rows) {
+    auto * mem = llama_strix_kv_memory(ctx);
+    if (!mem || n < 0 || src_rows < n || src == nullptr) {
+        return false;
+    }
+    ctx->synchronize();
+    return mem->kv_rows_set(seq_id, p0, (uint32_t) n, (const uint8_t *) src, (uint32_t) src_rows);
 }
 
 void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void * data), void * abort_callback_data) {

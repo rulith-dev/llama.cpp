@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <set>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -36,6 +37,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_DISK_PERSIST,    // strixllama: POST /strix/persist, before the server is stopped
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -650,6 +652,16 @@ struct server_prompt_cache {
         uint64_t size_dft;
         uint64_t size_spec;
     };
+    // strixllama: version 3 keeps a conversation's attention rows by position (llama_strix_kv_*) in runs, written
+    // once each as the conversation grows and never rewritten: a run holds up to disk_run positions, and one that
+    // ends short (the conversation left its slot there) stays that way - the next run starts where it ends
+    struct disk_run_ref {
+        uint64_t hi;                    // XXH3-128 of the rows
+        uint64_t lo;
+        int32_t  pos0;                  // the first position in the file
+        int32_t  n;                     // positions in the file
+        int32_t  n_use;                 // positions of it the entry uses, from pos0 (an edit can end it early)
+    };
     // a slot's checkpoints handed back to the store: (n_tokens, pos_min, pos_max) -> the ref it is stored under
     using ckpt_paged_map = std::map<std::tuple<int64_t, int32_t, int32_t>, disk_ckpt_ref>;
 
@@ -658,8 +670,18 @@ struct server_prompt_cache {
     // With `paged_out`, an entry restored from the disk tier leaves its checkpoints there: `prompt` gets them without
     // their bytes and `paged_out` says where they are (pinned), exactly as if the slot had paged them out itself - a
     // 79K-token conversation carries ~3.3 GB of checkpoints of which a rewind reads one.
+    //
+    // strixllama: a version 3 entry is restored straight into the contexts' cells, a run at a time, and never whole in
+    // memory; then `runs_out` (when given) holds the runs that cover the restored positions, for the slot to write on
+    // from without writing them again. A slot whose conversation was restored any other way gets them cleared.
+    struct disk_runs_state {
+        std::vector<disk_run_ref> tgt;
+        std::vector<disk_run_ref> dft;
+        llama_tokens              tokens;  // what the runs were written for: they hold only while the prompt starts so
+    };
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
-              const std::function<void(size_t)> & before_restore = nullptr, ckpt_paged_map * paged_out = nullptr);
+              const std::function<void(size_t)> & before_restore = nullptr, ckpt_paged_map * paged_out = nullptr,
+              disk_runs_state * runs_out = nullptr);
 
     void update();
     struct disk_chunk_ref {
@@ -672,12 +694,19 @@ struct server_prompt_cache {
         server_tokens tokens;
         uint64_t      bytes     = 0;    // the entry's own file
         int64_t       order     = 0;    // larger = more recently written or used
-        int32_t       version   = 0;    // 1: one self-contained file, 2: a manifest over chunks/ and ckpt/
+        int32_t       version   = 0;    // 1: one self-contained file, 2: a manifest over chunks/ and ckpt/, 3: over runs/ and ckpt/
         uint64_t      main_size = 0;
         uint64_t      drft_size = 0;
         std::vector<disk_chunk_ref> main;
         std::vector<disk_chunk_ref> drft;
         std::vector<disk_ckpt_ref>  ckpts;
+        // version 3: bytes per position of the target's and the draft's rows, their runs from position 0, and
+        // how many tokens can be restored exactly - the latest checkpoint the runs reach
+        uint64_t row_tgt = 0;
+        uint64_t row_dft = 0;
+        std::vector<disk_run_ref> runs_tgt;
+        std::vector<disk_run_ref> runs_dft;
+        int64_t  n_exact = 0;
     };
     struct disk_object {                // a chunk or checkpoint file, shared between entries
         uint64_t bytes = 0;
@@ -690,12 +719,24 @@ struct server_prompt_cache {
         std::vector<disk_ckpt_ref> ckpts;                                      // every checkpoint of the prompt
         std::vector<std::pair<uint64_t, common_prompt_checkpoint>> ckpt_data;  // copies of the ones not stored yet
         std::vector<uint64_t> pinned;                                          // stored ones it names: held until counted
+        // version 3: every run of the entry, the rows of the ones this job writes, and the stored ones it names
+        int32_t  version = 2;
+        int32_t  id_slot = -1;
+        uint64_t row_tgt = 0;
+        uint64_t row_dft = 0;
+        int64_t  n_exact = 0;
+        std::vector<disk_run_ref> runs_tgt;
+        std::vector<disk_run_ref> runs_dft;
+        std::vector<std::pair<std::pair<uint64_t, uint64_t>, std::vector<uint8_t>>> run_data;
+        std::vector<std::pair<uint64_t, uint64_t>> run_pinned;
     };
 
     std::string disk_dir;
     uint64_t    disk_limit    = 0;      // bytes, 0 = no disk tier
     bool        disk_has_mtmd = false;
+    int32_t     disk_version  = 2;      // the manifest format this server writes; the store holds no older one
     int32_t     disk_block    = 4096;   // tokens a conversation grows by before it is written again
+    int32_t     disk_run      = 4096;   // version 3: positions in a run (STRIX_PROMPT_CACHE_RUN)
     int64_t     disk_seq      = 0;
     uint64_t    disk_bytes    = 0;      // entries, and every object once
 
@@ -705,12 +746,14 @@ struct server_prompt_cache {
     std::vector<disk_entry>                              disk_index;
     std::map<std::pair<uint64_t, uint64_t>, disk_object> disk_chunks;
     std::map<uint64_t, disk_object>                      disk_ckpts;
+    std::map<std::pair<uint64_t, uint64_t>, disk_object> disk_runs;
     std::deque<std::unique_ptr<disk_job>>                disk_queue;
-    std::deque<std::string>                              disk_migrate;   // version 1 entries to convert
     std::vector<disk_entry>                              disk_doomed;    // unreadable, for the writer to remove
     std::vector<std::pair<uint64_t, uint64_t>>           disk_bad_chunks;   // found damaged or missing by a read
     std::vector<uint64_t>                                disk_bad_ckpts;
+    std::vector<std::pair<uint64_t, uint64_t>>           disk_bad_runs;
     std::vector<uint64_t>                                disk_unpin;        // pins to release, by the writer
+    std::vector<std::pair<uint64_t, uint64_t>>           disk_unpin_runs;
     std::function<void()>                                disk_on_written;   // called by the writer after each job
     disk_job *                                           disk_current = nullptr;
     bool                                                 disk_stop    = false;
@@ -718,11 +761,14 @@ struct server_prompt_cache {
 
     ~server_prompt_cache();
 
-    // entries live in <root>/<model_tag>: a state is only meaningful to the model that computed it
-    void     set_disk(const std::string & root, size_t limit_mib, bool has_mtmd, const std::string & model_tag = "");
+    // entries live in <root>/<model_tag>: a state is only meaningful to the model that computed it. `version`
+    // is the format this server writes (3 where its contexts serve rows by position, else 2): entries of an
+    // earlier one are deleted as the store is opened
+    void     set_disk(const std::string & root, size_t limit_mib, bool has_mtmd, const std::string & model_tag, int32_t version);
     bool     has_disk() const { return disk_limit > 0; }
     uint64_t disk_size();
     bool     disk_busy();                  // a job is waiting: a save that would not wait can skip its work
+    bool     disk_drain(int64_t timeout_ms);   // wait until the writer has nothing queued or in hand; false on timeout
     // how much of `tokens` is on disk or on its way there: the longest stored prompt it starts with, or all
     // of it when a stored prompt starts with it
     size_t   disk_covered(const server_tokens & tokens, bool with_jobs = true);
@@ -734,6 +780,25 @@ struct server_prompt_cache {
     // with no bytes are ones the slot handed back, and `paged` says where they are
     bool     persist(const server_prompt & prompt, std::vector<uint8_t> && data_main, std::vector<uint8_t> && data_drft, bool wait,
                      const ckpt_paged_map * paged = nullptr);
+    // version 3: hand a conversation's runs to the writer. `tokens` are its first n positions and `runs_tgt` /
+    // `runs_dft` every run it has from position 0: those with rows in `run_data` are new, the rest must be in the
+    // store. `end`, when not null, is the recurrent state at exactly n (a conversation leaving its slot); the other
+    // checkpoints come from `ckpts` and `paged` as in persist(), those past n left out - but only those in
+    // `writable` are written, the rest named when the store has them already. `wait` blocks while the queue is full
+    // instead of giving up. A job whose runs the store lost meanwhile is dropped, and the slot told through
+    // runs_lost() to start its runs over.
+    bool persist_runs(int32_t id_slot, const server_tokens & tokens, const std::list<common_prompt_checkpoint> & ckpts,
+                      const std::set<const common_prompt_checkpoint *> & writable,
+                      const ckpt_paged_map * paged, const common_prompt_checkpoint * end, uint64_t row_tgt, uint64_t row_dft,
+                      const std::vector<disk_run_ref> & runs_tgt, const std::vector<disk_run_ref> & runs_dft,
+                      std::vector<std::pair<std::pair<uint64_t, uint64_t>, std::vector<uint8_t>>> && run_data, bool wait);
+    bool runs_lost(int32_t id_slot);           // and clears it
+    // the ref a run of rows is stored under: named by their XXH3-128
+    static disk_run_ref make_run_ref(const std::vector<uint8_t> & rows, int32_t pos0, int32_t n);
+    // positions of `tokens` the store brings back exactly, counting jobs on their way: a slot that is leaving writes
+    // only when this falls short of its conversation
+    size_t   disk_exact(const server_tokens & tokens);
+
     // checkpoints are cold data - only a rewind reads one - so an idle slot drops the bytes of those the store
     // holds; returns the bytes freed
     uint64_t ckpt_page_out(const server_tokens & tokens, std::list<common_prompt_checkpoint> & ckpts, ckpt_paged_map & paged);
@@ -747,10 +812,16 @@ struct server_prompt_cache {
     server_prompt_cache_state * load_from_disk(const server_tokens & tokens_new, float & f_keep_best, float & f_sim_best,
                                                ckpt_paged_map * paged = nullptr);
 
+    // version 3's side of load(): the best such entry, if it beats (f_keep_best, f_sim_best), restored
+    bool   load_runs(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft,
+                     int32_t id_slot, float & f_keep_best, float & f_sim_best, const std::function<void(size_t)> & before_restore,
+                     ckpt_paged_map * paged_out, disk_runs_state * runs_out, bool & restored);
+
     // the writer's side, and helpers that expect disk_mu held
     void   disk_writer();
     void   disk_write(disk_job & job);
-    void   disk_convert_v1(const std::string & path);
+    void   disk_write_runs(disk_job & job);
+    std::set<int32_t> disk_runs_lost;          // slots whose last job named runs the store no longer had
     void   disk_drop(const disk_entry & e, bool remove_file = true);
     void   disk_evict(const std::string & keep);
     void   disk_retire_bad();

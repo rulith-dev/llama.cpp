@@ -356,6 +356,153 @@ struct server_slot {
     server_prompt_cache::ckpt_paged_map ckpt_paged;
     server_prompt_cache * disk_cache = nullptr;
 
+    // strixllama: disk tier version 3 - this conversation's runs of attention rows in the store (or on their way),
+    // in position order from 0; they are written once and the next one starts where they end. Cleared whenever the
+    // slot takes another conversation, cut when this one is rewound.
+    mutable server_prompt_cache::disk_runs_state runs;
+
+    void runs_truncate(llama_pos p) const {
+        for (auto * v : { &runs.tgt, &runs.dft }) {
+            while (!v->empty() && v->back().pos0 >= p) {
+                v->pop_back();
+            }
+            if (!v->empty()) {
+                v->back().n_use = std::min<int32_t>(v->back().n_use, p - v->back().pos0);
+            }
+        }
+        if (runs.tokens.size() > (size_t) p) {
+            runs.tokens.resize(p);
+        }
+    }
+
+    // strixllama: hand the disk tier this conversation's rows it has not got, a run of disk_run positions at a time -
+    // gathered out of the cache (~15 ms for 120 MB) and written once by the writer. With `leaving`, the rest goes
+    // too, a run that ends short, and the recurrent state at the end: the conversation is about to leave the slot,
+    // so the store brings all of it back. Nothing to do is success; false when it could not be handed over.
+    bool persist_runs(server_prompt_cache & cache, bool leaving, bool wait) const {
+        const uint64_t row_tgt = llama_strix_kv_row_size(ctx_tgt);
+        const uint64_t row_dft = ctx_dft ? llama_strix_kv_row_size(ctx_dft) : 0;
+        if (!cache.has_disk() || cache.disk_run <= 0 || row_tgt == 0 || (ctx_dft && row_dft == 0) || prompt.n_tokens() == 0) {
+            return false;
+        }
+        if (prompt.tokens.get_text_tokens().size() != (size_t) prompt.n_tokens()) {
+            return false;                           // media: the disk tier does not store it
+        }
+        if (cache.runs_lost(id)) {
+            runs = {};                              // the store lost a run of ours: start over
+        }
+        // the runs hold only as far as the prompt still starts with the tokens they were written for: a rewind that
+        // took another turn, a context shift, a reused cache chunk - wherever it differs, they are cut there
+        {
+            const llama_tokens & cur = prompt.tokens.get_tokens();
+            const size_t lim = std::min(cur.size(), runs.tokens.size());
+            const size_t same = (size_t) (std::mismatch(cur.begin(), cur.begin() + lim, runs.tokens.begin()).first - cur.begin());
+            if (same < runs.tokens.size()) {
+                runs_truncate((llama_pos) same);
+            }
+        }
+        auto cover = [](const std::vector<server_prompt_cache::disk_run_ref> & v) {
+            int64_t n = 0;
+            for (const auto & r : v) {
+                n += r.n_use;
+            }
+            return n;
+        };
+        // the positions both the prompt and the cache hold: a token just sampled is not in the cache yet
+        const int64_t n_tok   = prompt.n_tokens();
+        const int64_t end_tgt = std::min<int64_t>(n_tok, llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id) + 1);
+        const int64_t end_dft = ctx_dft ? std::min<int64_t>(n_tok, llama_memory_seq_pos_max(llama_get_memory(ctx_dft), id) + 1) : 0;
+
+        auto new_tgt = runs.tgt;
+        auto new_dft = runs.dft;
+        std::vector<std::pair<std::pair<uint64_t, uint64_t>, std::vector<uint8_t>>> data;
+        auto gather = [&](llama_context * ctx, uint64_t row, std::vector<server_prompt_cache::disk_run_ref> & v, int64_t end) {
+            for (int64_t p = cover(v); p < end; ) {
+                const int64_t len = std::min<int64_t>(cache.disk_run, end - p);
+                if (len < cache.disk_run && !leaving) {
+                    break;                          // a run that is not full waits, unless the conversation leaves
+                }
+                std::vector<uint8_t> rows((size_t) (len * (int64_t) row));
+                if (!llama_strix_kv_get_rows(ctx, id, (llama_pos) p, (int32_t) len, rows.data(), rows.size())) {
+                    return false;
+                }
+                const auto r = server_prompt_cache::make_run_ref(rows, (int32_t) p, (int32_t) len);
+                v.push_back(r);
+                data.push_back({ { r.hi, r.lo }, std::move(rows) });
+                p += len;
+            }
+            return true;
+        };
+        try {
+            if (!gather(ctx_tgt, row_tgt, new_tgt, end_tgt) || (ctx_dft && !gather(ctx_dft, row_dft, new_dft, end_dft))) {
+                SLT_WRN(*this, "%s", "disk cache: the cache would not give up its rows; not writing them\n");
+                return false;
+            }
+        } catch (const std::bad_alloc &) {
+            SLT_WRN(*this, "%s", "disk cache: not enough memory to gather a run; trying again later\n");
+            return false;
+        }
+        const int64_t n_entry = cover(new_tgt);
+        if (n_entry == 0 || (data.empty() && !leaving)) {
+            return true;
+        }
+
+        // leaving, with the runs up to the last position the cache holds: the recurrent state now is the state at the
+        // entry's end (a token sampled last and not decoded is not in the entry; the next prompt brings it again)
+        common_prompt_checkpoint end_ckpt;
+        const common_prompt_checkpoint * end = nullptr;
+        if (leaving && n_entry == end_tgt) {
+            end_ckpt.update_pos(n_entry, llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id),
+                                         llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id));
+            try {
+                end_ckpt.update_tgt(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                end_ckpt.update_dft(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                common_speculative_get_state(spec, id, end_ckpt.data_spec);
+                end = &end_ckpt;
+            } catch (const std::bad_alloc &) {
+                SLT_WRN(*this, "%s", "disk cache: not enough memory for the recurrent state; the entry ends at an earlier checkpoint\n");
+            }
+        }
+
+        // the recurrent state is the part of a conversation that changes, so the store gets it only as the conversation
+        // leaves: the state at the end, and the last two checkpoints of its last prompt - just before its end, where a
+        // regenerated answer or a template that drops the thinking goes back to, and for a short turn its last user
+        // message. Checkpoints the store has already are named whenever; the older ones in memory are not written.
+        std::set<const common_prompt_checkpoint *> writable;
+        if (leaving) {
+            int id_last = -1;
+            for (const auto & c : prompt.checkpoints) {
+                if (!c.data_tgt.empty() && c.n_tokens <= n_entry) {
+                    id_last = std::max(id_last, c.id_task);
+                }
+            }
+            for (auto it = prompt.checkpoints.rbegin(); it != prompt.checkpoints.rend() && writable.size() < 2; ++it) {
+                if (!it->data_tgt.empty() && it->n_tokens <= n_entry && it->id_task == id_last) {
+                    writable.insert(&*it);
+                }
+            }
+        }
+
+        server_tokens tokens = prompt.tokens.clone();
+        tokens.keep_first((size_t) n_entry);
+        const size_t n_new = data.size();
+        if (!cache.persist_runs(id, tokens, prompt.checkpoints, writable, &ckpt_paged, end, row_tgt, row_dft, new_tgt, new_dft,
+                                std::move(data), wait)) {
+            return false;
+        }
+        runs.tgt = std::move(new_tgt);
+        runs.dft = std::move(new_dft);
+        {
+            const llama_tokens & cur = prompt.tokens.get_tokens();
+            runs.tokens.assign(cur.begin(), cur.begin() + std::min<size_t>(cur.size(), (size_t) cover(runs.tgt)));
+        }
+        if (leaving || n_new > 0) {
+            SLT_INF(*this, "disk cache: %zu new runs handed over, %lld of %lld tokens in runs (draft %lld)%s\n", n_new,
+                    (long long) n_entry, (long long) n_tok, (long long) cover(runs.dft), end ? ", with the state at the end" : "");
+        }
+        return true;
+    }
+
     // strixllama: `ram` also keeps the state in the RAM tier (upstream's behaviour); `wait` blocks while the
     // disk writer's queue is full instead of letting the disk copy go. The disk tier gets its own copy through
     // a background writer, and only when it has not got this conversation, or a longer one, already - so the
@@ -373,11 +520,22 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        const bool to_disk = prompt_cache.has_disk() && prompt_cache.disk_wants(prompt);
+        bool to_disk = prompt_cache.has_disk() && prompt_cache.disk_wants(prompt);
 
         // a save that would not wait for the writer skips the gather too when the writer has a job waiting
         if (to_disk && !ram && !wait && prompt_cache.disk_busy()) {
             return false;
+        }
+
+        // strixllama: disk tier version 3 - the store gets the rows it has not got and the recurrent state at the end,
+        // never the whole state; the RAM tier below still takes a short conversation whole
+        bool queued_runs = false;
+        if (to_disk && llama_strix_kv_row_size(ctx_tgt) > 0 && (!ctx_dft || llama_strix_kv_row_size(ctx_dft) > 0)) {
+            queued_runs = persist_runs(prompt_cache, /* leaving = */ true, wait);
+            to_disk = false;
+            if (!ram) {
+                return queued_runs;
+            }
         }
 
         // a checkpoint handed back to the disk tier has no bytes here, and the RAM tier would keep it that way
@@ -386,7 +544,7 @@ struct server_slot {
 
         auto * cur = ram && !paged ? prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft) : nullptr;
         if (cur == nullptr && !to_disk) {
-            return false;
+            return queued_runs;
         }
 
         const int64_t t0 = ggml_time_us();
@@ -426,7 +584,7 @@ struct server_slot {
                 (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (t3 - t2) / 1000.0,
                 cur ? ", kept in RAM" : "", to_disk ? (queued ? ", queued for disk" : ", disk writer busy") : "");
 
-        return cur != nullptr || queued;
+        return cur != nullptr || queued || queued_runs;
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens,
@@ -436,12 +594,14 @@ struct server_slot {
         auto before_restore = [&](size_t n_tokens) {
             prompt_cache.ckpt_release(ckpt_paged);
             n_tokens_persist_checked = -1;
+            runs = {};
             if (make_room_for) {
                 make_room_for(n_tokens);
             }
         };
-        // an entry restored from the disk tier leaves its checkpoints there, pinned for this slot like paged-out ones
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, before_restore, &ckpt_paged);
+        // an entry restored from the disk tier leaves its checkpoints there, pinned for this slot like paged-out ones,
+        // and one of version 3 its runs, which the slot writes on from
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, before_restore, &ckpt_paged, &runs);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -461,6 +621,7 @@ struct server_slot {
             disk_cache->ckpt_release(ckpt_paged);
         }
         ckpt_paged.clear();
+        runs = {};
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -854,6 +1015,7 @@ struct server_slot {
         other.stats = stats;
 
         other.prompt = prompt.clone();
+        other.runs   = runs;                         // strixllama: the same rows, so the same runs
         other.init_sampler();
     }
 };
@@ -1518,7 +1680,9 @@ private:
                     task.id = queue_tasks.get_new_id();
                     queue_tasks.post(std::move(task));
                 };
-                prompt_cache->set_disk(dir, mib ? std::max(1, atoi(mib)) : 16384, mctx != nullptr, tag);
+                // version 3 where both contexts serve rows by position, else version 2; the store keeps no older one
+                const bool rows = llama_strix_kv_row_size(ctx_tgt) > 0 && (!ctx_dft || llama_strix_kv_row_size(ctx_dft) > 0);
+                prompt_cache->set_disk(dir, mib ? std::max(1, atoi(mib)) : 16384, mctx != nullptr, tag, rows ? 3 : 2);
                 for (auto & slot : slots) {
                     slot.disk_cache = prompt_cache.get();
                 }
@@ -1864,6 +2028,14 @@ private:
             }
             if (slot.prompt.tokens.get_text_tokens().size() != (size_t) n) {
                 slot.n_tokens_persist_checked = n;          // media: the disk tier does not store it
+                continue;
+            }
+            // version 3: the runs the conversation filled while it was busy and the writer turned away; the rest,
+            // and the recurrent state, only when it leaves its slot - nothing is written twice
+            if (llama_strix_kv_row_size(slot.ctx_tgt) > 0 && (!slot.ctx_dft || llama_strix_kv_row_size(slot.ctx_dft) > 0)) {
+                if (slot.persist_runs(*prompt_cache, /* leaving = */ false, /* wait = */ false)) {
+                    slot.n_tokens_persist_checked = n;
+                }
                 continue;
             }
             const size_t block   = (size_t) prompt_cache->disk_block;
@@ -2952,6 +3124,36 @@ private:
                     res->n_erased = n_erased;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_DISK_PERSIST:
+                {
+                    // strixllama: the server is about to be stopped, and every conversation in a slot leaves memory
+                    // with it - each goes to the disk tier as it would on leaving its slot (its last run, the
+                    // recurrent state at its end, its last prompt's checkpoints), and the answer waits for the
+                    // writer. A slot still generating is left alone: its request is about to be cut off anyway.
+                    auto res = std::make_unique<server_task_result_control>();
+                    res->id = task.id;
+                    const int64_t t0 = ggml_time_us();
+                    int n_saved = 0;
+                    int64_t n_tokens = 0;
+                    if (prompt_cache && prompt_cache->has_disk()) {
+                        for (auto & slot : slots) {
+                            if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
+                                continue;
+                            }
+                            if (slot.prompt_save(*prompt_cache, /* ram = */ false, /* wait = */ true)) {
+                                n_saved++;
+                                n_tokens += slot.prompt.n_tokens();
+                            }
+                        }
+                        res->success = prompt_cache->disk_drain(120000);
+                    } else {
+                        res->success = true;
+                    }
+                    res->message = string_format("%d conversations, %lld tokens, %.0f ms%s", n_saved, (long long) n_tokens,
+                                                 (ggml_time_us() - t0) / 1000.0, res->success ? "" : "; the writer did not finish in time");
+                    SRV_INF("persist: %s\n", res->message.c_str());
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_GET_LORA:
                 {
                     // TODO @ngxson : make lora_adapters a dedicated member of server_context
@@ -3077,6 +3279,16 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        // strixllama: disk tier version 3 - a conversation's full runs go to the store as it grows, each written once;
+        // gathering one takes ~15 ms, once every disk_run positions
+        if (prompt_cache && prompt_cache->has_disk()) {
+            for (auto & slot : slots) {
+                if (slot.is_processing()) {
+                    slot.persist_runs(*prompt_cache, /* leaving = */ false, /* wait = */ false);
+                }
+            }
+        }
 
         // check if all slots are idle
         {
@@ -4976,6 +5188,27 @@ json server_routes::get_model_info() const {
     return get_res_model_info(*meta);
 }
 
+// strixllama: POST /strix/persist - see SERVER_TASK_TYPE_DISK_PERSIST
+static std::unique_ptr<server_res_generator> strix_persist_response(std::unique_ptr<server_res_generator> res, const server_http_req & req) {
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_DISK_PERSIST);
+        task.id = rd.get_new_id();
+        rd.post_task(std::move(task));
+    }
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+    res->ok(result->to_json());
+    return res;
+}
+
 void server_routes::init_routes() {
     // IMPORTANT: all lambda functions must start with create_response()
     // this is to ensure that the server_res_generator can handle sleeping case correctly
@@ -5613,6 +5846,10 @@ void server_routes::init_routes() {
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
         res->ok(result->to_json());
         return res;
+    };
+
+    this->post_strix_persist = [this](const server_http_req & req) {
+        return strix_persist_response(create_response(), req);
     };
 }
 

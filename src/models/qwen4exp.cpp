@@ -1256,6 +1256,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         pooled = build_block_keys(inp->blk_cells, inp->blk_pos, n_blocks);
         if (kb) {
             ggml_build_forward_expand(gf, ggml_set_rows(ctx0, kb, ggml_reshape_2d(ctx0, pooled, idx_dim, n_blocks), inp->kb_bid_rows));
+            // score with the keys as the cache holds them (F16), as every later graph does: a rebuild - the first
+            // graph of a conversation, one after a restore or a rewind - then selects what the cache would have
+            pooled = ggml_get_rows(ctx0, kb, inp->kb_bid_rows);
+            pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
         }
     }
     cb(pooled, "indexer_k", il);
