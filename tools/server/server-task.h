@@ -599,6 +599,7 @@ struct server_prompt {
 struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
+    std::vector<uint8_t> spec;   // strixllama: the drafter's own state at the end (common_speculative_get_state)
 
     size_t size() const {
         return main.size() + drft.size();
@@ -679,9 +680,11 @@ struct server_prompt_cache {
         std::vector<disk_run_ref> dft;
         llama_tokens              tokens;  // what the runs were written for: they hold only while the prompt starts so
     };
+    // `spec_out` gets the drafter's state at the restored entry's end (empty when the entry has none), for the caller
+    // to hand to common_speculative_set_state
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
               const std::function<void(size_t)> & before_restore = nullptr, ckpt_paged_map * paged_out = nullptr,
-              disk_runs_state * runs_out = nullptr);
+              disk_runs_state * runs_out = nullptr, std::vector<uint8_t> * spec_out = nullptr);
 
     void update();
     struct disk_chunk_ref {
@@ -818,7 +821,7 @@ struct server_prompt_cache {
     // version 3's side of load(): the best such entry, if it beats (f_keep_best, f_sim_best), restored
     bool   load_runs(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft,
                      int32_t id_slot, float & f_keep_best, float & f_sim_best, const std::function<void(size_t)> & before_restore,
-                     ckpt_paged_map * paged_out, disk_runs_state * runs_out, bool & restored);
+                     ckpt_paged_map * paged_out, disk_runs_state * runs_out, bool & restored, std::vector<uint8_t> * spec_out);
 
     // the writer's side, and helpers that expect disk_mu held
     void   disk_writer();

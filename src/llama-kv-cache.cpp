@@ -115,7 +115,7 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer + 2)*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -162,6 +162,9 @@ llama_kv_cache::llama_kv_cache(
     }
 
     const bool is_mla = hparams.is_mla();
+
+    // strixllama: the widest K and V rows per buffer type, for zero_cells' source
+    std::map<ggml_backend_buffer_type_t, std::pair<int64_t, int64_t>> widest;
 
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
@@ -248,6 +251,30 @@ llama_kv_cache::llama_kv_cache(
         map_layer_ids[il] = layers.size();
 
         layers.push_back({ il, k, v, k_stream, v_stream, });
+
+        auto & w = widest[buft];
+        w.first  = std::max<int64_t>(w.first,  has_k ? n_embd_k_gqa : 0);
+        w.second = std::max<int64_t>(w.second, has_v && !v_trans ? n_embd_v_gqa : 0);
+    }
+
+    // strixllama: zeros to copy over freed cells (zero_cells): 256 rows of each K/V type in each buffer, cleared with
+    // the buffer below and never written
+    for (const auto & [buft, w] : widest) {
+        ggml_context * ctx = ctx_for_buft(buft);
+        const int64_t n_zero = 256;
+        auto add = [&](ggml_type type, int64_t row) {
+            if (row > 0) {
+                ggml_tensor * z = ggml_new_tensor_1d(ctx, type, n_zero*row);
+                ggml_format_name(z, "cache_%szero_%s", name_tag, ggml_type_name(type));
+                zero_src.push_back({ buft, type, z });
+            }
+        };
+        if (type_k == type_v) {
+            add(type_k, std::max(w.first, w.second));
+        } else {
+            add(type_k, w.first);
+            add(type_v, w.second);
+        }
     }
 
     if (reuse) {
@@ -334,10 +361,12 @@ llama_kv_cache::llama_kv_cache(
 
         // strixllama: qwen4exp keeps V as it is. Its sparse-attention prefill kernel (qsa3) sums P*V on the matrix
         // cores, and those sums move in the last bit with the V of keys they weight by zero - the free cells after
-        // a conversation's last one, which hold whatever an earlier conversation left there. The inverse rotation
-        // of the output spreads that bit over 64 dimensions, far enough to reach the tokens, so a conversation read
-        // back from disk parted from the same one kept in memory; unrotated it does not. K rotated alone: mean KLD
-        // against f16 0.0139 +/- 0.0007, both rotated 0.0137.
+        // a conversation's last one. Before freed cells were zeroed (zero_cells) they held whatever an earlier
+        // conversation left there, and the inverse rotation of the output spread that bit far enough that a
+        // conversation read back from disk parted from the same one kept in memory. With zeroed cells a rotated V
+        // would be safe, but the disk tier's q8_0 conversations are stored unrotated and their rows are the same
+        // size either way, so rotating now would read them wrong; the quality is the same within error (mean KLD
+        // against f16: K rotated alone 0.0139 +/- 0.0007, both rotated 0.0137).
         attn_rot_v =
             !attn_rot_disable && model.arch != LLM_ARCH_QWEN4EXP &&
             n_embd_head_v_all > 0 &&
@@ -374,6 +403,15 @@ llama_kv_cache::llama_kv_cache(
 }
 
 void llama_kv_cache::clear(bool data) {
+    // strixllama: a cleared cache has no stale rows either (see zero_cells)
+    static const bool zero_on = [] { const char * e = getenv("STRIX_KV_ZERO_FREED"); return !e || atoi(e) != 0; }();
+    if (!data && zero_on && !other) {
+        if (lctx_sync != nullptr) {
+            ggml_backend_sched_synchronize(lctx_sync->get_sched());
+        }
+        data = true;
+    }
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -409,6 +447,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
+        std::vector<std::pair<uint32_t, uint32_t>> freed;
+
         for (uint32_t i = 0; i < cells.size(); ++i) {
             if (!cells.pos_in(i, p0, p1)) {
                 continue;
@@ -418,8 +458,15 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
+                if (!freed.empty() && freed.back().second == i) {
+                    freed.back().second = i + 1;
+                } else {
+                    freed.push_back({ i, i + 1 });
+                }
             }
         }
+
+        zero_cells(seq_to_stream[seq_id], freed);
 
         // If we freed up a slot, set head to it so searching can start there.
         if (new_head != cells.size() && new_head < head) {
@@ -433,6 +480,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
             uint32_t new_head = cells.size();
 
+            std::vector<std::pair<uint32_t, uint32_t>> freed;
+
             for (uint32_t i = 0; i < cells.size(); ++i) {
                 if (!cells.pos_in(i, p0, p1)) {
                     continue;
@@ -443,7 +492,14 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
+                if (!freed.empty() && freed.back().second == i) {
+                    freed.back().second = i + 1;
+                } else {
+                    freed.push_back({ i, i + 1 });
+                }
             }
+
+            zero_cells(s, freed);
 
             // If we freed up a slot, set head to it so searching can start there.
             if (new_head != cells.size() && new_head < head) {
@@ -560,13 +616,22 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
     uint32_t new_head = cells.size();
 
+    std::vector<std::pair<uint32_t, uint32_t>> freed;
+
     for (uint32_t i = 0; i < cells.size(); ++i) {
         if (cells.seq_keep(i, seq_id)) {
             if (new_head == cells.size()) {
                 new_head = i;
             }
+            if (!freed.empty() && freed.back().second == i) {
+                freed.back().second = i + 1;
+            } else {
+                freed.push_back({ i, i + 1 });
+            }
         }
     }
+
+    zero_cells(seq_to_stream[seq_id], freed);
 
     // If we freed up a slot, set head to it so searching can start there.
     if (new_head != cells.size() && new_head < head) {
@@ -1197,6 +1262,74 @@ void llama_kv_cache::copy_rows(ggml_tensor * t, const cell_move_vec_t & moves) c
         }
 
         ggml_reset(ctx);
+    }
+
+    ggml_free(ctx);
+}
+
+void llama_kv_cache::zero_cells(uint32_t strm, const std::vector<std::pair<uint32_t, uint32_t>> & ranges) const {
+    static const bool on = [] { const char * e = getenv("STRIX_KV_ZERO_FREED"); return !e || atoi(e) != 0; }();
+    if (!on || ranges.empty() || zero_src.empty() || other != nullptr) {
+        return;
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context * ctx = ggml_init(params);
+    GGML_ASSERT(ctx != nullptr);
+
+    bool synced = false;
+    for (const auto & layer : layers) {
+        for (ggml_tensor * t : { layer.k, layer.v }) {
+            if (t == nullptr || t->buffer == nullptr || t->data == nullptr || (t == layer.v && v_trans)) {
+                continue;
+            }
+
+            const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+            ggml_tensor * z = nullptr;
+            for (const auto & zs : zero_src) {
+                if (zs.buft == buft && zs.type == t->type) {
+                    z = zs.t;
+                    break;
+                }
+            }
+            if (z == nullptr || z->data == nullptr) {
+                continue;
+            }
+
+            // on the stream the graphs run on, as copy_rows: after the reads queued before, before the next graph
+            ggml_backend_t backend = backend_for(t);
+            if (backend == nullptr && !synced && lctx_sync != nullptr) {
+                ggml_backend_sched_synchronize(lctx_sync->get_sched());
+                synced = true;
+            }
+
+            const int64_t z_rows = ggml_nelements(z) / t->ne[0];
+            for (const auto & r : ranges) {
+                for (uint32_t c = r.first; c < r.second; ) {
+                    const uint32_t n = (uint32_t) std::min<int64_t>(r.second - c, z_rows);
+
+                    ggml_tensor * a = ggml_view_1d(ctx, z, (int64_t) n*t->ne[0], 0);
+                    ggml_tensor * b = ggml_view_1d(ctx, t, (int64_t) n*t->ne[0], (size_t) strm*t->nb[2] + (size_t) c*t->nb[1]);
+
+                    ggml_backend_view_init(a);
+                    ggml_backend_view_init(b);
+
+                    if (backend != nullptr) {
+                        ggml_backend_tensor_copy_async(backend, backend, a, b);
+                    } else {
+                        ggml_backend_tensor_copy(a, b);
+                    }
+
+                    ggml_reset(ctx);
+                    c += n;
+                }
+            }
+        }
     }
 
     ggml_free(ctx);
@@ -1848,6 +1981,22 @@ void llama_kv_cache::apply_moves(const cell_move_vec_t & moves) {
     for (const auto & m : moves) {
         cells.mv_range(m.src, m.dst, m.n, m.seq);
     }
+
+    // strixllama: what the pieces left behind is free now - zeroed after the copies that read it, on their stream
+    std::vector<std::pair<uint32_t, uint32_t>> freed;
+    for (const auto & m : moves) {
+        for (uint32_t i = m.src; i < m.src + m.n; ++i) {
+            if (!cells.is_empty(i)) {
+                continue;
+            }
+            if (!freed.empty() && freed.back().second == i) {
+                freed.back().second = i + 1;
+            } else {
+                freed.push_back({ i, i + 1 });
+            }
+        }
+    }
+    zero_cells(0, freed);
 }
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {

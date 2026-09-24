@@ -622,6 +622,9 @@ struct server_slot {
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, dst_dft, cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
+        if (cur) {
+            common_speculative_get_state(spec, id, cur->data.spec);
+        }
         const int64_t t2 = ggml_time_us();
 
         bool queued = false;
@@ -647,7 +650,9 @@ struct server_slot {
                      const std::function<void(size_t)> & make_room_for = nullptr) {
         // strixllama: when an entry is about to replace this slot's conversation, the old one's pins go, its block
         // bookkeeping goes, and room is made in the pool for the whole entry
+        bool replaced = false;
         auto before_restore = [&](size_t n_tokens) {
+            replaced = true;
             prompt_cache.ckpt_release(ckpt_paged);
             n_tokens_persist_checked = -1;
             runs = {};
@@ -657,9 +662,15 @@ struct server_slot {
         };
         // an entry restored from the disk tier leaves its checkpoints there, pinned for this slot like paged-out ones,
         // and one of version 3 its runs, which the slot writes on from
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, before_restore, &ckpt_paged, &runs);
+        std::vector<uint8_t> spec_state;
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, before_restore, &ckpt_paged, &runs, &spec_state);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+        }
+        // the drafter carries the target's row of the last position into the next batch: the restored conversation's,
+        // or none (an entry stored without it), never the one this slot held before
+        if (replaced) {
+            common_speculative_set_state(spec, id, spec_state);
         }
 
         return res;
@@ -1083,6 +1094,11 @@ struct server_slot {
 
         other.prompt = prompt.clone();
         other.runs   = runs;                         // strixllama: the same rows, so the same runs
+        {
+            std::vector<uint8_t> spec_state;         // and the drafter's carried row of them
+            common_speculative_get_state(spec, id, spec_state);
+            common_speculative_set_state(spec, other.id, spec_state);
+        }
         other.init_sampler();
     }
 };
@@ -3150,6 +3166,7 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        common_speculative_set_state(spec.get(), slot->id, {});   // a slot file has no drafter state
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -3562,6 +3579,34 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // strixllama: a draft pays for itself on one conversation, not on several at once. Every drafted token is
+        // verified, and in this mixture of experts each verified token reads the weights of ~10 more experts;
+        // several conversations already share the trunk's cost, so their drafts add verification they cannot
+        // win back. STRIX_SPEC_DRAFT_BY_SLOTS caps the draft by how many slots generate this step: "3,2,2,0"
+        // drafts 3 tokens for one, 2 for two or three and none from four on.
+        int n_draft_cap = INT_MAX;
+        if (spec) {
+            static const std::vector<int> by_slots = [] {
+                std::vector<int> v;
+                const char * e = getenv("STRIX_SPEC_DRAFT_BY_SLOTS");
+                for (const char * p = e; p && *p; ) {
+                    v.push_back(std::max(0, atoi(p)));
+                    p = strchr(p, ',');
+                    p = p ? p + 1 : nullptr;
+                }
+                return v;
+            }();
+            if (!by_slots.empty()) {
+                int n_gen = 0;
+                for (const auto & s : slots) {
+                    n_gen += s.state == SLOT_STATE_GENERATING;
+                }
+                if (n_gen > 0) {
+                    n_draft_cap = by_slots[std::min<size_t>(n_gen, by_slots.size()) - 1];
+                }
+            }
+        }
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
@@ -3583,7 +3628,7 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                const int n_draft_max = std::min(slot.get_n_draft_max(), n_draft_cap);
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -3665,6 +3710,8 @@ private:
                     //const int64_t t_start = ggml_time_us();
 
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.data_spec.clear();
+                    common_speculative_get_state(spec.get(), slot.id, ckpt.data_spec);
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -4607,6 +4654,7 @@ private:
                         if (slot.ctx_dft) {
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
+                        common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
 
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 

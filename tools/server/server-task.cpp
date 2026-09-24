@@ -1806,6 +1806,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
+            /*.spec =*/ {},
         },
     });
 
@@ -1813,7 +1814,11 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
-                               const std::function<void(size_t)> & before_restore, ckpt_paged_map * paged_out, disk_runs_state * runs_out) {
+                               const std::function<void(size_t)> & before_restore, ckpt_paged_map * paged_out, disk_runs_state * runs_out,
+                               std::vector<uint8_t> * spec_out) {
+    if (spec_out) {
+        spec_out->clear();
+    }
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1849,7 +1854,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (disk_limit > 0) {
         bool restored = false;
         if (load_runs(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, f_keep_best, f_sim_best, before_restore, paged_out,
-                      runs_out, restored)) {
+                      runs_out, restored, spec_out)) {
             return restored;                       // attempted: whatever happened, the slot's own conversation went
         }
     }
@@ -1947,6 +1952,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
 
         prompt = std::move(it_best->prompt);
+        if (spec_out) {
+            *spec_out = std::move(it_best->data.spec);
+        }
 
         states.erase(it_best);
 
@@ -4276,7 +4284,7 @@ server_prompt_cache_state * server_prompt_cache::load_from_disk(const server_tok
 // the recurrent state from the checkpoint at the restore point. Two runs in memory at most, never the state.
 bool server_prompt_cache::load_runs(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft,
                                     int32_t id_slot, float & f_keep_best, float & f_sim_best, const std::function<void(size_t)> & before_restore,
-                                    ckpt_paged_map * paged_out, disk_runs_state * runs_out, bool & restored) {
+                                    ckpt_paged_map * paged_out, disk_runs_state * runs_out, bool & restored, std::vector<uint8_t> * spec_out) {
     restored = false;
     const uint64_t row_tgt = llama_strix_kv_row_size(ctx_tgt);
     const uint64_t row_dft = ctx_dft ? llama_strix_kv_row_size(ctx_dft) : 0;
@@ -4477,6 +4485,8 @@ bool server_prompt_cache::load_runs(server_prompt & prompt, const server_tokens 
                                                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == c.data_dft.size());
                 if (!ok) {
                     why = "the recurrent state did not go in";
+                } else if (spec_out) {
+                    *spec_out = std::move(c.data_spec);   // the drafter's state at the restore point, when stored
                 }
             }
         }
@@ -4489,6 +4499,9 @@ bool server_prompt_cache::load_runs(server_prompt & prompt, const server_tokens 
     }
 
     if (!ok) {
+        if (spec_out) {
+            spec_out->clear();
+        }
         // the cells were taken: give them back, and blame what was at fault
         llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
         if (ctx_dft) {

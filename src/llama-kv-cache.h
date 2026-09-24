@@ -209,6 +209,12 @@ public:
     // copy the rows of the moves' pieces of a tensor on this cache's device, in order, queued as above
     void copy_rows(ggml_tensor * t, const cell_move_vec_t & moves) const;
 
+    // strixllama: zero the rows of cells [first, second) of stream strm in every layer, queued as above. A cell is
+    // zeroed as it is freed, so what a later conversation finds in the free cells it attends past its end - its
+    // own last block of keys holds some - is always the same: the matrix cores' sums move in the last bit with
+    // the values of keys they weight by zero (STRIX_KV_ZERO_FREED=0 leaves freed cells as they are)
+    void zero_cells(uint32_t strm, const std::vector<std::pair<uint32_t, uint32_t>> & ranges) const;
+
 private:
     // the cells of positions [p0, p0 + n) of seq_id as runs of consecutive cells, in position order (seq_rows_*)
     bool seq_row_cells(llama_seq_id seq_id, llama_pos p0, uint32_t n, bool own, std::vector<std::pair<uint32_t, uint32_t>> & runs) const;
@@ -391,6 +397,9 @@ private:
     llama_context * lctx_sync = nullptr;
     // the owner's mirror of every move (see set_move_hook)
     std::function<void(const cell_move_vec_t &, bool)> move_hook;
+    // strixllama: zero_cells' source - zeros in each buffer, one tensor per K/V type, never written
+    struct zero_src_t { ggml_backend_buffer_type_t buft; ggml_type type; ggml_tensor * t; };
+    std::vector<zero_src_t> zero_src;
     // where plan_layout put the sequences of its batch that hold no cell yet, for find_slot_regions
     mutable std::map<llama_seq_id, uint32_t> planned_start;
 
