@@ -421,7 +421,10 @@ struct server_slot {
         if (!cache.has_disk() || cache.disk_run <= 0 || row_tgt == 0 || (ctx_dft && row_dft == 0) || prompt.n_tokens() == 0) {
             return false;
         }
-        if (prompt.tokens.get_text_tokens().size() != (size_t) prompt.n_tokens()) {
+        // the text tokens, not get_tokens(): with a vision projector loaded every prompt is a media prompt to
+        // get_tokens(), which aborts, although this one has no media in it
+        const llama_tokens text = prompt.tokens.get_text_tokens();
+        if (text.size() != (size_t) prompt.n_tokens()) {
             return false;                           // media: the disk tier does not store it
         }
         if (cache.runs_lost(id)) {
@@ -430,7 +433,7 @@ struct server_slot {
         // the runs hold only as far as the prompt still starts with the tokens they were written for: a rewind that
         // took another turn, a context shift, a reused cache chunk - wherever it differs, they are cut there
         {
-            const llama_tokens & cur = prompt.tokens.get_tokens();
+            const llama_tokens & cur = text;
             const size_t lim = std::min(cur.size(), runs.tokens.size());
             const size_t same = (size_t) (std::mismatch(cur.begin(), cur.begin() + lim, runs.tokens.begin()).first - cur.begin());
             if (same < runs.tokens.size()) {
@@ -542,10 +545,7 @@ struct server_slot {
         }
         runs.tgt = std::move(new_tgt);
         runs.dft = std::move(new_dft);
-        {
-            const llama_tokens & cur = prompt.tokens.get_tokens();
-            runs.tokens.assign(cur.begin(), cur.begin() + std::min<size_t>(cur.size(), (size_t) cover(runs.tgt)));
-        }
+        runs.tokens.assign(text.begin(), text.begin() + std::min<size_t>(text.size(), (size_t) cover(runs.tgt)));
         if (leaving || n_new > 0) {
             SLT_INF(*this, "disk cache: %zu new runs handed over, %lld of %lld tokens in runs (draft %lld)%s\n", n_new,
                     (long long) n_entry, (long long) n_tok, (long long) cover(runs.dft), end ? ", with the state at the end" : "");
@@ -4026,9 +4026,9 @@ private:
                     // positions up to p0 - 1 and the recurrent state is at p0 - 1 (for a hybrid memory the lowest position
                     // is the recurrent one, the highest the lower of the two). If they do not, going on feeds the
                     // recurrent state positions it has seen already, or skips some (GitHub issue #1): the conversation
-                    // is processed again from its start instead. Not checked with images, whose positions run ahead
-                    // of their cells.
-                    if (!slot.prompt.tokens.has_mtmd) {
+                    // is processed again from its start instead. Not checked with images in the prompt, whose
+                    // positions run ahead of their cells - but checked with a vision projector loaded and none in it.
+                    if (slot.prompt.tokens.get_text_tokens().size() == slot.prompt.tokens.size()) {
                         auto * mem_tgt = llama_get_memory(ctx_tgt);
                         const llama_pos pos_max = llama_memory_seq_pos_max(mem_tgt, slot.id);
                         const llama_pos pos_min = llama_memory_seq_pos_min(mem_tgt, slot.id);
