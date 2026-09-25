@@ -956,6 +956,215 @@ static void top_k_parallel_radix_cuda(
         <<<nrows, BLOCK_SIZE, 0, stream>>>(src, dst, states, ncols, k);
 }
 
+// strixllama: top_k_rows begin
+// One block per row with the row's keys in registers: a radix select over them (four 8-bit passes, an LDS histogram per
+// wave), then one pass that writes the selection. top_k_parallel_radix_cuda reads the whole matrix
+// five times (four histograms, the gather) and scans it again in column order for the ties: at the QSA indexer's
+// 512 rows of 16.9K blocks (64K context) that is 1.17 ms a strip; this reads it once.
+// The selected set is the same - every element above the k-th largest, then the lowest columns equal to it - but not
+// the order within a row, which neither kernel specifies (the QSA callers sort it).
+template <int BLOCK, int ITEMS>
+static __global__ void __launch_bounds__(BLOCK) top_k_rows_cuda(
+        const float * __restrict__ src, int * __restrict__ dst, const int ncols, const int nrows, const int k, const int items) {
+    constexpr int NWAVES = BLOCK / 32;
+    // a histogram per wave, so same-digit lanes only collide within a wave; two 16-bit counts a word (bins d and d+128)
+    // keep it at 16 KB, so two blocks share a WGP and one's loads overlap the other's passes
+    __shared__ uint32_t whist[NWAVES][128];
+    __shared__ uint32_t hist[256];
+    __shared__ uint32_t sel_bucket;
+    __shared__ uint32_t sel_above;
+    __shared__ uint32_t out_count;
+    __shared__ uint32_t wave_eq[NWAVES];
+
+    const int tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
+    const uint64_t lanes_below = (1ull << lane) - 1;
+
+    {   // one row a block (a grid-stride loop would hoist every slot's address out of it and hold them all)
+        const int     row     = blockIdx.x;
+        const float * row_src = src + (size_t) row * ncols;
+        int *         row_dst = dst + (size_t) row * k;
+
+        // key 0 marks a slot past the row (a real key is at least 1: only a negative NaN maps to 0, and it is moved up)
+        uint32_t key[ITEMS];
+#pragma unroll
+        for (int j = 0; j < ITEMS; ++j) {
+            const int c = j * BLOCK + tid;
+            key[j] = j < items && c < ncols ? max(top_k_float_to_ordered(row_src[c]), 1u) : 0u;
+        }
+
+        // the k-th largest key, one 8-bit digit a pass from the top; desired ends as the number of elements equal to
+        // it that belong to the selection, eq_total as the number there are
+        uint32_t prefix = 0, pmask = 0, desired = (uint32_t) k, eq_total = 0;
+#pragma unroll 1
+        for (int shift = 24; shift >= 0; shift -= 8) {
+#pragma unroll
+            for (int b = lane; b < 128; b += 32) {
+                whist[wave][b] = 0;
+            }
+#pragma unroll
+            for (int j = 0; j < ITEMS; ++j) {
+                if (key[j] != 0 && (key[j] & pmask) == prefix) {
+                    const uint32_t d = (key[j] >> shift) & 255u;
+                    atomicAdd(&whist[wave][d & 127u], 1u << (16 * (d >> 7)));
+                }
+            }
+            __syncthreads();
+            for (int b = tid; b < 256; b += BLOCK) {
+                uint32_t sum = 0;
+#pragma unroll
+                for (int w = 0; w < NWAVES; ++w) {
+                    sum += (whist[w][b & 127] >> (16 * (b >> 7))) & 0xffffu;
+                }
+                hist[b] = sum;
+            }
+            __syncthreads();
+            if (wave == 0) {
+                // lane l holds bins 255-8l down to 248-8l; the lane whose range reaches the desired-th largest finds it
+                uint32_t cnt[8], sum = 0;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    cnt[i] = hist[255 - 8 * lane - i];
+                    sum += cnt[i];
+                }
+                uint32_t incl = sum;
+#pragma unroll
+                for (int off = 1; off < 32; off <<= 1) {
+                    const uint32_t o = __shfl_up(incl, off, 32);
+                    if (lane >= off) {
+                        incl += o;
+                    }
+                }
+                const uint32_t excl = incl - sum;
+                if (excl < desired && incl >= desired) {
+                    uint32_t above = excl;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        if (above + cnt[i] >= desired) {
+                            sel_bucket = 255 - 8 * lane - i;
+                            sel_above  = above;
+                            break;
+                        }
+                        above += cnt[i];
+                    }
+                }
+            }
+            __syncthreads();
+            const uint32_t b = sel_bucket;
+            prefix  |= b << shift;
+            pmask   |= 255u << shift;
+            desired -= sel_above;
+            if (shift == 0) {
+                eq_total = hist[b];
+            }
+            __syncthreads();
+        }
+
+        // everything above the threshold, and the equal ones too when all of them belong to the selection: each wave
+        // counts its own, the waves take consecutive ranges
+        const uint32_t thr         = prefix;
+        const bool     take_all_eq = eq_total == desired;
+        uint32_t mine = 0;
+#pragma unroll
+        for (int j = 0; j < ITEMS; ++j) {
+            mine += (uint32_t) __popcll(__ballot(key[j] > thr || (take_all_eq && key[j] == thr)));
+        }
+        if (lane == 0) {
+            wave_eq[wave] = mine;
+        }
+        __syncthreads();
+        uint32_t base = 0;
+        for (int w = 0; w < NWAVES; ++w) {
+            base += w < wave ? wave_eq[w] : 0;
+        }
+        if (tid == BLOCK - 1) {
+            out_count = base + mine;
+        }
+#pragma unroll
+        for (int j = 0; j < ITEMS; ++j) {
+            const bool     sel = key[j] > thr || (take_all_eq && key[j] == thr);
+            const uint64_t m   = __ballot(sel);
+            if (sel) {
+                row_dst[base + __popcll(m & lanes_below)] = j * BLOCK + tid;
+            }
+            base += (uint32_t) __popcll(m);
+        }
+        if (!take_all_eq) {
+            // ties at the threshold: the lowest columns first, as top_k_gather_equal takes them (column = j * block + tid)
+            __syncthreads();
+            const uint32_t first = out_count;   // k - desired
+            uint32_t taken = 0;
+            // which of this thread's slots hold the threshold, as bits: the loop below then indexes no registers
+            uint64_t eqbits[(ITEMS + 63) / 64] = {};
+#pragma unroll
+            for (int j = 0; j < ITEMS; ++j) {
+                eqbits[j / 64] |= (uint64_t) (key[j] == thr) << (j % 64);
+            }
+            for (int j = 0; j < items && taken < desired; ++j) {
+                const bool     eq = ((j < 64 ? eqbits[0] : eqbits[(ITEMS + 63) / 64 - 1]) >> (j % 64)) & 1;
+                const uint64_t m  = __ballot(eq);
+                if (lane == 0) {
+                    wave_eq[wave] = (uint32_t) __popcll(m);
+                }
+                __syncthreads();
+                uint32_t before = 0, total = 0;
+                for (int w = 0; w < NWAVES; ++w) {
+                    const uint32_t x = wave_eq[w];
+                    before += w < wave ? x : 0;
+                    total  += x;
+                }
+                const uint32_t rank = taken + before + (uint32_t) __popcll(m & lanes_below);
+                if (eq && rank < desired) {
+                    row_dst[first + rank] = j * BLOCK + tid;
+                }
+                taken += total;
+                __syncthreads();
+            }
+        }
+    }
+    GGML_UNUSED(nrows);
+}
+
+template <int BLOCK>
+static void top_k_rows_launch(const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
+    const dim3 grid((unsigned) nrows), block(BLOCK);
+    const int items = (ncols + BLOCK - 1) / BLOCK;
+    if (items <= 4) {
+        top_k_rows_cuda<BLOCK, 4><<<grid, block, 0, stream>>>(src, dst, ncols, nrows, k, items);
+    } else if (items <= 8) {
+        top_k_rows_cuda<BLOCK, 8><<<grid, block, 0, stream>>>(src, dst, ncols, nrows, k, items);
+    } else if (items <= 16) {
+        top_k_rows_cuda<BLOCK, 16><<<grid, block, 0, stream>>>(src, dst, ncols, nrows, k, items);
+    } else if (items <= 24) {
+        top_k_rows_cuda<BLOCK, 24><<<grid, block, 0, stream>>>(src, dst, ncols, nrows, k, items);
+    } else if (items <= 32) {
+        top_k_rows_cuda<BLOCK, 32><<<grid, block, 0, stream>>>(src, dst, ncols, nrows, k, items);
+    } else if (items <= 40) {
+        top_k_rows_cuda<BLOCK, 40><<<grid, block, 0, stream>>>(src, dst, ncols, nrows, k, items);
+    } else if (items <= 48) {
+        top_k_rows_cuda<BLOCK, 48><<<grid, block, 0, stream>>>(src, dst, ncols, nrows, k, items);
+    } else if (items <= 64) {
+        top_k_rows_cuda<BLOCK, 64><<<grid, block, 0, stream>>>(src, dst, ncols, nrows, k, items);
+    } else {
+        top_k_rows_cuda<BLOCK, 128><<<grid, block, 0, stream>>>(src, dst, ncols, nrows, k, items);
+    }
+}
+
+static bool top_k_rows_cuda(const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
+    static const bool on = !getenv("STRIX_TOP_K_ROWS") || atoi(getenv("STRIX_TOP_K_ROWS")) != 0;
+    static const int  bs = getenv("STRIX_TOP_K_ROWS_BLOCK") ? atoi(getenv("STRIX_TOP_K_ROWS_BLOCK")) : 1024;
+    if (!on || nrows < 32 || nrows > 65535 || ncols <= 1024 || k < 1 || k > ncols || ncols > 128 * bs) {
+        return false;
+    }
+    switch (bs) {
+        case 256: top_k_rows_launch<256>(src, dst, ncols, nrows, k, stream); break;
+        case 512: top_k_rows_launch<512>(src, dst, ncols, nrows, k, stream); break;
+        default:  top_k_rows_launch<1024>(src, dst, ncols, nrows, k, stream); break;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+// strixllama: top_k_rows end
+
 static bool top_k_use_small_kernel(int ncols, int nrows, int k) {
     if (k == 1) {
         return true;
@@ -1003,6 +1212,8 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_pool & pool = ctx.pool();
     if (top_k_use_small_kernel(ncols, nrows, k)) {
         top_k_small_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+    } else if (top_k_rows_cuda(src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream)) {
+        // done
     } else if (ncols > 1024) {
         top_k_parallel_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
     } else {

@@ -357,6 +357,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+    res &= gather_in_place == in_place(mctx, params.ubatch.n_seqs);
 
     return res;
 }
@@ -1147,6 +1148,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    // strixllama: whether the state gather may be skipped is part of the graph (llm_graph_input_rs::gather_in_place)
+    res &= inp_rs->gather_in_place == llm_graph_input_rs::in_place(mctx->get_recr(), params.ubatch.n_seqs);
 
     return res;
 }
@@ -1192,6 +1195,8 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    // strixllama: whether the state gather may be skipped is part of the graph (llm_graph_input_rs::gather_in_place)
+    res &= inp_rs->gather_in_place == llm_graph_input_rs::in_place(mctx->get_recr(), params.ubatch.n_seqs);
 
     return res;
 }
@@ -1280,6 +1285,8 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    // strixllama: whether the state gather may be skipped is part of the graph (llm_graph_input_rs::gather_in_place)
+    res &= inp_rs->gather_in_place == llm_graph_input_rs::in_place(mctx->get_recr(), params.ubatch.n_seqs);
 
     return res;
 }
@@ -3550,8 +3557,17 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
+    inp->gather_in_place = llm_graph_input_rs::in_place(mctx_cur, n_seqs);
 
     return inp;
+}
+
+bool llm_graph_input_rs::in_place(const llama_memory_recurrent_context * mctx, int64_t n_seqs) {
+    static const bool off = getenv("STRIX_GDN_GATHER_SKIP") && atoi(getenv("STRIX_GDN_GATHER_SKIP")) == 0;
+    // not s_copy(), which consumes a pending rollback (the MTP drafts a verify pass rejected): set_input, which calls
+    // it after this, would then read the newest state instead of the rolled-back one. A rollback does not change the
+    // answer here, so MTP decoding keeps reusing its graphs
+    return !off && n_seqs >= 1 && mctx->s_copy_own_cell((int) n_seqs);
 }
 
 llm_graph_input_rs * llm_graph_context::build_rs_inp() const {
@@ -3570,9 +3586,15 @@ ggml_tensor * llm_graph_context::build_rs(
         const llm_graph_get_rows_fn & get_state_rows) const {
     const auto * kv_state = inp->mctx;
 
-    return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
+    ggml_tensor * states = build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
+    // strixllama: each sequence gathers a row of the cell its new state is written to (see
+    // llm_graph_input_rs::gather_in_place); the HIP backend reads 'SGIP' in op_params[0] of the gather
+    if (inp->gather_in_place && states->op == GGML_OP_GET_ROWS) {
+        states->op_params[0] = 0x53474950;
+    }
+    return states;
 }
 
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(

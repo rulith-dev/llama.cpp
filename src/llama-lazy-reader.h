@@ -103,7 +103,7 @@ struct llama_lazy_reader {
     };
 
     void run_range_overlapped(const std::vector<std::pair<int32_t, int32_t>> & pairs,
-                              int64_t begin, int64_t end, float * dst) const {
+                              int64_t begin, int64_t end, float * dst, uint8_t * raw) const {
         std::vector<inflight> slots((size_t) std::min<int64_t>(STRIX_IO_DEPTH, std::max<int64_t>(1, end - begin)));
         for (auto & s : slots) { s.buf.resize(row_size); }
         int64_t next = begin;
@@ -135,6 +135,7 @@ struct llama_lazy_reader {
                 const size_t off = base + (size_t) pairs[s.i].first * row_size;
                 read_at(off + got, s.buf.data() + got, row_size - got, s.io);
             }
+            if (raw) { memcpy(raw + (size_t) s.i * row_size, s.buf.data(), row_size); }
             float * first = dst + (size_t) pairs[s.i].second * head_dim;
             if (to_float) {
                 to_float(s.buf.data(), first, head_dim);
@@ -159,18 +160,134 @@ struct llama_lazy_reader {
         }
     }
 
+    // strixllama: every row of this table is ~90 bytes at a random offset of a 28.8 GB tensor, so each one costs a 4 KB
+    // page from the SSD. Read through the cache manager those peaked at ~155K pages/s - a 2K-token prompt's 31.7K rows
+    // took ~200 ms with the GPU idle - while unbuffered reads of the aligned pages reach ~500K/s with 256 in flight
+    // (tmp/kvr/iops_test.cpp). The handle must then be the only one: while any buffered handle on the file is open,
+    // Windows keeps its cache map active and every non-cached read pays for coherency (~8K pages/s), so the reader
+    // opens the file unbuffered alone (`unbuffered`, load_lazy_reader; STRIX_PLE_UNBUFFERED=0 keeps buffered reads).
+    static constexpr size_t UNBUF_PAGE = 4096;
+    static constexpr int    UNBUF_WORKERS = 16;
+    bool unbuffered = false;
+
+    void run_range_unbuffered(const std::vector<std::pair<int32_t, int32_t>> & pairs,
+                              int64_t begin, int64_t end, float * dst, uint8_t * raw) const {
+        struct slot {
+            io_context io;
+            OVERLAPPED ov{};
+            uint8_t * buf = nullptr;
+            uint64_t page0 = 0;
+            DWORD len = 0;
+            int64_t i = -1, j = -1;   // pairs[i..j] are served by this read
+            bool pending = false;
+            ~slot() { if (buf) { _aligned_free(buf); } }
+        };
+        const int n_slots = (int) std::min<int64_t>(STRIX_IO_DEPTH, std::max<int64_t>(1, end - begin));
+        std::vector<slot> slots((size_t) n_slots);
+        std::vector<HANDLE> events((size_t) n_slots);
+        for (int k = 0; k < n_slots; ++k) {
+            slots[k].buf = (uint8_t *) _aligned_malloc(2 * UNBUF_PAGE, UNBUF_PAGE);
+            if (!slots[k].buf) {
+                throw std::bad_alloc();
+            }
+            events[k] = slots[k].io.event;
+        }
+        auto offset_of = [&](int32_t row) { return (uint64_t) base + (uint64_t) row * row_size; };
+        int64_t next = begin;
+        int live = 0;
+
+        auto issue = [&](slot & s) {
+            const int64_t i = next;
+            const uint64_t p0 = offset_of(pairs[i].first) / UNBUF_PAGE * UNBUF_PAGE;
+            int64_t j = i;   // every following row that ends within the two pages from p0 comes with this read
+            while (j + 1 < end && offset_of(pairs[j + 1].first) + row_size <= p0 + 2 * UNBUF_PAGE) { ++j; }
+            s.len = (DWORD) (offset_of(pairs[j].first) + row_size - p0 <= UNBUF_PAGE ? UNBUF_PAGE : 2 * UNBUF_PAGE);
+            s.i = i; s.j = j; s.page0 = p0; next = j + 1;
+            s.ov = {};
+            s.ov.Offset     = (DWORD) p0;
+            s.ov.OffsetHigh = (DWORD) (p0 >> 32);
+            s.ov.hEvent     = s.io.event;
+            ResetEvent(s.io.event);
+            if (!ReadFile(fd, s.buf, s.len, nullptr, &s.ov) && GetLastError() != ERROR_IO_PENDING) {
+                throw std::runtime_error(format("lazy unbuffered read at %llu failed: %lu", (unsigned long long) p0, (unsigned long) GetLastError()));
+            }
+            s.pending = true; ++live;
+        };
+
+        auto finish = [&](slot & s) {
+            DWORD got = 0;
+            if (!GetOverlappedResult(fd, &s.ov, &got, TRUE)) {
+                throw std::runtime_error(format("lazy unbuffered read completion failed: %lu", (unsigned long) GetLastError()));
+            }
+            for (int64_t k = s.i; k <= s.j; ) {
+                int64_t kk = k;
+                while (kk + 1 <= s.j && pairs[kk + 1].first == pairs[k].first) { ++kk; }
+                const uint64_t o = offset_of(pairs[k].first) - s.page0;
+                if (o + row_size > got) {
+                    throw std::runtime_error(format("lazy unbuffered read at %llu came back short", (unsigned long long) s.page0));
+                }
+                if (raw) { memcpy(raw + (size_t) k * row_size, s.buf + o, row_size); }
+                float * first = dst + (size_t) pairs[k].second * head_dim;
+                if (to_float) {
+                    to_float(s.buf + o, first, head_dim);
+                } else {
+                    memcpy(first, s.buf + o, (size_t) head_dim * sizeof(float));
+                }
+                for (int64_t m = k + 1; m <= kk; ++m) {
+                    memcpy(dst + (size_t) pairs[m].second * head_dim, first, (size_t) head_dim * sizeof(float));
+                }
+                k = kk + 1;
+            }
+            s.pending = false; --live;
+        };
+
+        for (auto & s : slots) { if (next >= end) { break; } issue(s); }
+        // whichever read completes first is finished and replaced, so all slots stay in flight
+        while (live > 0) {
+            const DWORD r = WaitForMultipleObjects((DWORD) n_slots, events.data(), FALSE, INFINITE);
+            if (r >= WAIT_OBJECT_0 + (DWORD) n_slots) {
+                throw std::runtime_error(format("lazy unbuffered wait failed: %lu", (unsigned long) GetLastError()));
+            }
+            slot & s = slots[r - WAIT_OBJECT_0];
+            if (!s.pending) {   // an idle slot's event stays set from its last read
+                ResetEvent(s.io.event);
+                continue;
+            }
+            finish(s);
+            if (next < end) {
+                issue(s);
+            } else {
+                ResetEvent(s.io.event);
+            }
+        }
+    }
+
 #else
     using file_handle = int;
 #endif
     llama_lazy_reader(file_handle fd, size_t base, size_t row_size, int64_t n_rows, int n_threads,
-                      enum ggml_type type, int64_t head_dim)
+                      enum ggml_type type, int64_t head_dim, bool unbuffered = false)
         : fd(fd), base(base), row_size(row_size), n_rows(n_rows), n_threads(n_threads),
           head_dim(head_dim), to_float(type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(type)->to_float) {
         GGML_ASSERT((type == GGML_TYPE_F32 || to_float != nullptr) && head_dim > 0);
+#ifdef _WIN32
+        this->unbuffered = unbuffered && row_size <= UNBUF_PAGE;
+#else
+        (void) unbuffered;
+#endif
     }
 
     llama_lazy_reader(const llama_lazy_reader &) = delete;
     llama_lazy_reader & operator=(const llama_lazy_reader &) = delete;
+
+    // strixllama: reads bypass the file cache (the model then must not keep a mapping of the file, see load_tensors)
+    bool is_unbuffered() const {
+#ifdef _WIN32
+        return unbuffered;
+#else
+        return false;
+#endif
+    }
 
     ~llama_lazy_reader() {
 #ifdef _WIN32
@@ -215,12 +332,128 @@ struct llama_lazy_reader {
 
         std::sort(pairs.begin(), pairs.end()); // equal rows adjacent, file order
 
+        int64_t n_hit = 0;
+        if (!cache_on()) {
+            read_pairs(pairs, dst, nullptr);
+        } else {
+            // strixllama: rows found in the cache are copied out under the lock and dequantized after it; the rest are
+            // read as before, their raw bytes kept, and put in the cache
+            std::vector<std::pair<int32_t, int32_t>> miss;
+            std::vector<int64_t> hit;          // pairs index of a cached row's first occurrence
+            std::vector<uint8_t> hit_raw;      // its raw bytes, in the order of hit
+            miss.reserve(pairs.size());
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex);
+                cache_alloc();
+                for (int64_t i = 0; i < n; ) {
+                    int64_t j = i;
+                    while (j + 1 < n && pairs[j + 1].first == pairs[i].first) { ++j; }
+                    const uint8_t * c = cache_find(pairs[i].first);
+                    if (c) {
+                        hit.push_back(i);
+                        hit_raw.insert(hit_raw.end(), c, c + row_size);
+                        n_hit += j - i + 1;
+                    } else {
+                        for (int64_t k = i; k <= j; ++k) { miss.push_back(pairs[k]); }
+                    }
+                    i = j + 1;
+                }
+            }
+            for (size_t h = 0; h < hit.size(); ++h) {
+                const int64_t i = hit[h];
+                float * first = dst + (size_t) pairs[i].second * head_dim;
+                const uint8_t * src = hit_raw.data() + h * row_size;
+                if (to_float) {
+                    to_float(src, first, head_dim);
+                } else {
+                    memcpy(first, src, (size_t) head_dim * sizeof(float));
+                }
+                for (int64_t k = i + 1; k < n && pairs[k].first == pairs[i].first; ++k) {
+                    memcpy(dst + (size_t) pairs[k].second * head_dim, first, (size_t) head_dim * sizeof(float));
+                }
+            }
+            if (!miss.empty()) {
+                std::vector<uint8_t> raw(miss.size() * row_size);
+                read_pairs(miss, dst, raw.data());
+                std::lock_guard<std::mutex> lock(cache_mutex);
+                for (size_t k = 0; k < miss.size(); ++k) {
+                    if (k == 0 || miss[k].first != miss[k - 1].first) {
+                        cache_put(miss[k].first, raw.data() + k * row_size);
+                    }
+                }
+            }
+        }
+
+        if (strixllama_trace) {
+            const double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - strixllama_t0).count();
+            int64_t uniq = n ? 1 : 0;
+            for (int64_t i = 1; i < n; ++i) {
+                if (pairs[i].first != pairs[i - 1].first) { ++uniq; }
+            }
+            fprintf(stderr, "PLE_GATHER rows=%lld uniq=%lld cached=%lld row_bytes=%zu ms=%.1f\n",
+                    (long long) n, (long long) uniq, (long long) n_hit, row_size, ms);
+        }
+    }
+
+    // strixllama: a cache of raw rows in RAM (STRIX_PLE_CACHE_MB, default 400; 0 = none). Reads bypass the file cache
+    // (unbuffered), so without it a row is read from the SSD every time: a 2K-token prompt's n-gram rows cost ~200 ms
+    // with the GPU idle, a repeated prompt or a common phrase as much as a new one. Direct-mapped by row: a slot holds
+    // its row's index and raw bytes.
+    mutable std::mutex cache_mutex;
+    mutable std::vector<uint8_t> cache_mem;
+    mutable size_t cache_slots = 0;     // a power of 2
+    size_t cache_stride() const { return (sizeof(int32_t) + row_size + 15) / 16 * 16; }
+    static long cache_mb() {
+        static const long mb = getenv("STRIX_PLE_CACHE_MB") ? atol(getenv("STRIX_PLE_CACHE_MB")) : 400;
+        return mb;
+    }
+    bool cache_on() const { return cache_mb() > 0; }
+    void cache_alloc() const {
+        if (cache_slots) { return; }
+        size_t slots = 1;
+        while (slots * 2 * cache_stride() <= (size_t) cache_mb() << 20) { slots *= 2; }
+        cache_mem.assign(slots * cache_stride(), 0);
+        for (size_t k = 0; k < slots; ++k) { *(int32_t *) (cache_mem.data() + k * cache_stride()) = -1; }
+        cache_slots = slots;
+    }
+    uint8_t * cache_slot(int32_t row) const {
+        const size_t h = (size_t) ((uint32_t) row * 2654435761u) & (cache_slots - 1);
+        return cache_mem.data() + h * cache_stride();
+    }
+    const uint8_t * cache_find(int32_t row) const {
+        const uint8_t * s = cache_slot(row);
+        return *(const int32_t *) s == row ? s + sizeof(int32_t) : nullptr;
+    }
+    void cache_put(int32_t row, const uint8_t * data) const {
+        uint8_t * s = cache_slot(row);
+        *(int32_t *) s = row;
+        memcpy(s + sizeof(int32_t), data, row_size);
+    }
+
+    // the sorted pairs' rows read by the worker threads into dst (and their raw bytes into raw, by pairs index)
+    void read_pairs(const std::vector<std::pair<int32_t, int32_t>> & pairs, float * dst, uint8_t * raw) const {
+        const int64_t n = (int64_t) pairs.size();
         // small gathers are not worth a thread per row
+#ifdef _WIN32
+        const int n_workers = (int) std::min<int64_t>(unbuffered ? std::min(n_threads, UNBUF_WORKERS) : n_threads,
+                                                      std::max<int64_t>(1, n / 32));
+#else
         const int n_workers = (int) std::min<int64_t>(n_threads, std::max<int64_t>(1, n / 32));
+#endif
+        // a worker's range must not split a row's run of pairs: each run is read, and captured, once
+        std::vector<int64_t> cut((size_t) n_workers + 1);
+        for (int w = 0; w <= n_workers; ++w) {
+            int64_t c = n * w / n_workers;
+            while (c > 0 && c < n && pairs[c].first == pairs[c - 1].first) { ++c; }
+            cut[(size_t) w] = c;
+        }
 
         auto run_chunk = [&](int w, std::exception_ptr & err) {
             try {
-                run_range(pairs, n * w / n_workers, n * (w + 1) / n_workers, dst);
+                if (cut[(size_t) w] < cut[(size_t) w + 1]) {
+                    run_range(pairs, cut[(size_t) w], cut[(size_t) w + 1], dst, raw);
+                }
             } catch (...) {
                 err = std::current_exception();
             }
@@ -250,17 +483,6 @@ struct llama_lazy_reader {
             if (err) {
                 std::rethrow_exception(err);
             }
-        }
-
-        if (strixllama_trace) {
-            const double ms = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - strixllama_t0).count();
-            int64_t uniq = n ? 1 : 0;
-            for (int64_t i = 1; i < n; ++i) {
-                if (pairs[i].first != pairs[i - 1].first) { ++uniq; }
-            }
-            fprintf(stderr, "PLE_GATHER rows=%lld uniq=%lld workers=%d row_bytes=%zu ms=%.1f\n",
-                    (long long) n, (long long) uniq, n_workers, row_size, ms);
         }
     }
 
@@ -310,6 +532,11 @@ struct llama_lazy_reader {
     // populate the page cache for the rows a later gather() will read; never writes any output, so a wrong
     // prediction only wastes readahead. Safe to call concurrently with gather().
     void prefetch(const int32_t * rows, int64_t n) const {
+#ifdef _WIN32
+        if (unbuffered) {
+            return;
+        }
+#endif
         std::vector<int32_t> uniq;
         uniq.reserve(n);
         for (int64_t i = 0; i < n; ++i) {
@@ -352,9 +579,13 @@ struct llama_lazy_reader {
 
 private:
     void run_range(const std::vector<std::pair<int32_t, int32_t>> & pairs,
-                   int64_t begin, int64_t end, float * dst) const {
+                   int64_t begin, int64_t end, float * dst, uint8_t * raw = nullptr) const {
 #ifdef _WIN32
-        run_range_overlapped(pairs, begin, end, dst);
+        if (unbuffered) {
+            run_range_unbuffered(pairs, begin, end, dst, raw);
+        } else {
+            run_range_overlapped(pairs, begin, end, dst, raw);
+        }
 #else
         std::vector<uint8_t> bounce(row_size);
         for (int64_t i = begin; i < end; ) {
@@ -374,6 +605,7 @@ private:
                 }
                 done += n_read;
             }
+            if (raw) { memcpy(raw + (size_t) i * row_size, bounce.data(), row_size); }
             float * first = dst + (size_t) pairs[i].second * head_dim;
             if (to_float) {
                 to_float(bounce.data(), first, head_dim);

@@ -37,7 +37,7 @@ __device__ __forceinline__ uint16_t hc_f2bf32(const float f) { uint32_t u = __fl
 static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_f32(
         const float * inject, const float * residual,
         const float * block_out, const float * gamma,
-        float * out_res, float * out_xn, uint16_t * out_xn_bf16, const bool store_xn_f32,
+        float * out_res, float * out_xn, uint16_t * out_xn_bf16, const bool store_xn_f32, const int64_t xn_ld,
         const uint16_t * res_in_bf16, uint16_t * res_out_bf16, const uint16_t * blk_in_bf16,
         const int n_embd, const float s1, const float b1, const float s2, const float b2, const float eps) {
     __shared__ float s_sum[32];
@@ -81,7 +81,7 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_f32(
 
     const float * g  = gamma  + (int64_t) c * n_embd;
     float *       xn = out_xn + row * n_embd;
-    uint16_t *    xh = out_xn_bf16 ? out_xn_bf16 + row * n_embd : nullptr;
+    uint16_t *    xh = out_xn_bf16 ? out_xn_bf16 + (int64_t) t * xn_ld + (int64_t) c * n_embd : nullptr;
 #pragma unroll
     for (int k = 0; k < 3; ++k) {
         const int col = tid + k * HC_CN_BLOCK;
@@ -101,12 +101,16 @@ __device__ __forceinline__ uint32_t hc_pack2(const float a, const float b) {
 }
 
 // two elements per thread per iteration, packed 32-bit accesses (Halogen's k_hc_scatter_norm layout)
+// strixllama: INJ - also the next hc_inject's dot products (hc == 4) over this stream's slice of xn, written as
+// inj_part[(t * hc + c) * 4 + m]; hc_inject_reduce sums the streams. Saves the inject's own pass over the F32 xn.
+template <bool INJ>
 static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b256(
         const float * inject, const float * residual,
         const float * block_out, const float * gamma,
-        float * out_res, float * out_xn, uint16_t * out_xn_bf16, const bool store_xn_f32,
+        float * out_res, float * out_xn, uint16_t * out_xn_bf16, const bool store_xn_f32, const int64_t xn_ld,
         const uint16_t * res_in_bf16, uint16_t * res_out_bf16, const uint16_t * blk_in_bf16,
-        const int n_embd, const float s1, const float b1, const float s2, const float b2, const float eps) {
+        const int n_embd, const float s1, const float b1, const float s2, const float b2, const float eps,
+        const float * __restrict__ inj_w, float * __restrict__ inj_part) {
     __shared__ float s_sum[32];
     const int c = blockIdx.x, t = blockIdx.y, hc = gridDim.x, tid = threadIdx.x;
     const float x1 = s1 * inject[(int64_t) t * hc + c] + b1;
@@ -152,7 +156,11 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b2
     const float scale = rsqrtf(mean + eps);
     const float * g  = gamma  + (int64_t) c * n_embd;
     float *       xn = out_xn + row * n_embd;
-    uint16_t *    xh = out_xn_bf16 ? out_xn_bf16 + row * n_embd : nullptr;
+    uint16_t *    xh = out_xn_bf16 ? out_xn_bf16 + (int64_t) t * xn_ld + (int64_t) c * n_embd : nullptr;
+    // the inject weights of this stream's slice: row m of w_inject [hc * n_embd, 4] is contiguous
+    const int64_t wk = (int64_t) hc * n_embd;
+    const float * wi = INJ ? inj_w + (int64_t) c * n_embd : nullptr;
+    float pa[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
     for (int k = 0; k < KP; ++k) {
         const int col = (tid + k * HC_CN_BLOCK2) * 2;
@@ -161,12 +169,65 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b2
             const float v0 = scale * xs[2 * k] * gv.x, v1 = scale * xs[2 * k + 1] * gv.y;
             if (store_xn_f32) *(float2 *)(xn + col) = make_float2(v0, v1);
             if (xh) *(uint32_t *)(xh + col) = hc_pack2(v0, v1);
+            if (INJ) {
+#pragma unroll
+                for (int m = 0; m < 4; ++m) {
+                    const float2 wv = *(const float2 *)(wi + m * wk + col);
+                    pa[m] = fmaf(v1, wv.y, fmaf(v0, wv.x, pa[m]));
+                }
+            }
         } else if (col < n_embd) {
             const float v0 = scale * xs[2 * k] * g[col];
             if (store_xn_f32) xn[col] = v0;
             if (xh) xh[col] = hc_f2bf32(v0);
+            if (INJ) {
+#pragma unroll
+                for (int m = 0; m < 4; ++m) {
+                    pa[m] = fmaf(v0, wi[m * wk + col], pa[m]);
+                }
+            }
         }
     }
+    if (INJ) {
+        // fixed order throughout: a butterfly within each wave, then the waves in index order
+        __shared__ float s_part[HC_CN_BLOCK2 / 32][4];
+        const int lane = tid % 32, wave = tid / 32;
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            pa[m] = warp_reduce_sum(pa[m]);
+        }
+        if (lane == 0) {
+#pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                s_part[wave][m] = pa[m];
+            }
+        }
+        __syncthreads();
+        if (tid < 4) {
+            float sum = s_part[0][tid];
+#pragma unroll
+            for (int w = 1; w < HC_CN_BLOCK2 / 32; ++w) {
+                sum += s_part[w][tid];
+            }
+            inj_part[row * 4 + tid] = sum;
+        }
+    }
+}
+
+// inject[t * hc + m] = sum over the streams c, in order, of the partials the combine wrote
+static __global__ void hc_inject_reduce_f32(const float * __restrict__ part, float * __restrict__ dst, const int hc, const int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const int64_t t = i / hc;
+    const int     m = (int) (i % hc);
+    const float * p = part + t * hc * 4 + m;
+    float sum = p[0];
+    for (int c = 1; c < hc; ++c) {
+        sum += p[c * 4];
+    }
+    dst[i] = sum;
 }
 
 bool ggml_cuda_hc_combine_norm_supported(const ggml_cuda_hc_combine_norm_args & a, const int warp_size) {
@@ -187,14 +248,16 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
                 ggml_nelements(a.inject) == hc * n_tokens);
 
     static const int shape = getenv("LLAMA_HC_CN_SHAPE") ? atoi(getenv("LLAMA_HC_CN_SHAPE")) : 0;
+    GGML_ASSERT(!a.inject_w || (shape == 1 && a.inject_part && hc == 4 && n_embd % 2 == 0 && n_tokens <= HC_INJ_MAX_T));
     if (shape == 1) {
         const ggml_cuda_kernel_launch_params lp2(dim3((int) hc, (int) n_tokens, 1), HC_CN_BLOCK2, 0, ctx.stream());
-        ggml_cuda_kernel_launch(hc_combine_norm_f32_b256, lp2,
+        auto kernel = a.inject_w ? hc_combine_norm_f32_b256<true> : hc_combine_norm_f32_b256<false>;
+        ggml_cuda_kernel_launch(kernel, lp2,
             (const float *) a.inject->data, (const float *) a.residual->data,
             (const float *) a.block_out->data, (const float *) a.gamma->data,
-            (float *) a.out_res->data, (float *) a.out_xn->data, a.out_xn_bf16, a.store_xn_f32,
+            (float *) a.out_res->data, (float *) a.out_xn->data, a.out_xn_bf16, a.store_xn_f32, a.xn_bf16_ld ? a.xn_bf16_ld : hc * n_embd,
             a.res_in_bf16, a.res_out_bf16, a.blk_in_bf16,
-            (int) n_embd, a.s1, a.b1, a.s2, a.b2, a.eps);
+            (int) n_embd, a.s1, a.b1, a.s2, a.b2, a.eps, a.inject_w, a.inject_part);
         static unsigned h2 = 0; if (h2++ < 2) fprintf(stderr, "HC_CN shape=256x4 n_embd=%lld tokens=%lld\n", (long long) n_embd, (long long) n_tokens);
         return;
     }
@@ -202,7 +265,36 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
     ggml_cuda_kernel_launch(hc_combine_norm_f32, launch_params,
         (const float *) a.inject->data, (const float *) a.residual->data,
         (const float *) a.block_out->data, (const float *) a.gamma->data,
-        (float *) a.out_res->data, (float *) a.out_xn->data, a.out_xn_bf16, a.store_xn_f32,
+        (float *) a.out_res->data, (float *) a.out_xn->data, a.out_xn_bf16, a.store_xn_f32, a.xn_bf16_ld ? a.xn_bf16_ld : hc * n_embd,
         a.res_in_bf16, a.res_out_bf16, a.blk_in_bf16,
         (int) n_embd, a.s1, a.b1, a.s2, a.b2, a.eps);
+}
+
+bool ggml_cuda_hc_inject_fusable(const ggml_cuda_hc_combine_norm_args & a) {
+    static const int shape = getenv("LLAMA_HC_CN_SHAPE") ? atoi(getenv("LLAMA_HC_CN_SHAPE")) : 0;
+    static const bool on = !getenv("STRIX_HC_INJECT_FUSE") || atoi(getenv("STRIX_HC_INJECT_FUSE")) != 0;
+    return on && shape == 1 && a.out_res->ne[1] == 4 && a.out_res->ne[0] % 2 == 0 && a.out_res->ne[3] == 1 &&
+        a.out_res->ne[2] <= HC_INJ_MAX_T;
+}
+
+// one buffer for the partials of the pending inject: allocated once at its largest, so its address never changes under
+// a captured graph; released with the backend (ggml_cuda_hc_release)
+static ggml_cuda_pool_alloc<float> * g_hc_inject_part = nullptr;
+float * ggml_cuda_hc_inject_part(ggml_backend_cuda_context & ctx) {
+    if (!g_hc_inject_part) {
+        g_hc_inject_part = new ggml_cuda_pool_alloc<float>(ctx.pool(), (size_t) HC_INJ_MAX_T * 4 * 4);
+    }
+    return g_hc_inject_part->get();
+}
+
+void ggml_cuda_hc_release() {
+    delete g_hc_inject_part;
+    g_hc_inject_part = nullptr;
+}
+
+void ggml_cuda_hc_inject_reduce(ggml_backend_cuda_context & ctx, const float * part, ggml_tensor * dst) {
+    const int64_t hc = dst->ne[0], n = ggml_nelements(dst);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) && hc == 4 && ggml_nrows(dst) <= HC_INJ_MAX_T);
+    hc_inject_reduce_f32<<<(unsigned) ((n + 255) / 256), 256, 0, ctx.stream()>>>(part, (float *) dst->data, (int) hc, n);
+    CUDA_CHECK(cudaGetLastError());
 }

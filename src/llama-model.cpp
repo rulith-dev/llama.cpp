@@ -1839,6 +1839,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // create the backend buffers
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
+    bool mapped_any = false;   // strixllama: a buffer lives on a mapping, so the model keeps them
+    std::vector<ggml_context *> ctx_direct_only;   // strixllama: lazy contexts only direct readers read: nothing to load
     ctx_buf_maps.reserve(ml.ctx_map.size());
 
     // Ensure we have enough capacity for the maximum backend buffer we will potentially create
@@ -1876,8 +1878,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
 
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        // strixllama: a lazy context whose every tensor a direct reader reads unbuffered is never read through its
+        // buffer, and the mapping behind one would keep the file's cache map active for the server's life, which
+        // makes every unbuffered read pay for coherency (~8K pages/s against ~500K): such a context gets an empty
+        // placeholder buffer, and with no buffer on them the mappings go with the loader
+        bool lazy_direct_only = is_lazy_mapped && !ml.use_mmap;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); lazy_direct_only && t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const auto it = lazy_readers.find(ggml_get_name(t));
+            lazy_direct_only = it != lazy_readers.end() && it->second && it->second->is_unbuffered();
+        }
+
+        if ((ml.use_mmap || is_lazy_mapped) && !lazy_direct_only && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
+            mapped_any = true;
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
                 // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer,
@@ -1899,7 +1912,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         } else {
             ggml_backend_buffer_t buf;
-            if (ml.no_alloc) {
+            if (lazy_direct_only) {
+                ctx_direct_only.push_back(ctx);
+            }
+            if (ml.no_alloc || lazy_direct_only) {
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
@@ -1971,12 +1987,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
+        if (std::find(ctx_direct_only.begin(), ctx_direct_only.end(), ctx) != ctx_direct_only.end()) {
+            continue;
+        }
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
     }
 
-    if (use_mmap_buffer) {
+    if (use_mmap_buffer && mapped_any) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
@@ -2017,8 +2036,16 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader 
     if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name.c_str(), -1, wide.data(), size)) {
         throw std::runtime_error("failed to convert lazy reader path");
     }
-    const HANDLE fd = CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                                  FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, nullptr);
+    // strixllama: unbuffered, alone (see llama_lazy_reader::unbuffered); buffered when that cannot be opened
+    const bool want_unbuffered = !getenv("STRIX_PLE_UNBUFFERED") || atoi(getenv("STRIX_PLE_UNBUFFERED")) != 0;
+    HANDLE fd = want_unbuffered ? CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                              FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_NO_BUFFERING, nullptr)
+                                : INVALID_HANDLE_VALUE;
+    const bool unbuffered = fd != INVALID_HANDLE_VALUE;
+    if (!unbuffered) {
+        fd = CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                         FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, nullptr);
+    }
     if (fd == INVALID_HANDLE_VALUE) {
         LLAMA_LOG_WARN("%s: Windows lazy reader open failed (%lu), using lazy mmap reads\n",
                 __func__, (unsigned long) GetLastError());
@@ -2051,8 +2078,13 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader 
 
     std::unique_ptr<llama_lazy_reader> reader;
     try {
+#ifdef _WIN32
+        reader = std::make_unique<llama_lazy_reader>(fd, w->offs,
+                ggml_row_size(t->type, t->ne[0]), t->ne[1], n_threads, t->type, t->ne[0], unbuffered);
+#else
         reader = std::make_unique<llama_lazy_reader>(fd, w->offs,
                 ggml_row_size(t->type, t->ne[0]), t->ne[1], n_threads, t->type, t->ne[0]);
+#endif
     } catch (...) {
 #ifdef _WIN32
         CloseHandle(fd);

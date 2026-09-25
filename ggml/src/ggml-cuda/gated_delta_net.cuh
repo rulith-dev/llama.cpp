@@ -5,6 +5,10 @@
 struct ggml_cuda_gated_delta_net_fused_cache {
     float * data;        // rollback slot 0
     int64_t slot_stride; // between rollback slots (0 when K==1)
+    // strixllama: each sequence's input state read from row state_rows[seq] of state_base (the whole state tensor: a
+    // row of the sequence's own cell, its newest state or a rollback snapshot) instead of src[5] - the gather is skipped
+    const float *   state_base = nullptr;
+    const int32_t * state_rows = nullptr;
 };
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

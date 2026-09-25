@@ -181,6 +181,10 @@ public:
 
     int32_t s_copy(int i) const;
 
+    // strixllama: whether every i < n reads its state from a row of its own cell (head + i: the newest state, or a
+    // rollback snapshot of it), the cell its new state is written to. Unlike s_copy it consumes no rollback index
+    bool s_copy_own_cell(int n) const;
+
 private:
     const llama_memory_status status;
 

@@ -1873,7 +1873,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // gated normalization, as self.norm(core_attn_out, z) in the reference
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
 
-    ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
+    // strixllama: one column per token, not a batch per sequence (STRIX_GDN_OUT_2D=0: as upstream): with several
+    // sequences decoding at once, a 3-D input made the projection a batched matrix-vector product per sequence
+    static const bool out_2d = !getenv("STRIX_GDN_OUT_2D") || atoi(getenv("STRIX_GDN_OUT_2D")) != 0;
+    ggml_tensor * final_output = out_2d && n_seqs > 1
+        ? ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs)
+        : ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
     cb(final_output, "final_output", il);
 
     cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);

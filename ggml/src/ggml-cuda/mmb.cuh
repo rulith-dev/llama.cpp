@@ -4,14 +4,20 @@
 bool ggml_cuda_mmb_supported_mm  (const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst, bool allow_iq3s = false);
 void ggml_cuda_mul_mat_mmb   (ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+// strixllama: a narrow F32 weight (M <= 64) against any number of columns on WMMA (mmb_f32narrow_kernel); false when the
+// shapes do not fit
+bool ggml_cuda_mmb_f32_narrow(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 void ggml_cuda_mmb_begin_graph();
 // producers that can emit a BF16 copy of an F32 output register it here; returns the BF16 buffer to fill (n elements)
 uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n);
+// strixllama: the same for a [K, rows] output whose rows may be padded; *ld gets the row stride in elements (0 = K)
+uint16_t * ggml_cuda_mmb_cache_reserve_ld(ggml_backend_cuda_context & ctx, const ggml_tensor * t, int64_t rows, int64_t K, int64_t * ld);
 // BF16 copy of tensor t if one is cached for the current graph (consumers may read it instead of the F32 data)
-const uint16_t * ggml_cuda_mmb_cache_lookup(const ggml_tensor * t);
+// a caller passing ld can take padded rows (their stride in *ld, 0 = dense); one that does not only ever sees dense rows
+const uint16_t * ggml_cuda_mmb_cache_lookup(const ggml_tensor * t, int64_t * ld = nullptr);
 // producer slots (pinned until the next producer of the same kind): 0 = HC normalized stream xn, 1 = HC gate
-uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot, const ggml_tensor * t, size_t n);
+uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot, const ggml_tensor * t, size_t n, int64_t ld = 0, size_t alloc_n = 0);
 void ggml_cuda_mmb_marks_clear();
 size_t ggml_cuda_mmb_marks_count();
 void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t);

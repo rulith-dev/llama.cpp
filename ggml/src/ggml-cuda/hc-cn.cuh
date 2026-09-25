@@ -11,11 +11,21 @@ struct ggml_cuda_hc_combine_norm_args {
     float               s1, b1, s2, b2;
     float               eps;
     uint16_t *          out_xn_bf16 = nullptr;
+    int64_t             xn_bf16_ld  = 0;         // strixllama: the BF16 copy's token stride when padded (0: hc * n_embd)
     bool                store_xn_f32 = true;     // false: consumers all read the BF16 copy
     const uint16_t *    res_in_bf16  = nullptr;   // `residual` is BF16 in place (marked bf16-only)
     const uint16_t *    blk_in_bf16  = nullptr;
     uint16_t *          res_out_bf16 = nullptr;
+    const float *       inject_w     = nullptr;   // strixllama: the next hc_inject's weights [hc * n_embd, hc], fused (hc == 4)
+    float *             inject_part  = nullptr;   // its per-stream partial dot products [T][hc][4]
 };
+
+// the largest ubatch the fused inject takes (its partial buffer is sized for it)
+#define HC_INJ_MAX_T 65536
 
 bool ggml_cuda_hc_combine_norm_supported(const ggml_cuda_hc_combine_norm_args & args, int warp_size);
 void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cuda_hc_combine_norm_args & args);
+bool ggml_cuda_hc_inject_fusable(const ggml_cuda_hc_combine_norm_args & args);
+float * ggml_cuda_hc_inject_part(ggml_backend_cuda_context & ctx);
+void ggml_cuda_hc_inject_reduce(ggml_backend_cuda_context & ctx, const float * part, ggml_tensor * dst);
+void ggml_cuda_hc_release();

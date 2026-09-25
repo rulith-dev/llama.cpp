@@ -467,3 +467,207 @@ void ggml_cuda_flash_attn_ext_qsa(ggml_backend_cuda_context & ctx, ggml_tensor *
                             (const int *) ucount.get(), (float *) dst->data, layout);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// strixllama: the packed K and V layouts in one pass from the cache. The graph (models/pack.inc) builds each as
+// CONT(permuted cache view) -> RESHAPE -> PERMUTE -> CONT: two full copies of the layer's cache, ~8 ms a layer at
+// 64K context through the generic copy kernel. The two paths below write the same bytes from the cache view directly.
+//   keys   [16, 4, 16, heads * n_kv / 4]: (a, b, c, h * nblk + n) = K[dim 16c + a][cell 4n + b][head h]
+//   values [4, 256, heads * n_kv / 4]:    (b, d, h * nblk + n)     = V[dim d][cell 4n + b][head h]
+static __global__ void qsa_pack_keys_kernel(const char * __restrict__ src, uint4 * __restrict__ dst, const int64_t nblk,
+        const int64_t nb_cell, const int64_t nb_head, const int64_t n_chunks) {
+    const int64_t q = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;   // one 32-byte run of 16 dims
+    if (q >= n_chunks) {
+        return;
+    }
+    const int     b = (int) (q & 3), c = (int) ((q >> 2) & 15);
+    const int64_t m = q >> 6, h = m / nblk, n = m - h * nblk;
+    const uint4 * s = (const uint4 *) (src + h * nb_head + (4 * n + b) * nb_cell + c * 32);
+    dst[2 * q]     = s[0];
+    dst[2 * q + 1] = s[1];
+}
+
+static __global__ void qsa_pack_values_kernel(const char * __restrict__ src, uint4 * __restrict__ dst, const int64_t nblk,
+        const int64_t nb_cell, const int64_t nb_head, const int64_t n_pairs) {
+    const int64_t q = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;   // dims 2d, 2d+1 of the block's four cells
+    if (q >= n_pairs) {
+        return;
+    }
+    const int     d2 = (int) (q & 127);
+    const int64_t m  = q >> 7, h = m / nblk, n = m - h * nblk;
+    const char *  s  = src + h * nb_head + 4 * n * nb_cell + d2 * 4;
+    const uint32_t v0 = *(const uint32_t *) (s);
+    const uint32_t v1 = *(const uint32_t *) (s + nb_cell);
+    const uint32_t v2 = *(const uint32_t *) (s + 2 * nb_cell);
+    const uint32_t v3 = *(const uint32_t *) (s + 3 * nb_cell);
+    // out: dim 2d cells 0..3, then dim 2d+1 cells 0..3
+    uint4 o;
+    o.x = (v0 & 0xffffu) | (v1 << 16);
+    o.y = (v2 & 0xffffu) | (v3 << 16);
+    o.z = (v0 >> 16) | (v1 & 0xffff0000u);
+    o.w = (v2 >> 16) | (v3 & 0xffff0000u);
+    dst[q] = o;
+}
+
+// the tensors' memory [first byte, one past the last) as a view reaches it
+static void qsa_extent(const ggml_tensor * t, uintptr_t & lo, uintptr_t & hi) {
+    size_t last = 0;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        last += (size_t) (t->ne[d] - 1) * t->nb[d];
+    }
+    lo = (uintptr_t) t->data;
+    hi = lo + last + ggml_type_size(t->type);
+}
+
+static bool qsa_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    uintptr_t alo, ahi, blo, bhi;
+    qsa_extent(a, alo, ahi);
+    qsa_extent(b, blo, bhi);
+    return alo < bhi && blo < ahi;
+}
+
+// nodes[i] = CONT(permuted cache view), then RESHAPE, PERMUTE, CONT(packed); the graph's structure only (graph_optimize
+// runs it before memory is assigned)
+static bool qsa_pack_match(const ggml_cgraph * g, const int i, const ggml_tensor ** src, ggml_tensor ** out, bool * keys) {
+    static const bool on = !getenv("STRIX_QSA_PACK_FUSE") || atoi(getenv("STRIX_QSA_PACK_FUSE")) != 0;
+    if (!on || i + 3 >= g->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * c0 = g->nodes[i], * r = g->nodes[i + 1], * p = g->nodes[i + 2];
+    ggml_tensor * o = g->nodes[i + 3];
+    if (c0->op != GGML_OP_CONT || r->op != GGML_OP_RESHAPE || p->op != GGML_OP_PERMUTE || o->op != GGML_OP_CONT ||
+            r->src[0] != c0 || p->src[0] != r || o->src[0] != p || c0->type != GGML_TYPE_F16 || o->type != GGML_TYPE_F16 ||
+            !ggml_is_contiguous(c0) || !ggml_is_contiguous(o) || ggml_node_get_use_count(g, i) != 1 ||
+            ggml_node_get_use_count(g, i + 1) != 1 || ggml_node_get_use_count(g, i + 2) != 1) {
+        return false;
+    }
+    // the cache view: [256 dims, n_kv cells, heads], dims contiguous
+    const ggml_tensor * s = c0->src[0];
+    const int64_t n_kv = c0->ne[1], heads = c0->ne[2];
+    if (s->type != GGML_TYPE_F16 || c0->ne[0] != 256 || c0->ne[3] != 1 || n_kv % 4 != 0 || n_kv < 4 || heads < 1 ||
+            !ggml_are_same_shape(s, c0) || s->nb[0] != 2 || s->nb[1] % 16 != 0 || s->nb[2] % 16 != 0) {
+        return false;
+    }
+    const int64_t N = n_kv / 4 * heads;
+    const bool is_keys = o->ne[0] == 16 && o->ne[1] == 4 && o->ne[2] == 16 && o->ne[3] == N &&
+        r->ne[0] == 16 && r->ne[1] == 16 && r->ne[2] == 4 && r->ne[3] == N &&
+        ggml_get_op_params_i32(p, 0) == 0 && ggml_get_op_params_i32(p, 1) == 2 && ggml_get_op_params_i32(p, 2) == 1 &&
+        ggml_get_op_params_i32(p, 3) == 3;
+    const bool is_values = o->ne[0] == 4 && o->ne[1] == 256 && o->ne[2] == N && o->ne[3] == 1 &&
+        r->ne[0] == 256 && r->ne[1] == 4 && r->ne[2] == N && r->ne[3] == 1 &&
+        ggml_get_op_params_i32(p, 0) == 1 && ggml_get_op_params_i32(p, 1) == 0 && ggml_get_op_params_i32(p, 2) == 2 &&
+        ggml_get_op_params_i32(p, 3) == 3;
+    if (!is_keys && !is_values) {
+        return false;
+    }
+    *src  = s;
+    *out  = o;
+    *keys = is_keys;
+    return true;
+}
+
+bool ggml_cuda_qsa_pack_deps(const ggml_cgraph * g, const int i, ggml_tensor ** src_root, ggml_tensor ** out) {
+    const ggml_tensor * s;
+    bool keys;
+    if (!qsa_pack_match(g, i, &s, out, &keys)) {
+        return false;
+    }
+    *src_root = const_cast<ggml_tensor *>(s->view_src ? s->view_src : s);
+    return true;
+}
+
+// returns the nodes consumed after nodes[i], or 0
+int ggml_cuda_qsa_pack_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * g, const int i) {
+    const ggml_tensor * s;
+    ggml_tensor * out;
+    bool keys;
+    if (!qsa_pack_match(g, i, &s, &out, &keys) || ((uintptr_t) s->data) % 16 != 0 || ((uintptr_t) out->data) % 16 != 0) {
+        return 0;
+    }
+    // the unfused path finished reading the source before the pack's output existed; the allocator may reuse the
+    // source for it unless graph_optimize kept the source (ggml_cuda_qsa_pack_deps) - never read and write one memory
+    if (qsa_overlap(s, out)) {
+        return 0;
+    }
+    const ggml_tensor * c0 = g->nodes[i];
+    const int64_t n_kv = c0->ne[1], heads = c0->ne[2];
+    const int64_t nblk = n_kv / 4, N = nblk * heads;
+    GGML_ASSERT(ggml_nelements(out) == 256 * n_kv * heads);
+    if (keys) {
+        const int64_t n_chunks = N * 64;   // 16 dims each, 1024 values a block
+        qsa_pack_keys_kernel<<<(unsigned) ((n_chunks + 255) / 256), 256, 0, ctx.stream()>>>(
+            (const char *) s->data, (uint4 *) out->data, nblk, (int64_t) s->nb[1], (int64_t) s->nb[2], n_chunks);
+    } else {
+        const int64_t n_pairs = N * 128;
+        qsa_pack_values_kernel<<<(unsigned) ((n_pairs + 255) / 256), 256, 0, ctx.stream()>>>(
+            (const char *) s->data, (uint4 *) out->data, nblk, (int64_t) s->nb[1], (int64_t) s->nb[2], n_pairs);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return 3;
+}
+
+// strixllama: the attention output gate, CONT(view of Qcur_full) then SIGMOID, as one pass: the view's rows (the gate
+// halves of the interleaved q|gate projection) read with float4s, the sigmoid applied, written contiguous. The same
+// expression as op_sigmoid in unary.cu, so the values are the unfused ones; half the traffic (0.83 + 0.86 ms a layer
+// at 2K tokens before).
+static __global__ void strided_sigmoid_kernel(const char * __restrict__ src, float4 * __restrict__ dst, const int64_t ne0_4,
+        const int64_t ne1, const int64_t ne2, const int64_t nb1, const int64_t nb2, const int64_t n4) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n4) {
+        return;
+    }
+    const int64_t i0 = i % ne0_4, r = i / ne0_4, i1 = r % ne1, i2 = r / ne1;
+    const float4 x = *(const float4 *) (src + i2 * nb2 + i1 * nb1 + i0 * 16);
+    float4 y;
+    y.x = 1.0f / (1.0f + expf(-x.x));
+    y.y = 1.0f / (1.0f + expf(-x.y));
+    y.z = 1.0f / (1.0f + expf(-x.z));
+    y.w = 1.0f / (1.0f + expf(-x.w));
+    dst[i] = y;
+}
+
+// CONT(strided F32 view) whose only reader is a SIGMOID; the graph's structure only
+static bool cont_sigmoid_match(const ggml_cgraph * g, const int i, const ggml_tensor ** src, ggml_tensor ** out) {
+    static const bool on = !getenv("STRIX_CONT_SIGMOID") || atoi(getenv("STRIX_CONT_SIGMOID")) != 0;
+    if (!on || i + 1 >= g->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * c = g->nodes[i];
+    ggml_tensor * sg = g->nodes[i + 1];
+    if (c->op != GGML_OP_CONT || sg->op != GGML_OP_UNARY || ggml_get_unary_op(sg) != GGML_UNARY_OP_SIGMOID ||
+            sg->src[0] != c || ggml_node_get_use_count(g, i) != 1 || c->type != GGML_TYPE_F32 || sg->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(c) || !ggml_is_contiguous(sg) || ggml_nelements(c) != ggml_nelements(sg)) {
+        return false;
+    }
+    const ggml_tensor * s = c->src[0];
+    // a view of up to three dimensions, rows contiguous, in the CONT's (row-major) element order
+    if (s->type != GGML_TYPE_F32 || s->ne[3] != 1 || s->nb[0] != 4 || s->ne[0] % 4 != 0 || s->nb[1] % 16 != 0 ||
+            s->nb[2] % 16 != 0 || ggml_nelements(s) != ggml_nelements(c)) {
+        return false;
+    }
+    *src = s;
+    *out = sg;
+    return true;
+}
+
+bool ggml_cuda_cont_sigmoid_deps(const ggml_cgraph * g, const int i, ggml_tensor ** src_root, ggml_tensor ** out) {
+    const ggml_tensor * s;
+    if (!cont_sigmoid_match(g, i, &s, out)) {
+        return false;
+    }
+    *src_root = const_cast<ggml_tensor *>(s->view_src ? s->view_src : s);
+    return true;
+}
+
+int ggml_cuda_cont_sigmoid_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * g, const int i) {
+    const ggml_tensor * s;
+    ggml_tensor * sg;
+    if (!cont_sigmoid_match(g, i, &s, &sg) || ((uintptr_t) s->data) % 16 != 0 || ((uintptr_t) sg->data) % 16 != 0 ||
+            qsa_overlap(s, sg)) {   // see ggml_cuda_qsa_pack_fuse
+        return 0;
+    }
+    const int64_t n4 = ggml_nelements(sg) / 4;
+    strided_sigmoid_kernel<<<(unsigned) ((n4 + 255) / 256), 256, 0, ctx.stream()>>>((const char *) s->data, (float4 *) sg->data,
+        s->ne[0] / 4, s->ne[1], s->ne[2], (int64_t) s->nb[1], (int64_t) s->nb[2], n4);
+    CUDA_CHECK(cudaGetLastError());
+    return 1;
+}

@@ -8,3 +8,14 @@
 bool ggml_cuda_flash_attn_ext_qsa_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
 
 void ggml_cuda_flash_attn_ext_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// strixllama: CONT(permuted cache view) -> RESHAPE -> PERMUTE -> CONT(packed K or V) in one pass; the nodes consumed
+// after nodes[i], or 0
+int ggml_cuda_qsa_pack_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * g, int i);
+// the same match on the graph's structure alone: the source to keep allocated until `out` is computed (graph_optimize)
+bool ggml_cuda_qsa_pack_deps(const ggml_cgraph * g, int i, ggml_tensor ** src_root, ggml_tensor ** out);
+
+// strixllama: CONT(strided F32 view) followed by its only reader SIGMOID, in one pass; the nodes consumed after
+// nodes[i], or 0
+int ggml_cuda_cont_sigmoid_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * g, int i);
+bool ggml_cuda_cont_sigmoid_deps(const ggml_cgraph * g, int i, ggml_tensor ** src_root, ggml_tensor ** out);

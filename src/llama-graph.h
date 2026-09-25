@@ -280,6 +280,12 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // strixllama: every sequence of the batch reads its state from a row of the cell it is written back to (its newest
+    // state or a rollback snapshot), the usual case; build_rs then marks its gather so a backend may read the rows
+    // s_copy names directly instead. Part of the graph, so it must match for reuse
+    bool gather_in_place = false;
+    static bool in_place(const llama_memory_recurrent_context * mctx, int64_t n_seqs);
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {

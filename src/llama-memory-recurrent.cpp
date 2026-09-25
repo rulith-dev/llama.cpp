@@ -1325,3 +1325,14 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
     }
     return (int32_t)(idx * mem->size) + src0;
 }
+
+bool llama_memory_recurrent_context::s_copy_own_cell(int n) const {
+    // s_copy(i) is idx * size + src0: rollback group idx of cell src0
+    for (int i = 0; i < n; ++i) {
+        const uint32_t cell_idx = i + mem->head;
+        if (mem->cells[cell_idx].src0 != (int32_t) cell_idx) {
+            return false;
+        }
+    }
+    return true;
+}
