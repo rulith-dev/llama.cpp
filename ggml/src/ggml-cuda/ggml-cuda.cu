@@ -2019,7 +2019,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // is too narrow for mul_mat_f and fell through to cuBLAS: ~120 us per call against ~8 us per 8 columns
     // in the vector kernel, 95 + 72 such calls per pass. Run the vector kernel over column chunks instead.
     // Measured on gfx1151: [4 x 10240] 117 -> 16 us at 16 columns, [48 x 2560] 37 -> 11.
-    if (!ggml_is_quantized(src0->type) && ne01 <= 64 && ne11 > MMVF_MAX_BATCH_SIZE && ne11 <= 64
+    // strixllama: and an F32 weight of any height at 9-32 columns (STRIX_F32_VEC_CHUNK_MAX): the MoE router
+    // [2560 x 512] of a nine-token verify step - three conversations drafting two tokens each - took the MMB
+    // kernel's 128-row tiles there, four workgroups for the whole GPU: ~250 us a product, the step +11 ms
+    static const int64_t f32_vec_chunk_max = getenv("STRIX_F32_VEC_CHUNK_MAX") ? atoll(getenv("STRIX_F32_VEC_CHUNK_MAX")) : 32;
+    const bool vec_chunks = (ne01 <= 64 && ne11 <= 64) || (src0->type == GGML_TYPE_F32 && ne11 <= f32_vec_chunk_max);
+    if (!ggml_is_quantized(src0->type) && vec_chunks && ne11 > MMVF_MAX_BATCH_SIZE
             && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1
             && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, /*ne11 =*/ 1)) {
         int64_t chunk = MMVF_MAX_BATCH_SIZE;
@@ -2134,6 +2139,33 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }
+            }
+        }
+
+        // strixllama: a verify step of several conversations (5-16 tokens) is more than the vector kernel takes
+        // (IQ3_S 4, IQ4_NL 6 on RDNA 3.5), and the tiled kernel pays per expert for staging a tile it barely fills: a
+        // nine-token step's routed experts 397 -> 289 us a product for the gate/up, 499 -> 387 for the down, the step
+        // -5 ms. Chunks of STRIX_MOE_VEC_CHUNK tokens (0: off) through the vector kernel instead, up to
+        // STRIX_MOE_VEC_CHUNK_MAX_T tokens; past that the tiled kernel's one read of an expert for all its tokens wins
+        static const int moe_vec_chunk = getenv("STRIX_MOE_VEC_CHUNK") ? atoi(getenv("STRIX_MOE_VEC_CHUNK")) : 4;
+        static const int moe_vec_chunk_max_t = getenv("STRIX_MOE_VEC_CHUNK_MAX_T") ? atoi(getenv("STRIX_MOE_VEC_CHUNK_MAX_T")) : 16;
+        if (moe_vec_chunk > 0 && ggml_is_quantized(src0->type) && ne2 > 1 && ne2 <= moe_vec_chunk_max_t && ne12 == ne2) {
+            const int chunk = std::min(moe_vec_chunk, get_mmvq_mmid_max_batch(src0->type, cc));
+            if (chunk >= 1) {
+                for (int64_t t0 = 0; t0 < ne2; t0 += chunk) {
+                    const int64_t nt = std::min<int64_t>(chunk, ne2 - t0);
+                    ggml_tensor src1_c = *src1;
+                    src1_c.ne[2] = nt;
+                    src1_c.data  = (char *) src1->data + t0*src1->nb[2];
+                    ggml_tensor ids_c = *ids;
+                    ids_c.ne[1] = nt;
+                    ids_c.data  = (char *) ids->data + t0*ids->nb[1];
+                    ggml_tensor dst_c = *dst;
+                    dst_c.ne[2] = nt;
+                    dst_c.data  = (char *) dst->data + t0*dst->nb[2];
+                    ggml_cuda_mul_mat_vec_q(ctx, src0, &src1_c, &ids_c, &dst_c);
+                }
+                return;
             }
         }
 
