@@ -1883,6 +1883,42 @@ static __global__ void k_skinny_f32_direct(const float * __restrict__ w, const f
     }
 }
 
+// strixllama: an F16 x F32 product with a tiny inner dimension - the compact sparse-attention scorer's block membership,
+// K = the sequences of a ubatch - went to hipBLAS, which loads a kernel from disk the first time it meets a shape: a
+// 272 ms stall in the first step three conversations decode together, and again as their blocks grow. One thread an
+// output element, the K products summed in order (STRIX_SMALL_K=0: as before). The membership is 0 or 1, so exact.
+static __global__ void k_small_k_f16(const half * __restrict__ a, const float * __restrict__ b, float * __restrict__ d,
+        const int K, const int M, const int64_t sa, const int64_t sb, const int64_t sd) {
+    const int m = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= M) {
+        return;
+    }
+    const half  * ap = a + (int64_t) m * sa;
+    const float * bp = b + (int64_t) blockIdx.y * sb;
+    float acc = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        acc = fmaf(__half2float(ap[k]), bp[k], acc);
+    }
+    d[(int64_t) blockIdx.y * sd + m] = acc;
+}
+
+static bool ggml_cuda_small_k(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    static const bool on = !getenv("STRIX_SMALL_K") || atoi(getenv("STRIX_SMALL_K")) != 0;
+    const int64_t K = src0->ne[0], M = src0->ne[1], N = src1->ne[1];
+    if (!on || src0->type != GGML_TYPE_F16 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || K > 32 ||
+            src1->ne[0] != K || dst->ne[0] != M || dst->ne[1] != N || N > 65535 || M > INT_MAX ||
+            src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+            src0->nb[0] != sizeof(half) || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
+            src0->nb[1] % sizeof(half) != 0 || src1->nb[1] % sizeof(float) != 0 || dst->nb[1] % sizeof(float) != 0) {
+        return false;
+    }
+    const dim3 grid((unsigned) ((M + 255) / 256), (unsigned) N), block(256);
+    k_small_k_f16<<<grid, block, 0, ctx.stream()>>>((const half *) src0->data, (const float *) src1->data, (float *) dst->data,
+        (int) K, (int) M, src0->nb[1] / sizeof(half), src1->nb[1] / sizeof(float), dst->nb[1] / sizeof(float));
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 static bool ggml_cuda_skinny_f32(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     static const bool on = !getenv("STRIX_SKINNY_F32") || atoi(getenv("STRIX_SKINNY_F32")) != 0;
     const int64_t K = src0->ne[0], M = src0->ne[1], T = src1->ne[1];
@@ -1948,6 +1984,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 
     if (hint != GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_hc_inject_take(ctx, src1, dst)) {
+        return;
+    }
+
+    if (hint != GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_small_k(ctx, src0, src1, dst)) {
         return;
     }
 
