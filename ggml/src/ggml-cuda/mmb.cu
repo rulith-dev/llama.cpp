@@ -1129,7 +1129,10 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
     // to hipBLAS, which loads each GEMM kernel from disk on its first use - 20 to 400 ms stalls in the first requests,
     // and again whenever a context length or batch size reaches a new kernel. Same numerics as the long batches get.
     static const int64_t f32_min_t = getenv("STRIX_MMB_F32_MIN_T") ? atoll(getenv("STRIX_MMB_F32_MIN_T")) : 9;
-    if (T < (f32w ? f32_min_t : (int64_t) mmb_min_t()) || T > INT32_MAX / 4) return false;
+    // strixllama: BF16 weights (the sparse-attention indexer's projections) likewise: mul_mat_f takes up to 16 columns
+    // and this kernel took 512 on, so a 17-511 token batch - most chat turns - loaded hipBLAS's BF16 kernels, ~0.4 s
+    static const int64_t bf16_min_t = getenv("STRIX_MMB_BF16_MIN_T") ? atoll(getenv("STRIX_MMB_BF16_MIN_T")) : 9;
+    if (T < (f32w ? f32_min_t : bf16w ? bf16_min_t : (int64_t) mmb_min_t()) || T > INT32_MAX / 4) return false;
     return ggml_nrows(dst) == T;
 }
 

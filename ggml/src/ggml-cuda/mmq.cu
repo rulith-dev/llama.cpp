@@ -370,8 +370,17 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             switch (type) {
                 case GGML_TYPE_Q2_K:
                     return ne11 <= 128;
-                case GGML_TYPE_Q6_K:
+                case GGML_TYPE_Q6_K: {
+                    // strixllama: above 256 columns hipBLAS was the pick, and it loads each GEMM kernel from disk the
+                    // first time it meets a shape - the MTP draft's Q6_K attn_v stalled 208 ms in the draft's first
+                    // prompt batch, and a prompt's last batch is a new width almost every time. On RDNA3.5 MMQ takes
+                    // every width (STRIX_MMQ_Q6K_ANY=0: upstream's limit)
+                    static const bool any = !getenv("STRIX_MMQ_Q6K_ANY") || atoi(getenv("STRIX_MMQ_Q6K_ANY")) != 0;
+                    if (any && GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+                        return true;
+                    }
                     return ne11 <= (GGML_CUDA_CC_IS_RDNA3_0(cc) ? 128 : 256);
+                }
                 case GGML_TYPE_IQ2_XS:
                 case GGML_TYPE_IQ2_S:
                     return GGML_CUDA_CC_IS_RDNA3_5(cc) || ne11 <= 128;
