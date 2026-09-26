@@ -2022,8 +2022,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // strixllama: and an F32 weight of any height at 9-32 columns (STRIX_F32_VEC_CHUNK_MAX): the MoE router
     // [2560 x 512] of a nine-token verify step - three conversations drafting two tokens each - took the MMB
     // kernel's 128-row tiles there, four workgroups for the whole GPU: ~250 us a product, the step +11 ms
-    static const int64_t f32_vec_chunk_max = getenv("STRIX_F32_VEC_CHUNK_MAX") ? atoll(getenv("STRIX_F32_VEC_CHUNK_MAX")) : 32;
-    const bool vec_chunks = (ne01 <= 64 && ne11 <= 64) || (src0->type == GGML_TYPE_F32 && ne11 <= f32_vec_chunk_max);
+    // strixllama: and a BF16 weight of any height at 9-32 columns (STRIX_BF16_VEC_CHUNK_MAX): the sparse-attention
+    // indexer's k projection [2560 x 128] took the MMB kernel's one 128-row tile there, one workgroup for the whole GPU
+    static const int64_t f32_vec_chunk_max  = getenv("STRIX_F32_VEC_CHUNK_MAX")  ? atoll(getenv("STRIX_F32_VEC_CHUNK_MAX"))  : 32;
+    static const int64_t bf16_vec_chunk_max = getenv("STRIX_BF16_VEC_CHUNK_MAX") ? atoll(getenv("STRIX_BF16_VEC_CHUNK_MAX")) : 32;
+    const bool vec_chunks = (ne01 <= 64 && ne11 <= 64) || (src0->type == GGML_TYPE_F32 && ne11 <= f32_vec_chunk_max)
+        || (src0->type == GGML_TYPE_BF16 && ne11 <= bf16_vec_chunk_max);
     if (!ggml_is_quantized(src0->type) && vec_chunks && ne11 > MMVF_MAX_BATCH_SIZE
             && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1
             && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, /*ne11 =*/ 1)) {
@@ -2059,6 +2063,29 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    // strixllama: a quantized weight of at most STRIX_Q_VEC_CHUNK_ROWS output rows (1024) at 9-32 columns
+    // (STRIX_Q_VEC_CHUNK_MAX, 0: off) - the hyper-connection down projection [10240 x 320], the attention k and v, the
+    // shared expert - is a handful of MMQ tiles, and MMQ has no stream-k on RDNA: three to five workgroups for the whole
+    // GPU. The vector kernel over 8-column chunks reads the weight twice and still takes about half the time. Taller
+    // weights stay on MMQ: for the [6144 x 2560] projections the second read cost more than the tiles lose
+    static const int64_t q_vec_chunk_max  = getenv("STRIX_Q_VEC_CHUNK_MAX")  ? atoll(getenv("STRIX_Q_VEC_CHUNK_MAX"))  : 32;
+    static const int64_t q_vec_chunk_rows = getenv("STRIX_Q_VEC_CHUNK_ROWS") ? atoll(getenv("STRIX_Q_VEC_CHUNK_ROWS")) : 1024;
+    if (ggml_is_quantized(src0->type) && ne11 > MMVQ_MAX_BATCH_SIZE && ne11 <= q_vec_chunk_max && ne01 <= q_vec_chunk_rows
+            && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1
+            && ggml_cuda_should_use_mmvq(src0->type, cc, MMVQ_MAX_BATCH_SIZE)) {
+        const int64_t chunk = MMVQ_MAX_BATCH_SIZE;
+        for (int64_t c0 = 0; c0 < ne11; c0 += chunk) {
+            const int64_t nc = std::min<int64_t>(chunk, ne11 - c0);
+            ggml_tensor src1_c = *src1;
+            src1_c.ne[1] = nc;
+            src1_c.data  = (char *) src1->data + c0*src1->nb[1];
+            ggml_tensor dst_c = *dst;
+            dst_c.ne[1] = nc;
+            dst_c.data  = (char *) dst->data + c0*dst->nb[1];
+            ggml_cuda_mul_mat_vec_q(ctx, src0, &src1_c, nullptr, &dst_c);
+        }
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
