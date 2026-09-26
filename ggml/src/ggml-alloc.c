@@ -998,6 +998,22 @@ static bool ggml_gallocr_reserve_n_impl(
                             cur_size_dbg / 1048576.0, new_size / 1048576.0);
                 }
             }
+            // strixllama: a buffer that grows again grows by a quarter at least. The padding in ggml_vbuffer_alloc (3% +
+            // 16 MiB) absorbs the jitter between graphs of one shape, but not a graph that keeps growing: once an image
+            // is in a conversation every ubatch takes the dense sparse-attention inputs, whose mask and bias grow with the
+            // cache, so the pinned host buffer that stages them was freed and allocated again for almost every image -
+            // and ROCm on Windows keeps each freed buffer, a few MiB too small for the next request, for the rest of the
+            // process. 27 images of 1920x1080 over a 58K conversation took 12 GiB of RAM that way, and the next large
+            // batch faulted (issue #2). Geometric growth makes those reallocations a handful per process.
+            if (galloc->buffers[i] != NULL) {
+                for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
+                    const size_t prev = ggml_vbuffer_chunk_size(galloc->buffers[i], c);
+                    struct tallocr_chunk * chunk = galloc->buf_tallocs[i]->chunks[c];
+                    if (prev > 0 && chunk->max_size > prev && chunk->max_size < prev + prev/4) {
+                        chunk->max_size = prev + prev/4;
+                    }
+                }
+            }
 #ifndef NDEBUG
             {
                 size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;

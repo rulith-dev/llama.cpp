@@ -244,6 +244,34 @@ static bool hybrid_idx_ubatch_pos_dup(const llama_ubatch & ubatch) {
 }
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+    // strixllama: once a conversation holds an image (or a position gap, kb_dup), its ubatches take the dense
+    // sparse-attention inputs - a KQ mask and a per-block bias over n_kv x n_tokens, ~6.6 bytes a pair staged in
+    // pinned host memory and again on the GPU. They grow with every image, and each time the pinned buffer grew
+    // ROCm on Windows kept the old one: 27 images of 1920x1080 on a 58K conversation took 12 GiB of RAM, and a 14K
+    // text append at batch 8192 then faulted (issue #2). Such ubatches are held to n_kv x n_tokens <= 2^27: about
+    // 1024 tokens at 128K cells, 512 at 256K. The dense path is bound by attention over the whole cache, so this
+    // costs it little: the same 27 images prefilled at the same rate, the append at 245 t/s instead of 261 at 2^28,
+    // and the machine kept 11 GiB of RAM instead of 3. Text before any image keeps the full ubatch.
+    // STRIX_DENSE_UBATCH_BUDGET sets the bound in cell-token pairs (0 = no bound).
+    if (kb_dup) {
+        static const uint64_t budget = [] {
+            const char * e = getenv("STRIX_DENSE_UBATCH_BUDGET");
+            return e ? (uint64_t) strtoull(e, nullptr, 10) : (uint64_t) 1 << 27;
+        }();
+        const uint64_t n_kv = (uint64_t) get_mem_attn()->get_cells(0).used_max_p1() + balloc.get_n_tokens();
+        if (budget > 0 && n_kv > 0) {
+            const uint32_t cap = (uint32_t) std::max<uint64_t>(256, budget / n_kv / 256 * 256);
+            if (cap < n_ubatch) {
+                static uint32_t logged = 0;
+                if (cap != logged) {
+                    logged = cap;
+                    LLAMA_LOG_INFO("%s: image in the conversation - ubatch %u -> %u tokens at %llu cells (dense inputs bounded)\n",
+                                   __func__, n_ubatch, cap, (unsigned long long) n_kv);
+                }
+                n_ubatch = cap;
+            }
+        }
+    }
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
     do {
         balloc.split_reset();

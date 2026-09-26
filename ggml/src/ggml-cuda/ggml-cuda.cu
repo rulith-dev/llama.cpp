@@ -2691,6 +2691,21 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         GGML_LOG_ERROR("%s: %s failed\n", __func__, ggml_op_desc(dst));
+        // strixllama: name the node, its sources and where each lies in its buffer - what a report of a kernel fault needs
+        GGML_LOG_ERROR("  dst '%s' %s [%lld,%lld,%lld,%lld] nb [%zu,%zu,%zu] off %lld of buffer %zu, extent %zu\n", dst->name, ggml_type_name(dst->type),
+            (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3], dst->nb[1], dst->nb[2], dst->nb[3],
+            dst->buffer ? (long long) ((const char *) dst->data - (const char *) ggml_backend_buffer_get_base(dst->buffer)) : -1LL,
+            dst->buffer ? ggml_backend_buffer_get_size(dst->buffer) : (size_t) 0, ggml_nbytes(dst));
+        for (int k = 0; k < GGML_MAX_SRC && dst->src[k]; ++k) {
+            const ggml_tensor * s = dst->src[k];
+            const ggml_tensor * base = s->view_src ? s->view_src : s;
+            const char * b0 = s->buffer ? (const char *) ggml_backend_buffer_get_base(s->buffer) : nullptr;
+            const size_t bsz = s->buffer ? ggml_backend_buffer_get_size(s->buffer) : 0;
+            GGML_LOG_ERROR("  src%d '%s' (%s, view of '%s' %s) %s [%lld,%lld,%lld,%lld] nb [%zu,%zu,%zu] off %lld of buffer %zu, extent %zu\n",
+                k, s->name, ggml_op_desc(s), base->name, ggml_op_desc(base), ggml_type_name(s->type),
+                (long long) s->ne[0], (long long) s->ne[1], (long long) s->ne[2], (long long) s->ne[3], s->nb[1], s->nb[2], s->nb[3],
+                b0 ? (long long) ((const char *) s->data - b0) : -1LL, bsz, ggml_nbytes(s));
+        }
         CUDA_CHECK(err);
     }
 
