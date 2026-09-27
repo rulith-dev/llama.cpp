@@ -3586,8 +3586,9 @@ int llm_graph_input_rs::lazy_mode_for(const llama_memory_recurrent_context * mct
         return 0;
     }
     // a batch no longer than a verify per sequence, each in its own cell, none starting from a zeroed state, no other
-    // cell's state to copy along (build_rs does that, and the deferred-rollback net goes without it)
-    const bool is_short = ubatch.n_seq_tokens <= mctx->get_n_rs_seq() + 1;
+    // cell's state to copy along (build_rs does that, and the deferred-rollback net goes without it). A ragged ubatch
+    // replays first and runs the plain net, group by group
+    const bool is_short = !ubatch.ragged() && ubatch.n_seq_tokens <= mctx->get_n_rs_seq() + 1;
     return is_short && mctx->get_rs_z() < 0 && mctx->get_n_rs() == ubatch.n_seqs &&
            mctx->s_copy_own_cell((int) ubatch.n_seqs) ? 1 : 2;
 }

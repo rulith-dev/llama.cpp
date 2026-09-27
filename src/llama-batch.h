@@ -62,10 +62,29 @@ struct llama_ubatch {
         std::vector<int8_t>         output;
 
         std::vector<llama_seq_id> seq_id_data;
+
+        std::vector<uint32_t> seq_ntok;          // strixllama: ragged ubatches, see below
+        std::vector<uint32_t> seq_tok0;
     };
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
+
+    // strixllama: a ragged ubatch (split_ragged) gives its sequence sets different token counts: set s owns the
+    // tokens [seq_tok0[s], seq_tok0[s] + seq_ntok[s]), sets of one count next to each other, and n_seq_tokens is 0.
+    // Every other ubatch leaves these null, and set s owns n_seq_tokens tokens from s*n_seq_tokens.
+    const uint32_t * seq_ntok = nullptr; // [n_seqs]
+    const uint32_t * seq_tok0 = nullptr; // [n_seqs]
+
+    bool ragged() const {
+        return seq_ntok != nullptr;
+    }
+    uint32_t ntok(uint32_t s) const {
+        return seq_ntok ? seq_ntok[s] : n_seq_tokens;
+    }
+    uint32_t tok0(uint32_t s) const {
+        return seq_tok0 ? seq_tok0[s] : s*n_seq_tokens;
+    }
 };
 
 // a helper for sanitizing, fulfilling and splitting a batch
@@ -110,6 +129,15 @@ public:
     // sequence-set-wise split - each ubatch contains a single sequence-set
     llama_ubatch split_seq(uint32_t n_ubatch);
 
+    // strixllama: one ubatch for sequence sets of different lengths (llama_ubatch::ragged): the shortest sets whole,
+    // the rest of n_ubatch to the longer ones in turn, and no set leaves fewer than n_keep_tail tokens for a later
+    // ubatch. Needs a batch without coupled sequences (has_coupled)
+    llama_ubatch split_ragged(uint32_t n_ubatch, uint32_t n_keep_tail);
+
+    bool has_coupled() const {
+        return has_cpl;
+    }
+
     // a helper method for creating a well-defined ubatch of tokens
     // TODO: support embeddings if needed in the future
     llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs);
@@ -119,7 +147,9 @@ private:
 
     // create the next ubatch based on the provided batch indices (idxs) and the number of sequence sets (n_seqs)
     // return llama_ubatch.n_tokens == 0 if the entire batch was consumed
-    llama_ubatch ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs);
+    // strixllama: seq_ntok, when given, makes a ragged ubatch: the token count of each of the n_seqs sets, in order
+    llama_ubatch ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs,
+                            const std::vector<uint32_t> * seq_ntok = nullptr);
 
     // for debugging, start with LLAMA_BATCH_DEBUG=2
     void ubatch_print(const llama_ubatch & ubatch, int debug);

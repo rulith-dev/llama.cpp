@@ -620,7 +620,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
 }
 
 bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
-    const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
+    // strixllama: a ragged ubatch gives each sequence set its own token count (ubatch.tok0 / ubatch.ntok)
     const uint32_t n_seqs       = ubatch.n_seqs;
 
     // if we have enough unused cells before the current head ->
@@ -641,7 +641,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 
     // everything should fit if all seq_ids are smaller than the max
     for (uint32_t s = 0; s < n_seqs; ++s) {
-        const uint32_t i = s*n_seq_tokens; // first token of sequence set s
+        const uint32_t i = ubatch.tok0(s); // first token of sequence set s
         const uint32_t n_seq_id = ubatch.n_seq_id[i];
 
         for (uint32_t j = 0; j < n_seq_id; ++j) {
@@ -704,7 +704,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 
     // find usable cell range
     for (uint32_t s = 0; s < n_seqs; ++s) {
-        const uint32_t i = s*n_seq_tokens;
+        const uint32_t i = ubatch.tok0(s);
         const llama_seq_id seq_id = ubatch.seq_id[i][0];
         auto & seq_meta = cells[seq_id];
         bool has_cell = false;
@@ -743,7 +743,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 
     // gather and re-order
     for (uint32_t s = 0; s < n_seqs; ++s) {
-        const uint32_t i = s*n_seq_tokens;
+        const uint32_t i = ubatch.tok0(s);
         const int32_t dst_id = s + min;
         const int32_t src_id = cells[ubatch.seq_id[i][0]].tail;
         if (dst_id != src_id) {
@@ -768,7 +768,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 
     // update the pos of the used seqs
     for (uint32_t s = 0; s < n_seqs; ++s) {
-        const uint32_t i = s*n_seq_tokens;
+        const uint32_t i = ubatch.tok0(s);
+        const uint32_t n_seq_tokens = ubatch.ntok(s);
         const llama_pos last_pos = ubatch.pos[i + n_seq_tokens - 1];
         const int32_t cell_id = s + min;
         auto & cell = cells[cell_id];

@@ -720,6 +720,109 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
     return ubatch_add(idxs, 1, true);
 }
 
+// strixllama: the hybrid memory ran a batch of sequences with different token counts - conversations decoding next to
+// a prompt, several prompts at once - as several equal-length ubatches, each a pass over all the weights: five prompt
+// tails of 292-556 tokens took six passes. Here they are one ubatch, and the model runs its per-sequence parts (the
+// recurrent layers) once per group of equal counts (llama_ubatch::ragged).
+llama_ubatch llama_batch_allocr::split_ragged(uint32_t n_ubatch, uint32_t n_keep_tail) {
+    GGML_ASSERT(!has_cpl && "split_ragged needs a batch without coupled sequences");
+
+    // the sequence sets with tokens left, and where each stands
+    std::vector<seq_set_t> sets;
+    std::vector<int32_t>   cur;   // index into seq_set_map[set] of the first unused token
+    std::vector<uint32_t>  rem;   // unused tokens left
+    for (int32_t i = 0; i < batch.n_tokens && sets.size() < n_ubatch; ++i) {
+        if (used[i]) {
+            continue;
+        }
+        bool seen = false;
+        for (const auto & s : sets) {
+            if (s == seq_set[i]) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) {
+            continue;
+        }
+        const auto & idxs = seq_set_map[seq_set[i]];
+        int32_t c = 0;
+        while (c < (int32_t) idxs.size() && used[idxs[c]]) {
+            ++c;
+        }
+        sets.push_back(seq_set[i]);
+        cur.push_back(c);
+        rem.push_back((uint32_t) (idxs.size() - c));
+    }
+
+    if (sets.empty()) {
+        return {};
+    }
+
+    // the shortest first, whole; what n_ubatch has left goes to the longer ones in turn
+    std::vector<uint32_t> order(sets.size());
+    for (uint32_t s = 0; s < order.size(); ++s) {
+        order[s] = s;
+    }
+    std::stable_sort(order.begin(), order.end(), [&](uint32_t x, uint32_t y) { return rem[x] < rem[y]; });
+
+    std::vector<uint32_t> take(sets.size(), 0);
+    uint32_t budget = n_ubatch;
+    for (const uint32_t s : order) {
+        uint32_t t = std::min(rem[s], budget);
+        // [TAG_RECURRENT_ROLLBACK_SPLITS] the trailing n_keep_tail tokens of a set stay in one ubatch
+        if (t < rem[s] && rem[s] - t < n_keep_tail) {
+            t = rem[s] > n_keep_tail ? std::min(t, rem[s] - n_keep_tail) : 0;
+        }
+        take[s] = t;
+        budget -= t;
+    }
+
+    uint32_t n_total = 0;
+    for (const uint32_t t : take) {
+        n_total += t;
+    }
+    if (n_total == 0) {
+        // nothing fit under the tail rule: the first set alone, as split_equal would take it
+        const uint32_t s = order[0];
+        uint32_t t = std::min(rem[s], n_ubatch);
+        if (t < rem[s] && rem[s] - t < n_keep_tail && rem[s] > n_keep_tail) {
+            t = std::min(t, rem[s] - n_keep_tail);
+        }
+        take[s] = std::max<uint32_t>(t, 1);
+    }
+
+    // sets of one count next to each other, the longest first
+    std::vector<uint32_t> chosen;
+    for (const uint32_t s : order) {
+        if (take[s] > 0) {
+            chosen.push_back(s);
+        }
+    }
+    std::stable_sort(chosen.begin(), chosen.end(), [&](uint32_t x, uint32_t y) { return take[x] > take[y]; });
+
+    std::vector<int32_t>  idxs;
+    std::vector<uint32_t> seq_ntok;
+    for (const uint32_t s : chosen) {
+        const auto & all = seq_set_map[sets[s]];
+        for (uint32_t k = 0; k < take[s]; ++k) {
+            const int32_t idx = all[cur[s] + k];
+            idxs.push_back(idx);
+            used[idx] = true;
+            ++n_used;
+        }
+        seq_ntok.push_back(take[s]);
+    }
+
+    // one count for all: an ordinary equal-length ubatch
+    bool uniform = true;
+    for (const uint32_t t : seq_ntok) {
+        uniform = uniform && t == seq_ntok[0];
+    }
+
+    return ubatch_add(idxs, (uint32_t) seq_ntok.size(), true, uniform ? nullptr : &seq_ntok);
+}
+
 void llama_batch_allocr::clear() {
     n_outputs = 0;
 
@@ -746,12 +849,25 @@ void llama_batch_allocr::clear() {
     std::fill(seq_idx.begin(), seq_idx.end(), -1);
 }
 
-llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs) {
+llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs,
+                                            const std::vector<uint32_t> * seq_ntok) {
     const uint32_t n_tokens = idxs.size();
 
-    assert(n_tokens%n_seqs == 0);
+    assert(seq_ntok || n_tokens%n_seqs == 0);
 
     auto udata = std::make_shared<llama_ubatch::data_t>();
+
+    if (seq_ntok) {
+        GGML_ASSERT(seq_ntok->size() == n_seqs);
+        udata->seq_ntok = *seq_ntok;
+        udata->seq_tok0.resize(n_seqs);
+        uint32_t t0 = 0;
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            udata->seq_tok0[s] = t0;
+            t0 += (*seq_ntok)[s];
+        }
+        GGML_ASSERT(t0 == n_tokens);
+    }
 
     const int64_t n_embd_all = batch.embd ? (int64_t) n_tokens*n_embd : 0;
     const int64_t n_pos_all  =              (int64_t) n_tokens*n_pos_per_embd;
@@ -815,10 +931,13 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         }
     }
 
+    const uint32_t * p_ntok = seq_ntok ? udata->seq_ntok.data() : nullptr;
+    const uint32_t * p_tok0 = seq_ntok ? udata->seq_tok0.data() : nullptr;
+
     llama_ubatch res {
         /*.b_equal_seqs =*/ equal_seqs,
         /*.n_tokens     =*/ n_tokens,
-        /*.n_seq_tokens =*/ n_tokens/n_seqs,
+        /*.n_seq_tokens =*/ seq_ntok ? 0 : n_tokens/n_seqs,
         /*.n_seqs       =*/ n_seqs,
         /*.n_seqs_unq   =*/ (uint32_t) udata->seq_id_unq.size(),
         /*.n_pos        =*/ n_pos_per_embd,
@@ -832,6 +951,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.seq_idx      =*/ udata->seq_idx.data(),
         /*.output       =*/ udata->output.data(),
         /*.data         =*/ std::move(udata),
+        /*.seq_ntok     =*/ p_ntok,
+        /*.seq_tok0     =*/ p_tok0,
     };
 
     if (debug > 0) {
@@ -848,6 +969,13 @@ void llama_batch_allocr::ubatch_print(const llama_ubatch & ubatch, int debug) {
         LLAMA_LOG_DEBUG("%s:   equal_seqs   = %d\n", __func__, ubatch.equal_seqs());
         LLAMA_LOG_DEBUG("%s:   n_tokens     = %d\n", __func__, ubatch.n_tokens);
         LLAMA_LOG_DEBUG("%s:   n_seq_tokens = %d\n", __func__, ubatch.n_seq_tokens);
+        if (ubatch.ragged()) {
+            std::stringstream ss;
+            for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+                ss << ubatch.ntok(s) << " ";
+            }
+            LLAMA_LOG_DEBUG("%s:   ragged       = [ %s]\n", __func__, ss.str().c_str());
+        }
         LLAMA_LOG_DEBUG("%s:   n_seqs       = %d\n", __func__, ubatch.n_seqs);
         LLAMA_LOG_DEBUG("%s:   n_seqs_unq   = %d\n", __func__, ubatch.n_seqs_unq);
 

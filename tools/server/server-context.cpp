@@ -2158,8 +2158,61 @@ private:
             }
         }
 
-        // find the slot that has at least n% prompt similarity
-        if (slot_prompt_similarity != 0.0f) {
+        // strixllama: agents run several sessions on one long system prompt, so any two of them share most of their
+        // tokens, and the slot sharing the most with a prompt was often another session's. Taking it cut that
+        // session's own history - its task, answers and tool results - while f_keep stayed above 0.75 (the system
+        // prompt was most of the slot), and the session then processed all of it again on its next step: six agents
+        // on four slots went back to the system prompt on nearly every step. A slot takes a prompt for what it holds
+        // only when the prompt continues it - keeps all that was last asked there, less the few tokens a template
+        // renders differently once the answer is in the history: a next turn, a next agent step, a regenerate.
+        // Anything else goes to a free slot, else the least recently used one (below), and the part it shares with
+        // any slot is copied in (copy_prefix). The exception keeps the old choice: a shared part worth keeping that
+        // cannot be copied (an image in it). STRIX_SLOT_BY_SIMILARITY=1: upstream's choice by similarity.
+        static const bool by_similarity = [] {
+            const char * e = getenv("STRIX_SLOT_BY_SIMILARITY");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (task.id_slot == -1 && slot_prompt_similarity != 0.0f && !by_similarity) {
+            server_slot * best = nullptr;
+            size_t lcp_best = 0;
+            size_t lcp_own  = 0;
+            for (server_slot & slot : slots) {
+                if (slot.is_processing() || slot.prompt.tokens.empty()) {
+                    continue;
+                }
+                const size_t lcp = slot.prompt.tokens.get_common_prefix(task.tokens);
+                if (lcp > lcp_best) {
+                    lcp_best = lcp;
+                    best     = &slot;
+                }
+                const size_t n_last = slot.task_prev ? slot.task_prev->tokens.size() : slot.prompt.tokens.size();
+                if (lcp > lcp_own && lcp + 16 >= n_last) {
+                    lcp_own = lcp;
+                    ret     = &slot;
+                }
+            }
+            if (ret != nullptr) {
+                SLT_INF(*ret, "selected slot: the prompt continues it (%zu of its %d tokens kept)\n", lcp_own, ret->prompt.n_tokens());
+            } else if (best != nullptr) {
+                const int64_t n_shared = restore_point(*best, task.tokens, false);
+                if (n_shared >= 256 && !can_copy_prefix(*best, n_shared)) {
+                    ret = best;
+                    update_cache = lcp_best < best->prompt.tokens.size() / 2;
+                    SLT_INF(*ret, "selected slot: %" PRId64 " shared tokens that cannot be copied\n", n_shared);
+                }
+            }
+            if (ret == nullptr) {
+                for (server_slot & slot : slots) {
+                    if (!slot.is_processing() && slot.prompt.tokens.empty()) {
+                        ret = &slot;
+                        update_cache = true;
+                        SLT_INF(slot, "%s", "selected free slot; a shared prefix is copied in\n");
+                        break;
+                    }
+                }
+            }
+        } else if (slot_prompt_similarity != 0.0f) {
+            // find the slot that has at least n% prompt similarity
             float f_sim_best = 0;
 
             for (server_slot & slot : slots) {
@@ -4024,6 +4077,22 @@ private:
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
+        // strixllama: while conversations generate, a step takes at most STRIX_PREFILL_BUDGET prompt tokens (default
+        // 2048, 0: up to n_batch), so their next tokens wait for that much of another conversation's prefill rather
+        // than for n_batch tokens of it; the ragged ubatch runs their tokens in the same pass. Six agents on eight
+        // slots (tmp/ragged/agent_sim.py): no stall over 2.8 s instead of up to 4.9 s, time to first token as without
+        // it; 1024 kept every stall under 2 s but cost 20-30% of the time to first token
+        int32_t n_batch_prompt = n_batch;
+        {
+            static const int32_t budget = [] {
+                const char * e = getenv("STRIX_PREFILL_BUDGET");
+                return e ? atoi(e) : 2048;
+            }();
+            if (budget > 0 && batch.size() > 0) {
+                n_batch_prompt = std::min<int32_t>(n_batch, batch.size() + budget);
+            }
+        }
+
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
@@ -4032,7 +4101,7 @@ private:
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+                if (!add_ok || batch.size() >= n_batch_prompt) {
                     return; // batch is full, skip remaining slots
                 }
 
@@ -4510,7 +4579,7 @@ private:
                     }
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_prompt) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {

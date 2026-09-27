@@ -789,8 +789,9 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
                 ggml_tensor * input,
                         int   il) {
-    const int64_t n_seqs       = ubatch.n_seqs;
-    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+    // strixllama: a ragged ubatch keeps one column per token; build_layer_attn_linear takes each group's columns
+    const int64_t n_seqs       = ubatch.ragged() ? 1 : ubatch.n_seqs;
+    const int64_t n_seq_tokens = ubatch.ragged() ? n_tokens : ubatch.n_seq_tokens;
 
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
@@ -1758,6 +1759,44 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     return cur;
 }
 
+// strixllama: the sequence sets of a ubatch in groups of one token count - split_ragged puts sets of one count next to
+// each other (llama_ubatch::ragged): group g is n_seqs sets from set s0, n_tok tokens each, its tokens from t0. An
+// equal-length ubatch is one group
+struct qwen4exp_seq_group {
+    int64_t s0;
+    int64_t n_seqs;
+    int64_t n_tok;
+    int64_t t0;
+};
+
+static std::vector<qwen4exp_seq_group> qwen4exp_seq_groups(const llama_ubatch & ub) {
+    std::vector<qwen4exp_seq_group> res;
+    for (uint32_t s = 0; s < ub.n_seqs; ++s) {
+        const int64_t n  = ub.ntok(s);
+        const int64_t t0 = ub.tok0(s);
+        if (!res.empty() && res.back().n_tok == n && res.back().t0 + res.back().n_seqs * n == t0) {
+            res.back().n_seqs++;
+        } else {
+            res.push_back({ (int64_t) s, 1, n, t0 });
+        }
+    }
+    return res;
+}
+
+// strixllama: the groups' outputs back in one tensor, a column of `rows` values per token, in token order.
+// split_ragged puts the longest group first; the short ones are joined first, so the long one is copied once
+static ggml_tensor * qwen4exp_concat_groups(ggml_context * ctx, const std::vector<ggml_tensor *> & parts, int64_t rows) {
+    std::vector<ggml_tensor *> cols;
+    for (ggml_tensor * p : parts) {
+        cols.push_back(ggml_reshape_2d(ctx, p, rows, ggml_nelements(p) / rows));
+    }
+    ggml_tensor * rest = nullptr;
+    for (size_t k = 1; k < cols.size(); ++k) {
+        rest = rest ? ggml_concat(ctx, rest, cols[k], 1) : cols[k];
+    }
+    return rest ? ggml_concat(ctx, cols[0], rest, 1) : cols[0];
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
         llm_graph_input_rs * inp,
         ggml_tensor *        cur,
@@ -1770,11 +1809,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     const int64_t num_k_heads  = hparams.ssm_n_group;
     const int64_t num_v_heads  = hparams.ssm_dt_rank;
     const int64_t head_v_dim   = hparams.ssm_d_state;
-    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+
+    // strixllama: a ragged ubatch (llama_ubatch::ragged) builds the per-sequence part - the conv, the net and the
+    // states they read and write - once per group of sets with one token count (qwen4exp_seq_groups), and the per-token
+    // rest once, as a single set of all the tokens. An equal-length ubatch is one group and builds the graph it did
+    const bool    ragged       = ubatch.ragged();
+    const int64_t n_seq_tokens = ragged ? (int64_t) ubatch.n_tokens : (int64_t) ubatch.n_seq_tokens;
+    const int64_t n_seqs_tok   = ragged ? 1 : n_seqs;
 
     GGML_ASSERT(n_seqs != 0);
     GGML_ASSERT(ubatch.equal_seqs());
-    GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
+    GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs_tok);
     GGML_ASSERT(head_v_dim * num_v_heads == d_inner);
 
     auto qkvz = build_qkvz(cur, il);
@@ -1782,14 +1827,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * z         = qkvz.second;
 
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
-    beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
+    beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs_tok);
     cb(beta, "beta", il);
 
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
-    alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+    alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs_tok);
     cb(alpha, "alpha", il);
 
     ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
@@ -1799,7 +1844,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
     cb(gate, "gate", il);
 
-    gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
+    gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs_tok);
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
@@ -1810,85 +1855,119 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // the channels must match how load_arch_tensors sizes wqkv, not ssm_d_inner
     const int64_t conv_channels    = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
 
-    ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
-            conv_kernel_size - 1, conv_channels, il);
-
     // strixllama: deferred rollback (llm_graph_input_rs::lazy_mode): a short batch runs the net that records instead
     // of snapshotting and reads its states from their rows itself; any other first replays the records the states
-    // still carry, in place, so the gather and the plain net see them as they expect
+    // still carry, in place, so the gather and the plain net see them as they expect. A ragged ubatch is never short
     const int lazy_mode = inp->lazy_mode;
-    ggml_tensor * state = nullptr;
-    if (lazy_mode != 1) {
-        ggml_tensor * ssm_src = ssm_states_all;
-        if (lazy_mode == 2) {
-            ssm_src = ggml_gated_delta_net_replay(ctx0, ssm_states_all, mctx_cur->get_rec_l(il), inp->lazy_info,
-                    (int) head_v_dim, (int) num_v_heads, (int) num_k_heads);
+    GGML_ASSERT(!ragged || lazy_mode != 1);
+    ggml_tensor * states = nullptr;
+
+    std::vector<ggml_tensor *> outputs;
+    for (const auto & g : qwen4exp_seq_groups(ubatch)) {
+        const int64_t n_grp_tok  = g.n_tok;
+        const int64_t n_grp_seqs = g.n_seqs;
+
+        // the group's tokens, the columns [t0, t0 + n_tok*n_seqs) - the whole tensors when it is the only group
+        ggml_tensor * x_g    = qkv_mixed;
+        ggml_tensor * beta_g = beta;
+        ggml_tensor * gate_g = gate;
+        if (ragged) {
+            x_g    = ggml_view_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_grp_tok, n_grp_seqs,
+                    qkv_mixed->nb[1], qkv_mixed->nb[1] * n_grp_tok, qkv_mixed->nb[1] * g.t0);
+            beta_g = ggml_view_4d(ctx0, beta, 1, num_v_heads, n_grp_tok, n_grp_seqs,
+                    beta->nb[1], beta->nb[2], beta->nb[2] * n_grp_tok, beta->nb[2] * g.t0);
+            gate_g = ggml_view_4d(ctx0, gate, 1, num_v_heads, n_grp_tok, n_grp_seqs,
+                    gate->nb[1], gate->nb[2], gate->nb[2] * n_grp_tok, gate->nb[2] * g.t0);
         }
-        state = build_rs(inp, ssm_src, hparams.n_embd_s(), n_seqs);
-        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-        cb(state, "state_predelta", il);
+
+        ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, x_g,
+                conv_kernel_size - 1, conv_channels, il, g.s0, ragged ? n_grp_seqs : -1);
+
+        ggml_tensor * state = nullptr;
+        if (lazy_mode != 1) {
+            if (states == nullptr) {
+                ggml_tensor * ssm_src = ssm_states_all;
+                if (lazy_mode == 2) {
+                    ssm_src = ggml_gated_delta_net_replay(ctx0, ssm_states_all, mctx_cur->get_rec_l(il), inp->lazy_info,
+                            (int) head_v_dim, (int) num_v_heads, (int) num_k_heads);
+                }
+                states = build_rs(inp, ssm_src, hparams.n_embd_s(), n_seqs);
+            }
+            state = ragged ? ggml_view_2d(ctx0, states, states->ne[0], n_grp_seqs, states->nb[1], states->nb[1] * g.s0)
+                           : states;
+            state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_grp_seqs);
+            cb(state, "state_predelta", il);
+        }
+
+        ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+        cb(conv_output_proper, "conv_output_raw", il);
+
+        ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+        cb(conv_output_silu, "conv_output_silu", il);
+
+        ggml_tensor * conv_qkv_mix = conv_output_silu;
+
+        int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, conv_channels);
+
+        // Extract the convolved Q, K, V from conv_output
+        ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_grp_tok, n_grp_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_k_dim),
+                nb1_qkv,
+                nb1_qkv * n_grp_tok,
+                0);
+
+        ggml_tensor * k_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_grp_tok, n_grp_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_k_dim),
+                nb1_qkv,
+                nb1_qkv * n_grp_tok,
+                head_k_dim * num_k_heads * ggml_element_size(conv_qkv_mix));
+
+        ggml_tensor * v_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_v_dim, num_v_heads, n_grp_tok, n_grp_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_v_dim),
+                nb1_qkv,
+                nb1_qkv * n_grp_tok,
+                ggml_row_size(conv_qkv_mix->type, 2 * head_k_dim * num_k_heads));
+
+        cb(q_conv, "q_conv", il);
+        cb(k_conv, "k_conv", il);
+        cb(v_conv, "v_conv", il);
+
+        const float eps_norm = hparams.f_norm_rms_eps;
+
+        q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+
+        // repeat to match shapes when head keys != value keys; unneeded with the fused GDN (and the deferred-rollback
+        // net)
+        if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch) && lazy_mode != 1) {
+            GGML_ASSERT(num_v_heads % num_k_heads == 0);
+            q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_grp_tok, n_grp_seqs);
+            k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_grp_tok, n_grp_seqs);
+        }
+
+        cb(q_conv, "q_conv_predelta", il);
+        cb(k_conv, "k_conv_predelta", il);
+        cb(v_conv, "v_conv_predelta", il);
+
+        ggml_tensor * output = nullptr;
+        if (lazy_mode == 1) {
+            output = ggml_gated_delta_net_lazy(ctx0, q_conv, k_conv, v_conv, gate_g, beta_g, ssm_states_all,
+                    mctx_cur->get_rec_l(il), inp->lazy_info);
+            output = ggml_reshape_4d(ctx0, output, head_v_dim, num_v_heads, n_grp_tok, n_grp_seqs);
+            cb(output, "attn_output", il);
+        } else {
+            output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate_g, beta_g, state, il, g.s0);
+        }
+        outputs.push_back(output);
     }
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
-    cb(conv_output_proper, "conv_output_raw", il);
-
-    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
-    cb(conv_output_silu, "conv_output_silu", il);
-
-    ggml_tensor * conv_qkv_mix = conv_output_silu;
-
-    int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, conv_channels);
-
-    // Extract the convolved Q, K, V from conv_output
-    ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_k_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            0);
-
-    ggml_tensor * k_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_k_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            head_k_dim * num_k_heads * ggml_element_size(conv_qkv_mix));
-
-    ggml_tensor * v_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_v_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            ggml_row_size(conv_qkv_mix->type, 2 * head_k_dim * num_k_heads));
-
-    cb(q_conv, "q_conv", il);
-    cb(k_conv, "k_conv", il);
-    cb(v_conv, "v_conv", il);
-
-    const float eps_norm = hparams.f_norm_rms_eps;
-
-    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
-
-    // repeat to match shapes when head keys != value keys; unneeded with the fused GDN (and the deferred-rollback net)
-    if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch) && lazy_mode != 1) {
-        GGML_ASSERT(num_v_heads % num_k_heads == 0);
-        q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
-        k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
+    ggml_tensor * output = outputs[0];
+    if (ragged) {
+        output = qwen4exp_concat_groups(ctx0, outputs, head_v_dim * num_v_heads);
+        output = ggml_reshape_4d(ctx0, output, head_v_dim, num_v_heads, n_seq_tokens, n_seqs_tok);
     }
 
-    cb(q_conv, "q_conv_predelta", il);
-    cb(k_conv, "k_conv_predelta", il);
-    cb(v_conv, "v_conv_predelta", il);
-
-    ggml_tensor * output = nullptr;
-    if (lazy_mode == 1) {
-        output = ggml_gated_delta_net_lazy(ctx0, q_conv, k_conv, v_conv, gate, beta, ssm_states_all,
-                mctx_cur->get_rec_l(il), inp->lazy_info);
-        output = ggml_reshape_4d(ctx0, output, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
-        cb(output, "attn_output", il);
-    } else {
-        output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
-    }
-
-    ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+    ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs_tok);
 
     // gated normalization, as self.norm(core_attn_out, z) in the reference
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
@@ -1896,15 +1975,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // strixllama: one column per token, not a batch per sequence (STRIX_GDN_OUT_2D=0: as upstream): with several
     // sequences decoding at once, a 3-D input made the projection a batched matrix-vector product per sequence
     static const bool out_2d = !getenv("STRIX_GDN_OUT_2D") || atoi(getenv("STRIX_GDN_OUT_2D")) != 0;
-    ggml_tensor * final_output = out_2d && n_seqs > 1
-        ? ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs)
-        : ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
+    ggml_tensor * final_output = out_2d && n_seqs_tok > 1
+        ? ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs_tok)
+        : ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs_tok);
     cb(final_output, "final_output", il);
 
     cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
     cb(cur, "linear_attn_out", il);
 
-    cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
+    cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs_tok);
 
     return cur;
 }
@@ -2127,22 +2206,29 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         ggml_tensor *        x,
         int64_t              state_cols,
         int64_t              channels,
-        int                  il) {
+        int                  il,
+        int64_t              s0,
+        int64_t              n_seqs_grp) {
     const auto * mctx_cur = inp->mctx;
 
-    const auto kv_head = mctx_cur->get_head();
+    // strixllama: the sequences of one group of a ragged ubatch are the sets from s0 on, in the cells from head + s0
+    const auto kv_head = mctx_cur->get_head() + s0;
 
-    const int64_t n_seqs    = ubatch.n_seqs;
-    const int64_t row_total = conv_states_all->ne[0];
+    const int64_t n_seqs_all = ubatch.n_seqs;
+    const int64_t n_seqs     = n_seqs_grp < 0 ? n_seqs_all : n_seqs_grp;
+    const int64_t row_total  = conv_states_all->ne[0];
 
     // the row is exactly this convolution's state, so the gather is reused as a whole
     GGML_ASSERT(state_cols * channels == row_total);
 
     auto it = rs_rows.find(conv_states_all);
     if (it == rs_rows.end()) {
-        it = rs_rows.emplace(conv_states_all, build_rs(inp, conv_states_all, row_total, n_seqs)).first;
+        it = rs_rows.emplace(conv_states_all, build_rs(inp, conv_states_all, row_total, n_seqs_all)).first;
     }
     ggml_tensor * rows = it->second;
+    if (n_seqs != n_seqs_all) {
+        rows = ggml_view_2d(ctx0, rows, row_total, n_seqs, rows->nb[1], rows->nb[1] * s0);
+    }
 
     ggml_tensor * state = ggml_reshape_3d(ctx0, rows, state_cols, channels, n_seqs);
     cb(state, "conv_state_at", il);
@@ -2265,23 +2351,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
-    // [hist + n_seq_tokens, hc_dim, n_seqs], tokens on ne[0]
-    ggml_tensor * padded = build_conv_state_at(inp, inp->mctx->get_p_l(il),
-            ggml_reshape_3d(ctx0, normalized, hc_dim, n_seq_tokens, n_seqs),
-            hist, hc_dim, il);
-
-    ggml_tensor * conv_out = nullptr;
+    // column k of the [kern, hc_dim] kernel is one weight per channel
+    std::vector<ggml_tensor *> w_taps;
     for (int64_t k = 0; k < kern; ++k) {
-        // tap k reads (kern-1-k)*dilation positions back
-        const int64_t start = hist - (kern - 1 - k) * dil;
-
-        ggml_tensor * shifted = ggml_cont(ctx0,
-                ggml_transpose(ctx0,
-                        ggml_view_3d(ctx0, padded, n_seq_tokens, hc_dim, n_seqs,
-                                padded->nb[1], padded->nb[2],
-                                ggml_row_size(padded->type, start))));
-
-        // column k of the [kern, hc_dim] kernel is one weight per channel
         ggml_tensor * wk = ggml_cont(ctx0,
                 ggml_view_2d(ctx0, model.layers[il].ple_conv1d, 1, hc_dim,
                         model.layers[il].ple_conv1d->nb[1],
@@ -2291,10 +2363,44 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
         if (wk->type != GGML_TYPE_F32) {
             wk = ggml_cast(ctx0, wk, GGML_TYPE_F32);
         }
-
-        ggml_tensor * term = ggml_mul(ctx0, shifted, wk);
-        conv_out = conv_out ? ggml_add(ctx0, conv_out, term) : term;
+        w_taps.push_back(wk);
     }
+
+    // strixllama: a ragged ubatch (llama_ubatch::ragged) runs the conv once per group of sequence sets with one token
+    // count, each on its own history; an equal-length ubatch is one group
+    const bool ragged = ubatch.ragged();
+    std::vector<ggml_tensor *> conv_parts;
+    for (const auto & g : qwen4exp_seq_groups(ubatch)) {
+        const int64_t n_grp_tok  = g.n_tok;
+        const int64_t n_grp_seqs = g.n_seqs;
+
+        ggml_tensor * x_g = ragged
+            ? ggml_view_3d(ctx0, normalized, hc_dim, n_grp_tok, n_grp_seqs,
+                    normalized->nb[1], normalized->nb[1] * n_grp_tok, normalized->nb[1] * g.t0)
+            : ggml_reshape_3d(ctx0, normalized, hc_dim, n_seq_tokens, n_seqs);
+
+        // [hist + n_seq_tokens, hc_dim, n_seqs], tokens on ne[0]
+        ggml_tensor * padded = build_conv_state_at(inp, inp->mctx->get_p_l(il), x_g,
+                hist, hc_dim, il, g.s0, ragged ? n_grp_seqs : -1);
+
+        ggml_tensor * conv_g = nullptr;
+        for (int64_t k = 0; k < kern; ++k) {
+            // tap k reads (kern-1-k)*dilation positions back
+            const int64_t start = hist - (kern - 1 - k) * dil;
+
+            ggml_tensor * shifted = ggml_cont(ctx0,
+                    ggml_transpose(ctx0,
+                            ggml_view_3d(ctx0, padded, n_grp_tok, hc_dim, n_grp_seqs,
+                                    padded->nb[1], padded->nb[2],
+                                    ggml_row_size(padded->type, start))));
+
+            ggml_tensor * term = ggml_mul(ctx0, shifted, w_taps[k]);
+            conv_g = conv_g ? ggml_add(ctx0, conv_g, term) : term;
+        }
+        conv_parts.push_back(conv_g);
+    }
+
+    ggml_tensor * conv_out = ragged ? qwen4exp_concat_groups(ctx0, conv_parts, hc_dim) : conv_parts[0];
 
     conv_out = ggml_silu(ctx0, conv_out);
     conv_out = ggml_reshape_3d(ctx0, ggml_cont(ctx0, conv_out), n_embd, hc, n_tokens);

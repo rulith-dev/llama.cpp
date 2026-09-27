@@ -88,6 +88,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
 
     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
+    // strixllama: s0 - the sequences are the ubatch's from set s0 on (a group of a ragged ubatch), their cells
+    // head + s0 on
     ggml_tensor * build_recurrent_attn(
             llm_graph_input_rs * inp,
             ggml_tensor *        ssm_states_all,
@@ -97,7 +99,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        g,
             ggml_tensor *        b,
             ggml_tensor *        s,
-            int                  il);
+            int                  il,
+            int64_t              s0 = 0);
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {
@@ -2442,14 +2445,17 @@ struct llama_model_qwen4exp : public llama_model_base {
         // build_rs writes the state tensor in place, so one gather per cache tensor is reused
         std::map<ggml_tensor *, ggml_tensor *> rs_rows;
 
-        // one conv history per cache tensor: delta-net and PLE each have their own
+        // one conv history per cache tensor: delta-net and PLE each have their own. strixllama: s0, n_seqs - the
+        // group of a ragged ubatch x holds (x [channels, tokens, n_seqs]); -1: all the ubatch's sequences
         ggml_tensor * build_conv_state_at(
              llm_graph_input_rs * inp,
                     ggml_tensor * conv_states_all,
                     ggml_tensor * x,
                         int64_t   state_cols,
                         int64_t   channels,
-                            int   il);
+                            int   il,
+                        int64_t   s0 = 0,
+                        int64_t   n_seqs = -1);
 
         ggml_tensor * build_inp_ple(
   const llama_memory_hybrid_idx_context * mctx_hyb);

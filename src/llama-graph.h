@@ -835,7 +835,10 @@ struct llm_graph_params {
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
         // first check the ubatch
+        // strixllama: a ragged ubatch builds its per-sequence parts per group of token counts; it carries a prompt, so
+        // a graph built for it is not worth keeping
         bool can_reuse_ubatch =
+            !ubatch.ragged() && !other.ubatch.ragged() &&
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
             ubatch.n_tokens     == other.ubatch.n_tokens &&
             ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &&

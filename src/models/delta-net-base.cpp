@@ -533,9 +533,10 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_tensor *        g,
         ggml_tensor *        b,
         ggml_tensor *        s,
-        int                  il) {
+        int                  il,
+        int64_t              s0) {
     const auto * mctx_cur   = inp->mctx;
-    const auto   kv_head    = mctx_cur->get_head();
+    const auto   kv_head    = mctx_cur->get_head() + s0;
     const uint32_t mem_size = mctx_cur->get_size();
 
     const int64_t S_v          = s->ne[0];

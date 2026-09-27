@@ -294,7 +294,18 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = get_mem_recr()->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                // strixllama: sequences of different lengths in one ubatch (llama_ubatch::ragged), where the model
+                // (qwen4exp, the only user of this memory) builds its recurrent layers per group of lengths;
+                // STRIX_RAGGED=0: the equal-length split
+                static const bool ragged = [] {
+                    const char * e = getenv("STRIX_RAGGED");
+                    return e == nullptr || atoi(e) != 0;
+                }();
+                if (ragged && unified && !balloc.has_coupled()) {
+                    ubatch = balloc.split_ragged(n_ubatch, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                } else {
+                    ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                }
             }
 
             if (ubatch.n_tokens == 0) {
