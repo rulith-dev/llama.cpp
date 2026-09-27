@@ -328,7 +328,7 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
-    GGML_UNUSED(ubatch);
+    set_lazy_input(ubatch, mctx);
 
     const int64_t n_rs = mctx->get_n_rs();
 
@@ -358,6 +358,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
     res &= gather_in_place == in_place(mctx, params.ubatch.n_seqs);
+    res &= lazy_mode == lazy_mode_for(mctx, params.ubatch);
 
     return res;
 }
@@ -1115,6 +1116,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
+    inp_rs->set_lazy_input(ubatch, mctx->get_recr());
+
     if (inp_rs->s_copy) {
         llama_host_write(inp_rs->s_copy);
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
@@ -1150,6 +1153,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
     // strixllama: whether the state gather may be skipped is part of the graph (llm_graph_input_rs::gather_in_place)
     res &= inp_rs->gather_in_place == llm_graph_input_rs::in_place(mctx->get_recr(), params.ubatch.n_seqs);
+    res &= inp_rs->lazy_mode == llm_graph_input_rs::lazy_mode_for(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -1165,6 +1169,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+
+    inp_rs->set_lazy_input(ubatch, mctx->get_recr());
 
     if (inp_rs->s_copy) {
         llama_host_write(inp_rs->s_copy);
@@ -1197,6 +1203,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
     // strixllama: whether the state gather may be skipped is part of the graph (llm_graph_input_rs::gather_in_place)
     res &= inp_rs->gather_in_place == llm_graph_input_rs::in_place(mctx->get_recr(), params.ubatch.n_seqs);
+    res &= inp_rs->lazy_mode == llm_graph_input_rs::lazy_mode_for(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -1241,6 +1248,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+
+    inp_rs->set_lazy_input(ubatch, mctx->get_recr());
 
     if (inp_rs->s_copy) {
         llama_host_write(inp_rs->s_copy);
@@ -1287,6 +1296,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
     // strixllama: whether the state gather may be skipped is part of the graph (llm_graph_input_rs::gather_in_place)
     res &= inp_rs->gather_in_place == llm_graph_input_rs::in_place(mctx->get_recr(), params.ubatch.n_seqs);
+    res &= inp_rs->lazy_mode == llm_graph_input_rs::lazy_mode_for(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -3559,7 +3569,35 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->rs_z = mctx_cur->get_rs_z();
     inp->gather_in_place = llm_graph_input_rs::in_place(mctx_cur, n_seqs);
 
+    inp->lazy_mode = llm_graph_input_rs::lazy_mode_for(mctx_cur, ubatch);
+    if (inp->lazy_mode != 0) {
+        // the replay (mode 2) also brings up to date the states build_rs copies along beyond the batch's cells
+        inp->lazy_info = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 5, inp->lazy_mode == 1 ? n_seqs : n_rs);
+        ggml_set_input(inp->lazy_info);
+        ggml_set_name(inp->lazy_info, "inp_gdn_lazy");
+    }
+
+
     return inp;
+}
+
+int llm_graph_input_rs::lazy_mode_for(const llama_memory_recurrent_context * mctx, const llama_ubatch & ubatch) {
+    if (mctx == nullptr || !mctx->lazy_on() || ubatch.n_seqs == 0) {
+        return 0;
+    }
+    // a batch no longer than a verify per sequence, each in its own cell, none starting from a zeroed state, no other
+    // cell's state to copy along (build_rs does that, and the deferred-rollback net goes without it)
+    const bool is_short = ubatch.n_seq_tokens <= mctx->get_n_rs_seq() + 1;
+    return is_short && mctx->get_rs_z() < 0 && mctx->get_n_rs() == ubatch.n_seqs &&
+           mctx->s_copy_own_cell((int) ubatch.n_seqs) ? 1 : 2;
+}
+
+void llm_graph_input_rs::set_lazy_input(const llama_ubatch * ubatch, const llama_memory_recurrent_context * mctx_cur) const {
+    if (lazy_mode == 0 || lazy_info == nullptr) {
+        return;
+    }
+    llama_host_write(lazy_info);
+    mctx_cur->lazy_info((int32_t *) lazy_info->data, (int) lazy_info->ne[1], lazy_mode == 1, ubatch->n_seq_tokens);
 }
 
 bool llm_graph_input_rs::in_place(const llama_memory_recurrent_context * mctx, int64_t n_seqs) {

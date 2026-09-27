@@ -1960,6 +1960,191 @@ private:
         return nullptr;
     }
 
+    // strixllama: how many positions of `tokens` a slot's conversation can hand over - attention rows and the
+    // recurrent state with them. The slot the prompt goes to keeps its state where it stands, so a prompt that only
+    // appends to its conversation keeps all it shares; any other slot hands over a checkpoint (or, idle and standing
+    // exactly there, its current state). One token is always left to process.
+    int64_t restore_point(const server_slot & s, const server_tokens & tokens, bool own) const {
+        if (s.prompt.tokens.empty() || tokens.empty()) {
+            return 0;
+        }
+        const int64_t lcp = (int64_t) s.prompt.tokens.get_common_prefix(tokens);
+        const int64_t n   = s.prompt.n_tokens();
+        if (lcp == n && lcp < (int64_t) tokens.size() && (own || !s.is_processing())) {
+            return lcp;
+        }
+        int64_t best = 0;
+        for (const auto & c : s.prompt.checkpoints) {
+            if (c.n_tokens <= lcp && c.n_tokens < (int64_t) tokens.size() && c.n_tokens > best) {
+                best = c.n_tokens;
+            }
+        }
+        return best;
+    }
+
+    // strixllama: the other slot (idle or busy) whose conversation hands `tokens` the most positions
+    server_slot * best_prefix_source(const server_slot & dst, const server_tokens & tokens, int64_t & n_best) {
+        server_slot * best = nullptr;
+        n_best = 0;
+        for (auto & s : slots) {
+            if (&s == &dst) {
+                continue;
+            }
+            const int64_t n = restore_point(s, tokens, false);
+            if (n > n_best) {
+                n_best = n;
+                best   = &s;
+            }
+        }
+        return best;
+    }
+
+    // strixllama: the first n positions of another slot's conversation, brought into dst: its attention rows through
+    // the host (llama_strix_kv_get/set_rows, 4096 positions at a time), and the recurrent state at n from its
+    // checkpoint there - or from the slot itself when it is idle and stands at n. A prefix another conversation has
+    // already computed - a shared system prompt, the point a sub-agent forks from - is then read instead of computed
+    // again: tens of milliseconds for 10K positions against ~10 s of prefill. False, and dst emptied, on failure.
+    // strixllama: whether this server's caches can hand rows by position between slots at all (llama_strix_kv_*)
+    bool can_copy_rows() const {
+        return llama_strix_kv_row_size(ctx_tgt) > 0 && (!ctx_dft || llama_strix_kv_row_size(ctx_dft) > 0);
+    }
+
+    // strixllama: whether copy_prefix could take the first n positions of src (rows by position hold no image)
+    bool can_copy_prefix(const server_slot & src, int64_t n) const {
+        if (n <= 0 || !can_copy_rows() || n > (int64_t) src.prompt.n_tokens()) {
+            return false;
+        }
+        const auto media = src.prompt.tokens.find_next_media_chunk(0);
+        return media.first == nullptr || (int64_t) media.second >= n;
+    }
+
+    bool copy_prefix(server_slot & dst, server_slot & src, int64_t n) {
+        const size_t row_tgt = llama_strix_kv_row_size(ctx_tgt);
+        const size_t row_dft = ctx_dft ? llama_strix_kv_row_size(ctx_dft) : 0;
+        if (!can_copy_prefix(src, n)) {
+            return false;
+        }
+        const int64_t t0 = ggml_time_us();
+
+        common_prompt_checkpoint own;
+        common_prompt_checkpoint * ck = nullptr;
+        for (auto & c : src.prompt.checkpoints) {
+            if (c.n_tokens == n) {
+                ck = &c;
+            }
+        }
+        if (ck == nullptr) {
+            if (src.is_processing() || (int64_t) src.prompt.n_tokens() != n) {
+                return false;
+            }
+            own.update_pos(n, llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), src.id),
+                              llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), src.id));
+            own.update_tgt(ctx_tgt, src.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            own.update_dft(ctx_dft, src.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            common_speculative_get_state(spec.get(), src.id, own.data_spec);
+            ck = &own;
+        } else if (ck->data_tgt.empty()) {             // handed back to the disk tier while its slot was idle
+            if (!prompt_cache || !prompt_cache->ckpt_page_in(src.prompt.tokens, src.ckpt_paged, *ck)) {
+                return false;
+            }
+        }
+
+        llama_tokens text = src.prompt.tokens.get_text_tokens();
+        text.resize((size_t) n);
+
+        dst.prompt_clear();
+        bool ok = llama_strix_kv_alloc(ctx_tgt, dst.id, text.data(), (int32_t) n) &&
+                  (!ctx_dft || llama_strix_kv_alloc(ctx_dft, dst.id, text.data(), (int32_t) n));
+        // the rows go device to device, queued behind the graphs (nothing waited for); through the host only when
+        // a cache cannot do that (or STRIX_COPY_ROWS_HOST=1, for comparing the two)
+        static const bool host_only = getenv("STRIX_COPY_ROWS_HOST") && atoi(getenv("STRIX_COPY_ROWS_HOST")) != 0;
+        bool on_device = ok && !host_only && llama_strix_kv_copy_rows(ctx_tgt, src.id, dst.id, 0, (int32_t) n) &&
+                         (!ctx_dft || llama_strix_kv_copy_rows(ctx_dft, src.id, dst.id, 0, (int32_t) n));
+        std::vector<uint8_t> buf;
+        for (int64_t p0 = 0; ok && !on_device && p0 < n; p0 += 4096) {
+            const int32_t k = (int32_t) std::min<int64_t>(4096, n - p0);
+            buf.resize(row_tgt * k);
+            ok = llama_strix_kv_get_rows(ctx_tgt, src.id, (llama_pos) p0, k, buf.data(), buf.size()) &&
+                 llama_strix_kv_set_rows(ctx_tgt, dst.id, (llama_pos) p0, k, buf.data(), k);
+            if (ok && ctx_dft) {
+                buf.resize(row_dft * k);
+                ok = llama_strix_kv_get_rows(ctx_dft, src.id, (llama_pos) p0, k, buf.data(), buf.size()) &&
+                     llama_strix_kv_set_rows(ctx_dft, dst.id, (llama_pos) p0, k, buf.data(), k);
+            }
+        }
+        ok = ok && llama_state_seq_set_data_ext(ctx_tgt, ck->data_tgt.data(), ck->data_tgt.size(), dst.id,
+                                                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == ck->data_tgt.size();
+        ok = ok && (!ctx_dft || ck->data_dft.empty() ||
+                    llama_state_seq_set_data_ext(ctx_dft, ck->data_dft.data(), ck->data_dft.size(), dst.id,
+                                                 LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == ck->data_dft.size());
+        if (!ok) {
+            SLT_WRN(dst, "could not copy %" PRId64 " positions from slot %d; processing the prompt instead\n", n, src.id);
+            dst.prompt_clear();
+            return false;
+        }
+        common_speculative_set_state(spec.get(), dst.id, ck->data_spec);
+
+        dst.prompt.tokens = src.prompt.tokens.clone();
+        dst.prompt.tokens.keep_first((size_t) n);
+        dst.prompt.checkpoints.clear();
+        dst.prompt.checkpoints.push_back(*ck);         // a rewind to it works here too
+        dst.prompt.checkpoints.back().id_task = -1;
+
+        SLT_INF(dst, "copied %" PRId64 " positions from slot %d (%s, %.3f GiB, %s) in %.0f ms\n", n, src.id,
+                ck == &own ? "its state" : "its checkpoint", (double) n * (row_tgt + row_dft) / (1024.0 * 1024.0 * 1024.0),
+                on_device ? "on the device" : "through the host", (ggml_time_us() - t0) / 1000.0);
+        return true;
+    }
+
+    // strixllama: a prompt whose prefix a busy slot is computing right now - sub-agents started together with one
+    // system prompt - waits until that slot is past its anchor there (the first or the last user message of its prompt,
+    // which always get a checkpoint), then copies it (copy_prefix) instead of computing it a second time alongside. The
+    // same GPU does the work either way: the waiting prompt starts no later, and the one it waits for finishes sooner.
+    // STRIX_PREFIX_WAIT=0 turns it off.
+    bool wait_for_prefix(server_task & task) {
+        static const bool on = !getenv("STRIX_PREFIX_WAIT") || atoi(getenv("STRIX_PREFIX_WAIT")) != 0;
+        task.wait_slot = -1;
+        if (!on || task.tokens.empty() || task.type != SERVER_TASK_TYPE_COMPLETION || task.id_slot != -1 || task.is_parent() ||
+                params_base.n_ctx_checkpoints <= 0 || !can_copy_rows()) {
+            return false;
+        }
+        if (task.wait_t0 != 0 && ggml_time_us() - task.wait_t0 > 120 * 1000 * 1000) {
+            SRV_WRN("task %d waited two minutes for another slot's prefix; processing it instead\n", task.id);
+            return false;
+        }
+        const auto media = task.tokens.find_next_media_chunk(0);
+        int64_t n_now = 0;                             // what is on offer already
+        for (const auto & s : slots) {
+            n_now = std::max(n_now, restore_point(s, task.tokens, !s.is_processing()));
+        }
+        for (const auto & s : slots) {
+            if ((s.state != SLOT_STATE_STARTED && s.state != SLOT_STATE_PROCESSING_PROMPT) || !s.task) {
+                continue;
+            }
+            const int64_t lcp = (int64_t) s.task->tokens.get_common_prefix(task.tokens);
+            const auto & spans = s.task->params.message_spans;
+            int64_t anchor = -1;
+            for (const int64_t p : { (int64_t) spans.first_user_message_pos(), (int64_t) spans.last_user_message_pos() }) {
+                if (p > 0 && p <= lcp && p < (int64_t) task.tokens.size() && p > anchor) {
+                    anchor = p;
+                }
+            }
+            if (anchor < n_now + 1024 || (int64_t) s.prompt.n_tokens() > anchor ||
+                    (media.first != nullptr && (int64_t) media.second < anchor)) {
+                continue;                              // not worth a wait, already there, or no copy of it could follow
+            }
+            task.wait_slot = s.id;
+            task.wait_n    = anchor;
+            if (task.wait_t0 == 0) {
+                task.wait_t0 = ggml_time_us();
+                SRV_INF("task %d waits for slot %d to reach %" PRId64 " tokens of the prefix they share (%" PRId64 " on offer now)\n",
+                        task.id, s.id, anchor, n_now);
+            }
+            return true;
+        }
+        return false;
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
@@ -2026,6 +2211,23 @@ private:
                 if (f_keep < 0.5f) {
                     update_cache = true;
                 }
+
+                // strixllama: the slot that shares the most holds another conversation, a quarter or more of which
+                // would be cut: a free slot takes the prompt instead, the shared part is copied into it (copy_prefix
+                // below), and that conversation stays where it is. The free slot still looks in the RAM and disk
+                // tiers (update_cache), which may hold more of this prompt than the shared part. Not when the shared
+                // part could not be copied (an image in it) and is worth keeping: then it is cut from that slot
+                const int64_t n_shared = restore_point(*ret, task.tokens, false);
+                if (task.id_slot == -1 && f_keep < 0.75f && (n_shared < 256 || can_copy_prefix(*ret, n_shared))) {
+                    for (server_slot & slot : slots) {
+                        if (!slot.is_processing() && slot.prompt.tokens.empty()) {
+                            SLT_INF(slot, "free slot taken instead of slot %d (f_keep = %.3f); the shared prefix is copied\n", ret->id, f_keep);
+                            ret = &slot;
+                            update_cache = true;
+                            break;
+                        }
+                    }
+                }
             }
         }
 
@@ -2060,10 +2262,15 @@ private:
                 return ret;
             }
 
+            // strixllama: another slot's conversation - idle or busy - that hands this prompt more positions than the
+            // chosen slot keeps (copy_prefix): found first, so that making room does not purge it
+            int64_t n_src = 0;
+            server_slot * src = task.type == SERVER_TASK_TYPE_COMPLETION ? best_prefix_source(*ret, task.tokens, n_src) : nullptr;
+
             // room for this prompt and a margin to generate into, before anything is restored
             const size_t margin = task.params.n_predict > 0 ? (size_t) std::min<int32_t>(task.params.n_predict, 32768) : 4096;
             if (task.type == SERVER_TASK_TYPE_COMPLETION) {
-                make_room(*ret, task.tokens.size() + margin);
+                make_room(*ret, task.tokens.size() + margin, src);
             }
 
             update_cache = update_cache && prompt_cache;
@@ -2079,13 +2286,26 @@ private:
                 ret->prompt_save(*prompt_cache);
 
                 // an entry longer than the prompt (an edit deep in a long conversation) needs room for all of it
-                if (!ret->prompt_load(*prompt_cache, task.tokens, [&](size_t n_entry) { make_room(*ret, n_entry + margin); })) {
+                if (!ret->prompt_load(*prompt_cache, task.tokens, [&](size_t n_entry) { make_room(*ret, n_entry + margin, src); })) {
                     ret->prompt_clear();
                 }
 
                 prompt_cache->update();
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+            }
+
+            if (src != nullptr) {
+                const int64_t n_own = restore_point(*ret, task.tokens, true);
+                if (n_src >= n_own + 256) {
+                    // what the slot holds goes to the prompt cache first: its own conversation, or the entry the
+                    // load just took out of the RAM tier (entries leave it when they are restored)
+                    if (!ret->prompt.tokens.empty() && prompt_cache) {
+                        ret->prompt_save(*prompt_cache);
+                        prompt_cache->update();
+                    }
+                    copy_prefix(*ret, *src, n_src);
+                }
             }
         }
 
@@ -2155,7 +2375,7 @@ private:
     // disk first - until the other conversations and this one fit in the unified pool. Kept conversations can
     // fill it, and a restore from the cache needs free cells: without them it fails and the whole prompt is
     // processed instead, where the decode path would only have purged idle slots once prefill ran out.
-    void make_room(const server_slot & target, size_t need) {
+    void make_room(const server_slot & target, size_t need, const server_slot * keep = nullptr) {
         if (!params_base.kv_unified) {
             return;
         }
@@ -2172,7 +2392,7 @@ private:
             }
             server_slot * victim = nullptr;
             for (auto & slot : slots) {
-                if (&slot == &target || slot.is_processing() || slot.prompt.n_tokens() == 0) {
+                if (&slot == &target || &slot == keep || slot.is_processing() || slot.prompt.n_tokens() == 0) {
                     continue;
                 }
                 if (!victim || slot.t_last_used < victim->t_last_used) {
@@ -2833,37 +3053,57 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
+    // strixllama: how far a turn start must be from the last checkpoint to get one of its own. At least
+    // --checkpoint-min-step, and a quarter of the way to the end of the prompt: dense near the end, where edits and
+    // regenerations land, sparse far back (a 100K prompt of short turns gets ~10)
+    int64_t anchor_spacing(int64_t pos, int64_t n_prompt) const {
+        return std::max<int64_t>(params_base.checkpoint_min_step, (n_prompt - pos) / 4);
+    }
+
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         strixllama_fault("ckpt");
         const int id_task = slot.task->id;
 
-        // evict checkpoints within min-step of a previous checkpoint, unless they were
-        // created by the current task
-        // only when the list is full, otherwise short prompts keep just the oldest checkpoint
-        int64_t last = -1;
-        for (auto it = slot.prompt.checkpoints.begin();
-                slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
-                it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
-                SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                        it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
-
-                it = slot.prompt.checkpoints.erase(it);
-                continue;
+        // strixllama: which checkpoint goes when the list is full. The earliest stays: it is where the system prompt
+        // ends (the first user message), which every conversation that starts with it comes back to. Of the others,
+        // this task's stay if they can, and the one to go is the one whose loss costs least: a rewind into the
+        // stretch it starts replays from the checkpoint before it instead, and rewinds land near the end more often
+        // than far back - so its value is (gap before) x (gap after) / (distance from the end). Upstream erased
+        // every other task's checkpoint within min-step of the previous one, which left the first and this task's
+        // only, and a second conversation with the same 10K system prompt went back to the first checkpoint
+        auto & ckpts = slot.prompt.checkpoints;
+        while (!ckpts.empty() && ckpts.size() >= (size_t) params_base.n_ctx_checkpoints) {
+            ckpts.sort([](const common_prompt_checkpoint & a, const common_prompt_checkpoint & b) {
+                return a.n_tokens < b.n_tokens;
+            });
+            std::vector<std::list<common_prompt_checkpoint>::iterator> at;
+            for (auto it = ckpts.begin(); it != ckpts.end(); ++it) {
+                at.push_back(it);
             }
-
-            last = it->n_tokens;
-            ++it;
-        }
-
-        while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
-
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
-
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            const int64_t n_end = slot.prompt.n_tokens();
+            size_t victim = at.size();
+            for (int pass = 0; pass < 2 && victim == at.size(); ++pass) {
+                double v_min = 0.0;
+                for (size_t i = 1; i < at.size(); ++i) {
+                    if (pass == 0 && at[i]->id_task == id_task) {
+                        continue;
+                    }
+                    const int64_t n_i  = at[i]->n_tokens;
+                    const int64_t prev = at[i - 1]->n_tokens;
+                    const int64_t next = i + 1 < at.size() ? at[i + 1]->n_tokens : std::max<int64_t>(n_end, n_i);
+                    const double v = double(n_i - prev + 1) * double(next - n_i + 1) / double(std::max<int64_t>(n_end - n_i, 0) + 4096);
+                    if (victim == at.size() || v < v_min) {
+                        v_min  = v;
+                        victim = i;
+                    }
+                }
+            }
+            if (victim == at.size()) {
+                victim = 0;                            // a list of one
+            }
+            SLT_INF(slot, "erasing context checkpoint at n_tokens = %" PRId64 " (%zu of %zu, size = %.3f MiB)\n",
+                    at[victim]->n_tokens, victim + 1, at.size(), (float) at[victim]->size() / 1024 / 1024);
+            ckpts.erase(at[victim]);
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
@@ -2888,8 +3128,14 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        const int64_t t_ck0 = ggml_time_us();
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        const int64_t t_ck1 = ggml_time_us();
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (getenv("STRIX_CKPT_TIMING")) {
+            SLT_INF(slot, "checkpoint at %" PRId64 ": target %.1f ms (%.1f MiB), draft %.1f ms (%.1f MiB)\n", cur.n_tokens,
+                    (t_ck1 - t_ck0) / 1000.0, cur.data_tgt.size() / 1048576.0, (ggml_time_us() - t_ck1) / 1000.0, cur.data_dft.size() / 1048576.0);
+        }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
@@ -2922,6 +3168,12 @@ private:
                     }
 
                     const int id_task = task.id;
+
+                    // strixllama: another slot is computing this prompt's prefix right now: wait for it
+                    if (wait_for_prefix(task)) {
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
 
                     server_slot * slot = get_available_slot(task);
 
@@ -3394,6 +3646,20 @@ private:
                     slot.persist_runs(*prompt_cache, /* leaving = */ false, /* wait = */ false);
                 }
             }
+        }
+
+        // strixllama: prompts waiting for another slot's prefix (wait_for_prefix) go back to the queue once that slot
+        // is past it, has left that prompt, or two minutes went by
+        {
+            const int64_t now = ggml_time_us();
+            queue_tasks.pop_deferred_if([&](const server_task & t) {
+                if (t.wait_slot < 0 || t.wait_slot >= (int) slots.size()) {
+                    return false;
+                }
+                const auto & s = slots[t.wait_slot];
+                return (s.state != SLOT_STATE_STARTED && s.state != SLOT_STATE_PROCESSING_PROMPT) ||
+                       (int64_t) s.prompt.n_tokens() > t.wait_n || now - t.wait_t0 > 120 * 1000 * 1000;
+            });
         }
 
         // check if all slots are idle
@@ -4044,7 +4310,11 @@ private:
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
+                                        const int64_t t_ld0 = ggml_time_us();
                                         it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        if (getenv("STRIX_CKPT_TIMING")) {
+                                            SLT_INF(slot, "checkpoint at %" PRId64 " restored in %.1f ms\n", it->n_tokens, (ggml_time_us() - t_ld0) / 1000.0);
+                                        }
                                         it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
@@ -4214,6 +4484,30 @@ private:
 
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
+                    // strixllama: anchors, the points a later prompt forks from. The first user message is where the
+                    // system prompt ends, which every conversation that starts with it comes back to; the other turn
+                    // starts get a checkpoint when far enough from the last one, the spacing shrinking towards the
+                    // end of the prompt, where edits and regenerations land (see anchor_spacing)
+                    const auto first_user_pos = spans.first_user_message_pos();
+                    const int64_t n_prompt_all = slot.task->n_tokens();
+                    // the checkpoint n_ubatch before the end is upstream's cover for an edit near the end of a long
+                    // last message; the last message's own start covers it when that is within the same distance
+                    const bool ubatch_offset = !(last_user_pos >= 0 && n_prompt_all - last_user_pos <= 4 + (int64_t) n_ubatch);
+                    // the checkpoint the anchors below are spaced from: the latest, or this batch's own start when that
+                    // gets one - it is made only once the batch is filled, and spacing from the older one cut a short
+                    // batch at the next turn start that then got no checkpoint
+                    const int64_t batch_start = slot.prompt.n_tokens();
+                    int64_t ckpt_ref = slot.prompt.checkpoints.empty() ? -1 : slot.prompt.checkpoints.back().n_tokens;
+                    if (do_checkpoint && batch_start > 0) {
+                        const bool start_anchor = spans.is_turn_start(batch_start) && (batch_start == first_user_pos ||
+                                batch_start == last_user_pos || ckpt_ref < 0 ||
+                                batch_start >= ckpt_ref + anchor_spacing(batch_start, n_prompt_all));
+                        const bool start_offset = batch_start == n_prompt_all - std::min<int64_t>(n_batch, 4) ||
+                                (ubatch_offset && batch_start == n_prompt_all - std::min<int64_t>(n_batch, 4 + n_ubatch));
+                        if (start_anchor || start_offset) {
+                            ckpt_ref = batch_start;
+                        }
+                    }
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
@@ -4241,12 +4535,13 @@ private:
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
 
-                        // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
-                            const auto pos = slot.prompt.n_tokens();
-                            const auto & checkpoints = slot.prompt.checkpoints;
+                        // break at the anchors: the first and the last user message, and the other turn starts
+                        // far enough from the last checkpoint
+                        if (do_checkpoint && spans.is_turn_start(slot.prompt.n_tokens())) {
+                            const int64_t pos = slot.prompt.n_tokens();
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            if (pos == last_user_pos || pos == first_user_pos || ckpt_ref < 0 ||
+                                    pos >= ckpt_ref + anchor_spacing(pos, n_prompt_all)) {
                                 break;
                             }
                         }
@@ -4261,6 +4556,9 @@ private:
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
+                                if (offset != 4 && !ubatch_offset) {
+                                    continue;
+                                }
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
@@ -4304,8 +4602,15 @@ private:
 
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
 
-                    const bool is_user_start = spans.is_user_start(n_tokens_start);
+                    const bool is_user_start = spans.is_turn_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
+                    // strixllama: the batch starts at an anchor (see first_user_pos above), or at one of the offsets
+                    // before the end the loop cut it at
+                    const bool is_anchor = is_user_start && (n_tokens_start == first_user_pos || is_last_user_message ||
+                            slot.prompt.checkpoints.empty() ||
+                            n_tokens_start >= slot.prompt.checkpoints.back().n_tokens + anchor_spacing(n_tokens_start, n_prompt_all));
+                    const bool is_end_offset = n_tokens_start == n_prompt_all - std::min<int64_t>(n_batch, 4) ||
+                            (ubatch_offset && n_tokens_start == n_prompt_all - std::min<int64_t>(n_batch, 4 + n_ubatch));
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
@@ -4340,11 +4645,10 @@ private:
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
-                    // no need to create checkpoints that are too close together, unless it's the last user message
-                    do_checkpoint = do_checkpoint && (
-                            slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
-                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                    // strixllama: at the anchors and the offsets before the end only - not at every batch that starts
+                    // within n_ubatch of the end, and not at turn starts closer to the last checkpoint than the spacing
+                    do_checkpoint = do_checkpoint && (is_anchor || is_end_offset ||
+                            (slot.prompt.checkpoints.empty() && near_prompt_end));
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not

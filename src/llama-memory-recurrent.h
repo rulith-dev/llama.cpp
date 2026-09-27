@@ -82,6 +82,32 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // strixllama: deferred rollback for the gated delta net (ggml_gated_delta_net_lazy; STRIX_GDN_LAZY=0: off). A verify batch
+    // leaves the state row of its cell as it found it and records per token what a replay needs; the next batch replays
+    // the records its rollback kept. Per recurrent layer a record buffer [rec_floats, 1 + n_rs_seq, 2 * size] (two sets
+    // per cell: the next batch reads one and writes the other), and per cell how many records its last batch left - 0
+    // means its rows hold the state as the plain net leaves them (slot rs_idx of the cell) - and which set holds them.
+    uint32_t rec_floats = 0;
+    int32_t  gdn_s  = 0;      // S_v = S_k
+    int32_t  gdn_hv = 0;      // value heads
+    int32_t  gdn_hk = 0;      // key heads
+    std::vector<ggml_tensor *> rec_l;
+    std::vector<uint32_t>      rec_n;
+    std::vector<uint8_t>       rec_set;
+
+    bool lazy_on() const { return rec_floats > 0; }
+
+    // the records a cell's sequence would replay: its last batch's, less the rollback
+    uint32_t rec_pending(uint32_t cell) const;
+
+    // the state of `cell` for layer il as the plain net would hold it, computed from its row and records on the host
+    // (the same fmaf as the kernels): what state_write saves, and what seq_cp copies
+    void rec_materialize(uint32_t cell, int32_t il, std::vector<float> & out) const;
+
+    // the cell's state moved to its slot-0 rows (all recurrent tensors), its records and its sequences' rollback
+    // dropped: the plain net's view of it is right from then on. For cells two sequences share (seq_cp)
+    void rec_flatten(uint32_t cell);
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -180,6 +206,20 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    ggml_tensor * get_rec_l(int32_t il) const;
+    bool lazy_on() const;
+    uint32_t get_n_rs_seq() const;
+    int32_t gdn_s() const;
+    int32_t gdn_hv() const;
+    int32_t gdn_hk() const;
+
+    // strixllama: the per-cell input of the deferred-rollback net (lazy = true, n = n_seqs) or of the replay that brings
+    // the states up to date before the plain net (lazy = false, n = n_rs: the extras build_rs copies along too): row
+    // read, row written, records replayed, set read, set written - see llama_memory_recurrent::rec_l. Reads the rollback
+    // index without consuming it (s_copy does that), and moves the cells on: for the lazy net they hold n_seq_tokens
+    // records in the other set afterwards, else none.
+    void lazy_info(int32_t * info, int n, bool lazy, uint32_t n_seq_tokens) const;
 
     // strixllama: whether every i < n reads its state from a row of its own cell (head + i: the newest state, or a
     // rollback snapshot of it), the cell its new state is written to. Unlike s_copy it consumes no rollback index

@@ -286,6 +286,17 @@ public:
     // s_copy names directly instead. Part of the graph, so it must match for reuse
     bool gather_in_place = false;
     static bool in_place(const llama_memory_recurrent_context * mctx, int64_t n_seqs);
+
+    // strixllama: deferred rollback for the gated delta net (llama_memory_recurrent::rec_l). 0 = off, 1 = the batch
+    // runs the deferred-rollback net (a short batch: each sequence no longer than a verify, in its own cell), 2 = the
+    // plain net, after a replay that brings the states with records up to date. Part of the graph, so it must match
+    // for reuse; lazy_info is its per-sequence input
+    int lazy_mode = 0;
+    ggml_tensor * lazy_info = nullptr;  // I32 [5, n_seqs]
+    static int lazy_mode_for(const llama_memory_recurrent_context * mctx, const llama_ubatch & ubatch);
+    // fills lazy_info (before s_copy consumes the rollback index). The context is passed in: a hybrid input's can_reuse
+    // updates its own context, not this one's
+    void set_lazy_input(const llama_ubatch * ubatch, const llama_memory_recurrent_context * mctx_cur) const;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {

@@ -3024,10 +3024,18 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_GATED_DELTA_NET:
                     {
-                        const int64_t S_v = node->src[2]->ne[0];
-                        const int64_t K   = ggml_get_op_params_i32(node, 0);
-                        const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
-                        cur = per_thread * sizeof(float) * n_tasks;
+                        // strixllama: op_params[1] 1 = deferred rollback (a state and a delta per thread), 2 = the
+                        // replay alone (in place, no q)
+                        const int mode = ggml_get_op_params_i32(node, 1);
+                        if (mode == 2) {
+                            cur = 0;
+                        } else {
+                            const int64_t S_v = node->src[2]->ne[0];
+                            const int64_t K   = ggml_get_op_params_i32(node, 0);
+                            const int64_t per_thread = mode == 1 ? S_v + S_v * S_v + CACHE_LINE_SIZE_F32
+                                                                 : S_v + (K > 1 ? S_v * S_v : 0);
+                            cur = per_thread * sizeof(float) * n_tasks;
+                        }
                     } break;
                 case GGML_OP_COUNT:
                     {

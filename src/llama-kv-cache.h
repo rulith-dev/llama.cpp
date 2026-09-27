@@ -242,6 +242,9 @@ public:
     bool   seq_rows_get(llama_seq_id seq_id, llama_pos p0, uint32_t n, uint8_t * dst) const;
     // the same the other way; src is laid out for src_rows positions, of which the first n go in
     bool   seq_rows_set(llama_seq_id seq_id, llama_pos p0, uint32_t n, const uint8_t * src, uint32_t src_rows);
+    // the rows of positions [p0, p0 + n) of seq_src into the cells seq_dst holds for them (seq_alloc), device to
+    // device on the stream the graphs run on: no host round trip, nothing waited for
+    bool   seq_rows_copy(llama_seq_id seq_src, llama_seq_id seq_dst, llama_pos p0, uint32_t n);
     // seq_id loses its cells and gets cells for positions [0, n), as text tokens `tokens`, with no data yet - in
     // one run, after a rebalance if need be, unless sinfo_in gives a mirrored cache the other's layout
     // n_pos: the position sections the text batch carried - the owner's, so that a cache mirroring another one (the

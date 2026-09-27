@@ -84,6 +84,8 @@ public:
     size_t kv_row_size() const;
     bool   kv_rows_get(llama_seq_id seq_id, llama_pos p0, uint32_t n, uint8_t * dst) const;
     bool   kv_rows_set(llama_seq_id seq_id, llama_pos p0, uint32_t n, const uint8_t * src, uint32_t src_rows);
+    // strixllama: the rows of seq_src at positions [p0, p0 + n) into seq_dst's cells for them (kv_alloc), on the device
+    bool   kv_rows_copy(llama_seq_id seq_src, llama_seq_id seq_dst, llama_pos p0, uint32_t n);
     // seq_id loses everything it held and gets attention and indexer cells for positions [0, n) of `tokens`
     bool   kv_alloc(llama_seq_id seq_id, const llama_token * tokens, uint32_t n);
 

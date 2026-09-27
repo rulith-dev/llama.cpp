@@ -101,6 +101,17 @@ void server_queue::pop_deferred_task(int id_slot) {
                 break;
             }
         }
+        // strixllama: then the first that waits for a slot rather than for another slot's prefix (wait_slot): that
+        // one would only be deferred again, and the free slot would stay free under the tasks behind it
+        for (auto it = queue_tasks_deferred.begin(); !found && it != queue_tasks_deferred.end(); ++it) {
+            if (it->wait_slot < 0) {
+                QUE_DBG("pop deferred task, id_task = %d\n", it->id);
+                queue_tasks.emplace_front(std::move(*it));
+                queue_tasks_deferred.erase(it);
+                found = true;
+                break;
+            }
+        }
         // if not tasks found using the slot, just pop the first deferred task (default behavior)
         if (!found) {
             QUE_DBG("pop deferred task, id_task = %d\n", queue_tasks_deferred.front().id);
@@ -110,6 +121,25 @@ void server_queue::pop_deferred_task(int id_slot) {
     }
     time_last_task = ggml_time_ms();
     condition_tasks.notify_one();
+}
+
+void server_queue::pop_deferred_if(const std::function<bool(const server_task &)> & ready) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    bool moved = false;
+    for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ) {
+        if (ready(*it)) {
+            QUE_DBG("pop deferred task (ready), id_task = %d\n", it->id);
+            queue_tasks.emplace_front(std::move(*it));
+            it = queue_tasks_deferred.erase(it);
+            moved = true;
+        } else {
+            ++it;
+        }
+    }
+    if (moved) {
+        time_last_task = ggml_time_ms();
+        condition_tasks.notify_one();
+    }
 }
 
 void server_queue::wait_until_no_sleep() {

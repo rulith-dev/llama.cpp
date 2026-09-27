@@ -1866,6 +1866,42 @@ bool llama_kv_cache::seq_rows_get(llama_seq_id seq_id, llama_pos p0, uint32_t n,
     return true;
 }
 
+bool llama_kv_cache::seq_rows_copy(llama_seq_id seq_src, llama_seq_id seq_dst, llama_pos p0, uint32_t n) {
+    std::vector<std::pair<uint32_t, uint32_t>> rs, rd;
+    if (n_stream != 1 || seq_src == seq_dst || !seq_row_cells(seq_src, p0, n, false, rs) ||
+            !seq_row_cells(seq_dst, p0, n, true, rd)) {
+        return false;
+    }
+
+    // the two sides' runs cut into pieces contiguous on both
+    cell_move_vec_t pieces;
+    size_t   i  = 0;
+    size_t   j  = 0;
+    uint32_t oi = 0;
+    uint32_t oj = 0;
+    while (i < rs.size() && j < rd.size()) {
+        const uint32_t li = rs[i].second - rs[i].first - oi;
+        const uint32_t lj = rd[j].second - rd[j].first - oj;
+        const uint32_t k  = std::min(li, lj);
+        pieces.push_back({ rs[i].first + oi, rd[j].first + oj, k, seq_dst, true });
+        oi += k;
+        oj += k;
+        if (oi == rs[i].second - rs[i].first) { ++i; oi = 0; }
+        if (oj == rd[j].second - rd[j].first) { ++j; oj = 0; }
+    }
+
+    // as apply_moves: the whole tensors, which one stream spans
+    for (const auto & layer : layers) {
+        for (ggml_tensor * t : { layer.k, layer.v }) {
+            if (t != nullptr) {
+                copy_rows(t, pieces);
+            }
+        }
+    }
+
+    return true;
+}
+
 bool llama_kv_cache::seq_rows_set(llama_seq_id seq_id, llama_pos p0, uint32_t n, const uint8_t * src, uint32_t src_rows) {
     std::vector<std::pair<uint32_t, uint32_t>> runs;
     if (n > src_rows || !seq_row_cells(seq_id, p0, n, true, runs)) {

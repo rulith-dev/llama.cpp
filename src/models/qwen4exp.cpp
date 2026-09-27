@@ -1813,9 +1813,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
             conv_kernel_size - 1, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-    cb(state, "state_predelta", il);
+    // strixllama: deferred rollback (llm_graph_input_rs::lazy_mode): a short batch runs the net that records instead
+    // of snapshotting and reads its states from their rows itself; any other first replays the records the states
+    // still carry, in place, so the gather and the plain net see them as they expect
+    const int lazy_mode = inp->lazy_mode;
+    ggml_tensor * state = nullptr;
+    if (lazy_mode != 1) {
+        ggml_tensor * ssm_src = ssm_states_all;
+        if (lazy_mode == 2) {
+            ssm_src = ggml_gated_delta_net_replay(ctx0, ssm_states_all, mctx_cur->get_rec_l(il), inp->lazy_info,
+                    (int) head_v_dim, (int) num_v_heads, (int) num_k_heads);
+        }
+        state = build_rs(inp, ssm_src, hparams.n_embd_s(), n_seqs);
+        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+        cb(state, "state_predelta", il);
+    }
 
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
@@ -1855,8 +1867,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
     k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
 
-    // repeat to match shapes when head keys != value keys; unneeded with the fused GDN
-    if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
+    // repeat to match shapes when head keys != value keys; unneeded with the fused GDN (and the deferred-rollback net)
+    if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch) && lazy_mode != 1) {
         GGML_ASSERT(num_v_heads % num_k_heads == 0);
         q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
         k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
@@ -1866,7 +1878,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+    ggml_tensor * output = nullptr;
+    if (lazy_mode == 1) {
+        output = ggml_gated_delta_net_lazy(ctx0, q_conv, k_conv, v_conv, gate, beta, ssm_states_all,
+                mctx_cur->get_rec_l(il), inp->lazy_info);
+        output = ggml_reshape_4d(ctx0, output, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+        cb(output, "attn_output", il);
+    } else {
+        output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+    }
 
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 

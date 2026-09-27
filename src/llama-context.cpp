@@ -3969,6 +3969,14 @@ bool llama_strix_kv_set_rows(llama_context * ctx, llama_seq_id seq_id, llama_pos
     return mem->kv_rows_set(seq_id, p0, (uint32_t) n, (const uint8_t *) src, (uint32_t) src_rows);
 }
 
+bool llama_strix_kv_copy_rows(llama_context * ctx, llama_seq_id seq_src, llama_seq_id seq_dst, llama_pos p0, int32_t n) {
+    auto * mem = llama_strix_kv_memory(ctx);
+    if (!mem || n < 0) {
+        return false;
+    }
+    return mem->kv_rows_copy(seq_src, seq_dst, p0, (uint32_t) n);
+}
+
 void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void * data), void * abort_callback_data) {
     ctx->set_abort_callback(abort_callback, abort_callback_data);
 }

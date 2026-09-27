@@ -3124,9 +3124,10 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
 static int ggml_cuda_try_gdn_cache_fusion(
         const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gated_delta_net_fused_cache & fused_state_cpy) {
     const ggml_tensor * gdn = cgraph->nodes[node_idx];
-    // the kernel skips the snapshot tail, so the gdn output must not be a graph output
+    // the kernel skips the snapshot tail, so the gdn output must not be a graph output; the deferred-rollback net and
+    // the replay (op_params[1]) write no snapshots
     if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 ||
-        (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        (gdn->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_get_op_params_i32(gdn, 1) != 0) {
         return 0;
     }
 

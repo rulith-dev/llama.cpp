@@ -1027,6 +1027,9 @@ extern "C" {
     // rows into positions [p0, p0 + n) of cells llama_strix_kv_alloc made; src is laid out for src_rows positions,
     // of which the first n are used
     LLAMA_API bool llama_strix_kv_set_rows(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, int32_t n, const void * src, int32_t src_rows);
+    // strixllama: the attention rows of seq_src at positions [p0, p0 + n) copied into the cells seq_dst holds for them
+    // (llama_strix_kv_alloc), device to device and queued behind the graphs: nothing is waited for
+    LLAMA_API bool llama_strix_kv_copy_rows(struct llama_context * ctx, llama_seq_id seq_src, llama_seq_id seq_dst, llama_pos p0, int32_t n);
 
     // Set whether the context outputs embeddings or not
     // TODO: rename to avoid confusion with llama_get_embeddings()

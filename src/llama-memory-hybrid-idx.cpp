@@ -574,6 +574,14 @@ bool llama_memory_hybrid_idx::kv_rows_set(llama_seq_id seq_id, llama_pos p0, uin
            (!mem_idx || mem_idx->seq_rows_set(seq_id, p0, n, src + (size_t) src_rows*get_mem_attn()->row_size(), src_rows));
 }
 
+bool llama_memory_hybrid_idx::kv_rows_copy(llama_seq_id seq_src, llama_seq_id seq_dst, llama_pos p0, uint32_t n) {
+    if (kv_row_size() == 0) {
+        return false;
+    }
+    return get_mem_attn()->seq_rows_copy(seq_src, seq_dst, p0, n) &&
+           (!mem_idx || mem_idx->seq_rows_copy(seq_src, seq_dst, p0, n));
+}
+
 bool llama_memory_hybrid_idx::kv_alloc(llama_seq_id seq_id, const llama_token * tokens, uint32_t n) {
     if (kv_row_size() == 0) {
         return false;
@@ -727,6 +735,8 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
 
     std::vector<int32_t> order;
     std::vector<int32_t> rank;
+    // strixllama: with several sequences resident, the cells of each sequence of the ubatch, ranked among themselves
+    std::map<llama_seq_id, std::vector<int32_t>> seq_order;
 
     std::fill(dst_blk_pos, dst_blk_pos + 4*n_blocks*n_ns, 0);
 
@@ -837,18 +847,16 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
         // them and a cell can land outside the block window - the rank is dense by construction, so
         // ranking fixes that too. Without it the assert below aborts the server on the first long
         // enough conversation that contains an image.
-        if ((dup || oor) && ubatch->is_pos_2d() && one_seq) {
-            order.clear();
-            order.reserve(n_kv);
-
-            for (int64_t j = 0; j < n_kv; ++j) {
-                if (!cells.is_empty(j)) {
-                    order.push_back((int32_t) j);
-                }
-            }
-
+        //
+        // strixllama: with several sequences resident, each sequence of the ubatch is ranked among its own cells: the
+        // cells of the others are invisible to its queries and left out of its blocks, so a cell's rank is its place
+        // in its own conversation, as with one sequence resident. The ranking used to need one sequence in the whole
+        // cache, and an image in a second resident conversation aborted the server below (group_members): unranked,
+        // the image's repeated positions put two cells in one block slot. A cell two sequences of the ubatch share has
+        // two places, so such a ubatch is not ranked (seq_cp; not what the slots do).
+        if ((dup || oor) && ubatch->is_pos_2d()) {
             // same total order the mrope causal mask uses: pos, then ext.y, then ext.x
-            std::sort(order.begin(), order.end(), [&cells](int32_t a, int32_t b) {
+            auto by_pos = [&cells](int32_t a, int32_t b) {
                 const llama_pos pa = cells.pos_get(a);
                 const llama_pos pb = cells.pos_get(b);
 
@@ -859,17 +867,53 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
                 const auto & ea = cells.ext_get(a);
 
                 return cells.ext_get(b).is_2d_gt(ea.x, ea.y);
-            });
+            };
 
-            rank.assign(n_kv, -1);
+            order.clear();
+            seq_order.clear();
+            bool shared = false;
 
-            for (int64_t k = 0; k < (int64_t) order.size(); ++k) {
-                rank[order[k]] = (int32_t) k;
+            for (int64_t j = 0; j < n_kv && !shared; ++j) {
+                if (cells.is_empty(j)) {
+                    continue;
+                }
+                if (one_seq) {
+                    order.push_back((int32_t) j);
+                    continue;
+                }
+                const auto own = cells.seq_get_all(j) & active_seqs;
+                if (own.count() > 1) {
+                    shared = true;
+                } else if (own.any()) {
+                    for (int sq = 0; sq < LLAMA_MAX_SEQ; ++sq) {
+                        if (own.test(sq)) {
+                            seq_order[sq].push_back((int32_t) j);
+                            break;
+                        }
+                    }
+                }
             }
 
-            ranked = true;
+            if (!shared) {
+                rank.assign(n_kv, -1);
+                if (one_seq) {
+                    std::sort(order.begin(), order.end(), by_pos);
+                    for (int64_t k = 0; k < (int64_t) order.size(); ++k) {
+                        rank[order[k]] = (int32_t) k;
+                    }
+                } else {
+                    for (auto & [sq, ord] : seq_order) {
+                        std::sort(ord.begin(), ord.end(), by_pos);
+                        for (int64_t k = 0; k < (int64_t) ord.size(); ++k) {
+                            rank[ord[k]] = (int32_t) k;
+                        }
+                    }
+                }
 
-            group_cells();
+                ranked = true;
+
+                group_cells();
+            }
         }
 
         GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
@@ -1042,12 +1086,15 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
                 const llama_pos qy = ubatch->pos[i + n_tokens];
                 const llama_pos qx = ubatch->pos[i + n_tokens*2];
 
+                // the query's place among its own sequence's cells
+                const std::vector<int32_t> & ord = one_seq ? order : seq_order[seq_id];
+
                 int64_t lo = 0;
-                int64_t hi = (int64_t) order.size();
+                int64_t hi = (int64_t) ord.size();
 
                 while (lo < hi) {
                     const int64_t   mid = (lo + hi)/2;
-                    const int32_t   c   = order[mid];
+                    const int32_t   c   = ord[mid];
                     const llama_pos pc  = cells.pos_get(c);
 
                     if (pc < qt || (pc == qt && !cells.ext_get(c).is_2d_gt(qx, qy))) {

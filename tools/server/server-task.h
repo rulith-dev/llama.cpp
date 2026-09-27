@@ -154,6 +154,12 @@ struct server_task {
     int id_target = -1;
     int id_slot   = -1;
 
+    // strixllama: a deferred prompt waiting for another slot to compute its prefix (wait_for_prefix): the slot, the
+    // position it waits for, and since when
+    int     wait_slot = -1;
+    int64_t wait_n    = 0;
+    int64_t wait_t0   = 0;
+
     // used by parallel sampling (multiple completions from same prompt)
     int id_parent  = -1;
     // temporary store of child tasks for scheduling

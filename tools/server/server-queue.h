@@ -65,6 +65,9 @@ public:
     // prioritize tasks that use the specified slot (otherwise, pop the first deferred task)
     void pop_deferred_task(int id_slot);
 
+    // strixllama: move the deferred tasks `ready` accepts to the front of the queue
+    void pop_deferred_if(const std::function<bool(const server_task &)> & ready);
+
     // if sleeping, request exiting sleep state and wait until it is done
     // returns immediately if not sleeping
     void wait_until_no_sleep();

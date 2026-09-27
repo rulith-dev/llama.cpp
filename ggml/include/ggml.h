@@ -2659,6 +2659,37 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
+    // strixllama: the gated delta net with deferred rollback, for the short batches of a speculative verify. Each
+    // sequence's state is read from a row of state_all (the recurrent cache [S_v*S_v*H_v, n_rows]) and first brought
+    // up to date by replaying the token updates recorded by the previous batch that the rollback kept; the net then
+    // writes that state back (the new base) and, per token of this batch, the record a later replay needs - the
+    // delta [S_v, H_v], the key [S_k, H_k] and the gate [H_v] - instead of a full state snapshot per token.
+    //   rec  : [H_v*S_v + H_k*S_k + H_v, R, n_sets] F32, record sets of R records
+    //   info : [5, n_seqs] I32 per sequence: row read, row written, records replayed, set read, set written
+    // Returns the attention scores [S_v*H_v, n_tokens*n_seqs]. q, k: [S_k, H_k, n_tokens, n_seqs] (not repeated to H_v).
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_lazy(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state_all,
+            struct ggml_tensor  * rec,
+            struct ggml_tensor  * info);
+
+    // strixllama: the replay alone, in place: each sequence's state (row read + its records) is written to the row
+    // written, as the plain net expects it before a longer batch. Returns state_all, as a view that orders what reads
+    // it after the replay. info as above (the set written unused); S_v, H_v, H_k give the record layout.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_replay(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * state_all,
+            struct ggml_tensor  * rec,
+            struct ggml_tensor  * info,
+            int                   S_v,
+            int                   H_v,
+            int                   H_k);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
