@@ -6,6 +6,7 @@
 #include "llama-context.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
@@ -2568,6 +2569,9 @@ struct args_set_input_kq_mask {
 
     // strixllama: the first cell of the graph's view
     uint32_t off;
+
+    // strixllama: read the ubatch's sequences' membership bits in one pass (below); false only to check it
+    bool seq_bits;
 };
 
 // strixllama: the cells of a stream as the graph's view sees them, from its first cell (get_kv_window)
@@ -2614,12 +2618,62 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
         std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
         std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
 
+        // strixllama: each sequence's first row tests every cell's membership bitset (LLAMA_MAX_SEQ bits, 32 bytes a
+        // cell), so a ubatch of several conversations read the window's bitsets once per conversation: ~2 ms a decode
+        // step for four conversations over 125K cells, growing with both. Their bits are gathered here in one pass,
+        // two bytes a cell, and the rows test those: the same test on the same cells
+        llama_seq_id bit_seq[16];
+        int          n_bit_seq = 0;
+        std::vector<uint16_t> bits;
+        if (args.seq_bits && n_kv >= 4096) {
+            bool fits = true;
+            for (uint32_t ii = 0; ii < n_tps && fits; ++ii) {
+                const llama_seq_id sid = ubatch->seq_id[s*n_tps + ii][0];
+                if (std::find(bit_seq, bit_seq + n_bit_seq, sid) == bit_seq + n_bit_seq) {
+                    if (n_bit_seq == 16) {
+                        fits = false;
+                    } else {
+                        bit_seq[n_bit_seq++] = sid;
+                    }
+                }
+            }
+            // two sequences at least to pay, and one cell array for all of them
+            fits = fits && n_bit_seq >= 2;
+            for (int k = 1; fits && k < n_bit_seq; ++k) {
+                fits = seq_to_stream[bit_seq[k]] == seq_to_stream[bit_seq[0]];
+            }
+            if (fits) {
+                const llama_kv_cells_view cells = { v_cells.at(seq_to_stream[bit_seq[0]]), args.off };
+                bits.assign((size_t) n_kv, 0);
+                for (uint32_t j = 0; j < (uint32_t) n_kv; ++j) {
+                    if (cells.is_empty(j)) {
+                        continue;
+                    }
+                    uint16_t b = 0;
+                    for (int k = 0; k < n_bit_seq; ++k) {
+                        if (cells.seq_has(j, bit_seq[k])) {
+                            b |= (uint16_t) (1u << k);
+                        }
+                    }
+                    bits[j] = b;
+                }
+            } else {
+                n_bit_seq = 0;
+            }
+        }
+
         for (uint32_t ii = 0; ii < n_tps; ++ii) {
             const uint32_t i = s*n_tps + ii;
 
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
 
             const llama_kv_cells_view cells = { v_cells.at(seq_to_stream[seq_id]), args.off };
+
+            int seq_bit = -1;
+            if (!bits.empty()) {
+                seq_bit = (int) (std::find(bit_seq, bit_seq + n_bit_seq, seq_id) - bit_seq);
+                GGML_ASSERT(seq_bit < n_bit_seq);
+            }
 
                   llama_pos p0 = -1;
             const llama_pos p1 = ubatch->pos[i];
@@ -2676,7 +2730,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 }
 
                 // mask the token if not the same sequence
-                if (!cells.seq_has(j, seq_id)) {
+                if (seq_bit >= 0 ? !((bits[j] >> seq_bit) & 1) : !cells.seq_has(j, seq_id)) {
                     goto skip;
                 }
 
@@ -2803,6 +2857,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
         /*.off              =*/ off,
+        /*.seq_bits         =*/ true,
     };
 
     GGML_ASSERT(off == 0 || (n_stream == 1 && (uint64_t) off + n_kv <= get_size()));
@@ -2811,6 +2866,31 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
     } else {
         set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
+    }
+
+    // strixllama: STRIX_KQ_MASK_CHECK=1 fills the mask again the upstream way and compares the two byte for byte
+    static const bool check = getenv("STRIX_KQ_MASK_CHECK") && atoi(getenv("STRIX_KQ_MASK_CHECK")) != 0;
+    if (check) {
+        args_set_input_kq_mask plain = args;
+        plain.seq_bits = false;
+        const size_t n_bytes = (size_t) n_kv * n_tokens * ggml_element_size(dst);
+        std::vector<uint8_t> ref(ggml_nbytes(dst));
+        if (dst->type == GGML_TYPE_F16) {
+            set_input_kq_mask_impl<ggml_fp16_t>(plain, (ggml_fp16_t *) ref.data(), causal_attn);
+        } else {
+            set_input_kq_mask_impl<float>(plain, (float *) ref.data(), causal_attn);
+        }
+        static std::atomic<int64_t> n_checked{0};
+        static std::atomic<int64_t> n_bad{0};
+        const bool same = memcmp(ref.data(), dst->data, std::min(n_bytes, ref.size())) == 0;
+        const int64_t k = ++n_checked;
+        if (!same) {
+            ++n_bad;
+        }
+        if (!same || (k & (k - 1)) == 0) {
+            fprintf(stderr, "%s: STRIX_KQ_MASK_CHECK %lld masks, %lld differ (this one: %u tokens, %lld cells, %s)\n",
+                    __func__, (long long) k, (long long) n_bad.load(), n_tokens, (long long) n_kv, same ? "same" : "DIFFERENT");
+        }
     }
 
     //const int64_t t_end = ggml_time_us();
