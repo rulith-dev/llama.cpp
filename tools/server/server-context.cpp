@@ -1763,11 +1763,12 @@ private:
                     task.id = queue_tasks.get_new_id();
                     queue_tasks.post(std::move(task));
                 };
-                // version 3 where both contexts serve rows by position, else version 2; the store keeps no older one
+                // version 3 where both contexts serve rows by position, else version 2; the store keeps no older one.
+                // Version 3 is numbered 4 since 0.2.8 (see SPC_V3), so its entries from 0.2.7 and before go
                 const uint64_t row_tgt = llama_strix_kv_row_size(ctx_tgt);
                 const uint64_t row_dft = ctx_dft ? llama_strix_kv_row_size(ctx_dft) : 0;
                 const bool rows = row_tgt > 0 && (!ctx_dft || row_dft > 0);
-                prompt_cache->set_disk(dir, mib ? std::max(1, atoi(mib)) : 16384, mctx != nullptr, tag, rows ? 3 : 2,
+                prompt_cache->set_disk(dir, mib ? std::max(1, atoi(mib)) : 16384, mctx != nullptr, tag, rows ? 4 : 2,
                                        rows ? row_tgt : 0, rows ? row_dft : 0);
                 for (auto & slot : slots) {
                     slot.disk_cache = prompt_cache.get();

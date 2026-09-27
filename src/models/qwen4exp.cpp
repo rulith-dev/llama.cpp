@@ -855,6 +855,16 @@ static bool qwen4exp_qsa_flag(const char *name) {
     return value && atoi(value)!=0;
 }
 
+// strixllama: may an attention over n_kv cells go without the dense mask? Only the qsa3 kernel honours the selected
+// indices without one, so this must mirror what it takes (ggml_cuda_flash_attn_ext_qsa_supported): past that the
+// generic flash-attention kernels run and ignore the indices, and without the mask every query attends to every cell
+// of the window - other conversations and later positions included. Up to 0.2.7 the kernel stopped at 262140 cells
+// (16-bit block numbers), and 0.2.7's ragged ubatches, a prompt chunk next to three long answers, spanned more once
+// the four held ~262K cells together: ~20 ms a token, for a wrong result.
+static bool qwen4exp_qsa_maskless_ok(int64_t n_kv, int64_t n_tps) {
+    return n_tps >= 128 && n_kv <= INT32_MAX - 3 && qwen4exp_qsa_flag("LLAMA_QSA_NO_DENSE_MASK");
+}
+
 static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream);
 
 // [QSA_SCORE_BOUNDS] Visible-prefix scoring (ported from 2026-09-09-sparse-prefill/qsa-score-bounds).
@@ -954,8 +964,7 @@ public:
         res &= compact || bias->ne[1] == params.ubatch.n_tokens/n_stream;
         res &= (tail_idxs != nullptr) == blocks;
         res &= compact == (scalar && qwen4exp_qsa_flag("LLAMA_QSA_COMPACT_METADATA"));
-        res &= maskless == (scalar && qwen4exp_qsa_flag("LLAMA_QSA_NO_DENSE_MASK") &&
-                params.ubatch.n_tokens/n_stream >= 128);
+        res &= maskless == (scalar && qwen4exp_qsa_maskless_ok(n_kv, params.ubatch.n_tokens/n_stream));
         // strixllama: the membership inputs exist for a compact ubatch of several sequences, sized by their count
         res &= (seq_blk != nullptr) == (compact && params.ubatch.n_seqs_unq > 1);
         if (seq_blk) {
@@ -1151,7 +1160,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         // mask: every query of a multi-token decode batch sees the tokens after it. That is exactly the
         // MTP verification batch (2-4 tokens), whose target logits then see the drafts they are meant to
         // check. Keep the mask for anything the qsa3 kernel will not take.
-        qsa->maskless = scalar && qwen4exp_qsa_flag("LLAMA_QSA_NO_DENSE_MASK") && n_tps >= 128;
+        qsa->maskless = scalar && qwen4exp_qsa_maskless_ok(n_kv, n_tps);
         qsa->score_strip=qwen4exp_query_strip(n_tps,n_stream);
         qsa->score_key_limits=qwen4exp_score_key_limits(mctx_hyb,ubatch,n_blocks,qsa->score_strip,r,
                 hparams.indexer_top_k/r,qsa->compact,qsa->active_only);

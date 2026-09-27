@@ -2069,7 +2069,10 @@ const char     SPC_MAGIC[8] = {'S','T','R','I','X','S','P','C'};
 const char     CKP_MAGIC[8] = {'S','T','R','I','X','C','K','P'};
 const char     RUN_MAGIC[8] = {'S','T','R','I','X','R','U','N'};
 const uint32_t SPC_V2 = 2;
-const uint32_t SPC_V3 = 3;
+// the version 3 layout, numbered 4 since 0.2.8 so that a store drops what earlier builds wrote: 0.2.7 could compute a
+// prompt chunk's attention densely over several conversations' cells (qwen4exp_qsa_maskless_ok), and its runs and
+// checkpoints of such a conversation carry that on
+const uint32_t SPC_V3 = 4;
 const uint32_t CKP_V2 = 2;             // version 1 never shipped
 const uint32_t RUN_V1 = 1;
 

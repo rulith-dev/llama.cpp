@@ -759,6 +759,87 @@ llama_ubatch llama_batch_allocr::split_ragged(uint32_t n_ubatch, uint32_t n_keep
         return {};
     }
 
+    // strixllama: which sequences share this ubatch. The short ones - decode tokens, MTP verify drafts, a prompt of a
+    // few tokens - do, up to STRIX_MIX_TOTAL tokens in all (32: what the sparse attention's decode gather takes). A
+    // longer one, a prompt chunk, joins only while sharing costs less than a pass of its own: next to other sequences
+    // its queries score the sparse-attention index over their blocks too, and theirs over its own (~3 ns a query and
+    // cell), and a ubatch of several sequences loses the causal score bounds (about half of a query's own context).
+    // STRIX_MIX_CELLS: the query-cells a chunk may add (6e7, ~0.2 s: about a pass). 0.2.7 let every chunk share, and a
+    // 49K-token prompt next to one 88K-token answer ran at 793 t/s against 1012 alone, 74K next to two at 695 against
+    // 988; letting none share cost six agents' tails of a few hundred tokens a fifth more prompt time. The first long
+    // one that stays out goes next. STRIX_MIX_MAX: the most tokens a short one has left (0: 0.2.7's ragged ubatches)
+    {
+        static const uint32_t mix_max = [] {
+            const char * e = getenv("STRIX_MIX_MAX");
+            return e ? (uint32_t) atoi(e) : 32u;
+        }();
+        static const uint32_t mix_total = [] {
+            const char * e = getenv("STRIX_MIX_TOTAL");
+            return e ? (uint32_t) atoi(e) : 32u;
+        }();
+        static const double mix_cells = [] {
+            const char * e = getenv("STRIX_MIX_CELLS");
+            return e ? atof(e) : 6e7;
+        }();
+        if (mix_max > 0 && sets.size() > 1) {
+            // a sequence's context once this ubatch is in: its last position here
+            std::vector<double> ctx(sets.size());
+            for (uint32_t s = 0; s < sets.size(); ++s) {
+                ctx[s] = (double) batch.pos[seq_set_map[sets[s]].back()] + 1.0;
+            }
+            std::vector<uint32_t> by_len(sets.size());
+            for (uint32_t s = 0; s < by_len.size(); ++s) {
+                by_len[s] = s;
+            }
+            std::stable_sort(by_len.begin(), by_len.end(), [&](uint32_t x, uint32_t y) { return rem[x] < rem[y]; });
+            std::vector<uint32_t> keep;
+            uint32_t total = 0;
+            for (const uint32_t s : by_len) {
+                if (rem[s] > mix_max || (!keep.empty() && total + rem[s] > mix_total)) {
+                    break;
+                }
+                keep.push_back(s);
+                total += rem[s];
+            }
+            double sum_ctx = 0.0, sum_rem = 0.0;
+            for (const uint32_t s : keep) {
+                sum_ctx += ctx[s];
+                sum_rem += rem[s];
+            }
+            for (uint32_t s = 0; s < sets.size(); ++s) {
+                if (rem[s] <= mix_max) {
+                    continue;   // short: kept above, or next
+                }
+                double add = 0.0;
+                if (!keep.empty()) {
+                    add = rem[s]*sum_ctx + ctx[s]*sum_rem + 0.5*rem[s]*ctx[s];
+                    if (keep.size() == 1) {
+                        add += 0.5*rem[keep[0]]*ctx[keep[0]];   // the first one's bounds go too
+                    }
+                }
+                if (keep.empty() || add <= mix_cells) {
+                    keep.push_back(s);
+                    sum_ctx += ctx[s];
+                    sum_rem += rem[s];
+                }
+            }
+            if (keep.size() < sets.size()) {
+                std::sort(keep.begin(), keep.end());   // batch order
+                std::vector<seq_set_t> k_sets;
+                std::vector<int32_t>   k_cur;
+                std::vector<uint32_t>  k_rem;
+                for (const uint32_t s : keep) {
+                    k_sets.push_back(sets[s]);
+                    k_cur.push_back(cur[s]);
+                    k_rem.push_back(rem[s]);
+                }
+                sets.swap(k_sets);
+                cur.swap(k_cur);
+                rem.swap(k_rem);
+            }
+        }
+    }
+
     // the shortest first, whole; what n_ubatch has left goes to the longer ones in turn
     std::vector<uint32_t> order(sets.size());
     for (uint32_t s = 0; s < order.size(); ++s) {
