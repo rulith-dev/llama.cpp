@@ -13,7 +13,7 @@ static __device__ __forceinline__ float xor_tree(float v) {
     for (int off = 16; off > 0; off >>= 1) { v += __shfl_xor(v, off); }
     return v;
 }
-template <bool GATE>
+template <bool GATE, bool HAS_W = true>
 static __global__ void __launch_bounds__(256) rms_rows_f32(const float * x, const float * w, const float * z, float * dst,
         const int ncols, const int64_t nrows, const int64_t nchannels, const int64_t total_rows,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps) {
@@ -40,7 +40,8 @@ static __global__ void __launch_bounds__(256) rms_rows_f32(const float * x, cons
     for (int wv = 0; wv < 8; ++wv) {
         const int col = 32 * wv + lane;
         if (col < ncols) {
-            const float t = scale * x[col] * w[col];
+            float t;
+            if constexpr (HAS_W) { t = scale * x[col] * w[col]; } else { t = scale * x[col]; }
             if (GATE) { const float s = 1.0f / (1.0f + expf(-z[col])); dst[col] = t * s; } else { dst[col] = t; }
         }
     }
@@ -106,6 +107,20 @@ int ggml_cuda_norm_rows_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_no
     float eps; memcpy(&eps, rms->op_params, sizeof(float)); if (eps < 0.0f) return 0;
     m.x = x; m.w = w; m.z = nullptr; m.dst = mul; m.eps = eps;
     return 1;
+}
+
+// strixllama: a plain RMS norm of narrow rows (no weight after it, as the gated delta net's q/k norms): the same
+// wave-per-row kernel. norm.cu's launch gives each row a 256-thread block, and at 393K rows of 128 (48 heads x 8192
+// tokens) that is block-scheduling bound: ~10 ms a layer where the bytes take ~2
+bool ggml_cuda_rms_rows_plain(const float * x, float * dst, int ncols, int64_t nrows, int64_t nchannels, int64_t nsamples,
+        int64_t stride_row, int64_t stride_channel, int64_t stride_sample, float eps, cudaStream_t stream) {
+    const int64_t total = nrows * nchannels * nsamples;
+    if (!norm_rows_enabled() || ncols > 256 || ncols % 32 != 0 || total < 4096) return false;
+    const dim3 grid((unsigned) ((total + 7) / 8)), block(256);
+    const ggml_cuda_kernel_launch_params lp(grid, block, 0, stream);
+    ggml_cuda_kernel_launch(rms_rows_f32<false, false>, lp, x, (const float *) nullptr, (const float *) nullptr, dst,
+        ncols, nrows, nchannels, total, stride_row, stride_channel, stride_sample, eps);
+    return true;
 }
 
 void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_norm_gated_match & m) {

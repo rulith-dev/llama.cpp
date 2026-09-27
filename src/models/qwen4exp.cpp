@@ -828,11 +828,28 @@ static bool qwen4exp_qsa_embd_ok(const llama_ubatch & ubatch) {
     return !v || atoi(v) != 0;
 }
 
+// strixllama: the most queries the decode gather takes (qwen4exp_gather_attn); 32 covers eight slots verifying a draft
+// of 3 each, and above that the gather reads more than it saves
+static int64_t qwen4exp_gather_max_t() {
+    static const int64_t v = getenv("LLAMA_QSA_DECODE_GATHER_MAX_T") ? (int64_t) atoll(getenv("LLAMA_QSA_DECODE_GATHER_MAX_T")) : 32;
+    return v;
+}
+
+// strixllama: a ubatch between the two kernels that read the selected indices - more queries than the decode gather
+// takes, fewer than the 128 the qsa3 prefill kernel needs. The selection went to the generic flash attention with the
+// plain causal mask, which ignores it: dense attention over every visible cell instead of the model's sparse one.
+// Such a ubatch takes the plain top-k and the top-k mask instead (the block selection's -1 sentinels are for the
+// kernels only; the mask's set_rows cannot take them)
+static bool qwen4exp_qsa_between_kernels(int64_t n_tps) {
+    return n_tps > qwen4exp_gather_max_t() && n_tps < 128;
+}
+
 static bool qwen4exp_use_block_selection(bool blk_bias, int64_t n_stream, int64_t ratio, int64_t n_kv,
         const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams) {
     const char * block_env=getenv("LLAMA_QSA_BLOCK_SELECTION");
     const char * direct_env=getenv("LLAMA_QSA_DIRECT_INDICES");
     return block_env && atoi(block_env)!=0 && direct_env && atoi(direct_env)!=0 &&
+        n_stream > 0 && !qwen4exp_qsa_between_kernels(ubatch.n_tokens / n_stream) &&
         blk_bias && n_stream==1 && ratio>1 && hparams.indexer_top_k%ratio==0 &&
         n_kv>hparams.indexer_top_k+ratio-1 && n_kv<=16777216 && ubatch.token && qwen4exp_qsa_embd_ok(ubatch) &&
         cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias==0.0f &&
@@ -1559,7 +1576,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
                 indices_all->nb[1], indices_all->nb[2], indices_all->nb[3], first*indices_all->nb[1]);
 
         const char * direct_env = getenv("LLAMA_QSA_DIRECT_INDICES");
-        const bool direct_indices = direct_env && atoi(direct_env) != 0 &&
+        const bool direct_indices = direct_env && atoi(direct_env) != 0 && !qwen4exp_qsa_between_kernels(n_tps) &&
             n_stream == 1 && cparams.flash_attn && cparams.offload_kqv &&
             hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap;
         ggml_tensor * kq_mask_top_k = kq_mask;
@@ -1608,11 +1625,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
             const char * e = getenv("LLAMA_QSA_DECODE_GATHER");
             return e != nullptr && atoi(e) != 0;
         }();
-        // 32 covers eight slots verifying a draft of 3 each; above that the gather reads more than it saves
-        static const int64_t gather_max_t = []() {
-            const char * e = getenv("LLAMA_QSA_DECODE_GATHER_MAX_T");
-            return e ? (int64_t) atoll(e) : (int64_t) 32;
-        }();
+        const int64_t gather_max_t = qwen4exp_gather_max_t();
         const bool gather = gather_on && n_query <= gather_max_t && n_stream == 1 &&
             cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap &&
             (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0) && (v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_Q8_0) &&

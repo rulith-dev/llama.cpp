@@ -466,60 +466,36 @@ gated_delta_net_r16_cuda(const float * q,
     constexpr int V4  = TOKEN_TILE * BCOLS / 4;
     constexpr int NQ  = (QK4 + nthreads - 1) / nthreads;
     constexpr int NV  = (V4 + nthreads - 1) / nthreads;
-    float4 rq[NQ], rk[NQ], rv[NV];
-    float  rgv = 0.0f, rbv = 0.0f;
-    auto fetch = [&](const int t0) {
-        const int tile = (int) min((int64_t) TOKEN_TILE, n_tokens - t0);
-#pragma unroll
-        for (int j = 0; j < NQ; j++) {
-            const int idx = thread + j * nthreads, tt = idx / (S_v / 4), i4 = idx % (S_v / 4);
-            if (idx < QK4 && tt < tile) {
-                const int64_t off = iq3 * sq3 + (int64_t) (t0 + tt) * sq2 + iq1 * sq1 + 4 * i4;
-                rq[j] = *(const float4 *) (q + off);
-                rk[j] = *(const float4 *) (k + off);
-            }
-        }
-#pragma unroll
-        for (int j = 0; j < NV; j++) {
-            const int idx = thread + j * nthreads, tt = idx / (BCOLS / 4), c4 = idx % (BCOLS / 4);
-            if (idx < V4 && tt < tile) {
-                rv[j] = *(const float4 *) (v + sequence * sv3 + (int64_t) (t0 + tt) * sv2 + h_idx * sv1 + col0 + 4 * c4);
-            }
-        }
-        if (thread < tile) {
-            const int64_t gb_offset = sequence * sb3 + (t0 + thread) * sb2 + h_idx * sb1;
-            rgv = g[gb_offset];
-            rbv = beta[gb_offset];
-        }
-    };
-    auto stash = [&](const int buf, const int t0) {
-        const int tile = (int) min((int64_t) TOKEN_TILE, n_tokens - t0);
-#pragma unroll
-        for (int j = 0; j < NQ; j++) {
-            const int idx = thread + j * nthreads, tt = idx / (S_v / 4), i4 = idx % (S_v / 4);
-            if (idx < QK4 && tt < tile) {
-                *(float4 *) &q_shared[buf][tt][4 * i4] = rq[j];
-                *(float4 *) &k_shared[buf][tt][4 * i4] = rk[j];
-            }
-        }
-#pragma unroll
-        for (int j = 0; j < NV; j++) {
-            const int idx = thread + j * nthreads, tt = idx / (BCOLS / 4), c4 = idx % (BCOLS / 4);
-            if (idx < V4 && tt < tile) {
-                *(float4 *) &v_shared[buf][tt][4 * c4] = rv[j];
-            }
-        }
-        if (thread < tile) {
-            g_shared[buf][thread]    = rgv;
-            beta_shared[buf][thread] = rbv;
-        }
-    };
-
+    // strixllama: the tile goes from global memory straight to LDS. Staged through register arrays (rq, rk, rv) it
+    // kept them in scratch - 10 scratch_store_b128 and 10 scratch_load_b128 a tile, a private segment of 112-272
+    // bytes a lane - and a dispatch that needs scratch shares the queue's scratch ring with every other one
     const int buf = 0;
     for (int t0 = 0; t0 < n_tokens; t0 += TOKEN_TILE) {
         const int tile_size = min((int64_t) TOKEN_TILE, n_tokens - t0);
-        fetch(t0);
-        stash(0, t0);
+#pragma unroll
+        for (int j = 0; j < NQ; j++) {
+            const int idx = thread + j * nthreads, tt = idx / (S_v / 4), i4 = idx % (S_v / 4);
+            if (idx < QK4 && tt < tile_size) {
+                const int64_t off = iq3 * sq3 + (int64_t) (t0 + tt) * sq2 + iq1 * sq1 + 4 * i4;
+                const float4 xq = *(const float4 *) (q + off);
+                const float4 xk = *(const float4 *) (k + off);
+                *(float4 *) &q_shared[buf][tt][4 * i4] = xq;
+                *(float4 *) &k_shared[buf][tt][4 * i4] = xk;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < NV; j++) {
+            const int idx = thread + j * nthreads, tt = idx / (BCOLS / 4), c4 = idx % (BCOLS / 4);
+            if (idx < V4 && tt < tile_size) {
+                *(float4 *) &v_shared[buf][tt][4 * c4] =
+                    *(const float4 *) (v + sequence * sv3 + (int64_t) (t0 + tt) * sv2 + h_idx * sv1 + col0 + 4 * c4);
+            }
+        }
+        if (thread < tile_size) {
+            const int64_t gb_offset = sequence * sb3 + (t0 + thread) * sb2 + h_idx * sb1;
+            g_shared[buf][thread]    = g[gb_offset];
+            beta_shared[buf][thread] = beta[gb_offset];
+        }
         __syncthreads();
 
         for (int tt = 0; tt < tile_size; ++tt) {

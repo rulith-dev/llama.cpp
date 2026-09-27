@@ -734,6 +734,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         ggml_cuda_flash_attn_ext_qsa(ctx, dst);
         return;
     }
+    // strixllama: selected indices without a mask are for the qsa3 kernel alone. The kernels below ignore src[5], and
+    // without the mask they attend to every cell of the window - later positions and other conversations included,
+    // as 0.2.7's prompt chunks next to answering conversations did. Fail here rather than compute that
+    if (dst->src[5] != nullptr && dst->src[3] == nullptr) {
+        GGML_ABORT("QSA: a maskless attention op with selected indices reached a kernel that ignores them (q %lld x k %lld)",
+                   (long long) dst->src[0]->ne[1], (long long) dst->src[1]->ne[1]);
+    }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
