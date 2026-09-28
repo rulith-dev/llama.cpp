@@ -193,6 +193,9 @@ private:
         std::vector<llama_seq_id> clear_from;   // kb_from[s] = none for these
         bool set_stale = false;                 // and kb_stale[s] = 1
     };
+    // kept from one call to the next, so a step's inputs reuse the last one's memory (eight conversations at 40K: ~4 MB)
+    mutable qsa_run_inputs       run_ri;
+    mutable std::vector<int32_t> run_blk_run, run_blk_pb;
     bool set_input_qsa_run(qsa_run_inputs & out, ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                            ggml_tensor * bias, ggml_tensor * tail_idxs, const llama_ubatch * ubatch, uint32_t ratio,
                            const qsa_kb_inputs * kb, const qsa_mixed_inputs * mixed, bool active_only, uint32_t kv_off) const;

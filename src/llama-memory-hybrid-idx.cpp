@@ -931,8 +931,12 @@ bool llama_memory_hybrid_idx::set_input_qsa_run(qsa_run_inputs & out, ggml_tenso
         order[k] = (int) k;
     }
     std::sort(order.begin(), order.end(), [&](int x, int y) { return runs[x].c0 > runs[y].c0; });
-    std::vector<int32_t> blk_run;   // per block: its run
-    std::vector<int32_t> blk_pb;    // and its bucket
+    std::vector<int32_t> & blk_run = run_blk_run;   // per block: its run
+    std::vector<int32_t> & blk_pb  = run_blk_pb;    // and its bucket
+    blk_run.clear();
+    blk_pb.clear();
+    blk_run.reserve(n_blocks);
+    blk_pb.reserve(n_blocks);
     {
         int64_t lo = INT64_MAX, hi = -1;
         for (const auto & R : runs) {
@@ -1017,12 +1021,19 @@ bool llama_memory_hybrid_idx::set_input_qsa_run(qsa_run_inputs & out, ggml_tenso
     }
     if (mixed_seqs) {
         out.seq_blk.assign(n_slots*n_blocks, 0.0f);
-        for (int64_t b = 0; b < n_bid; ++b) {
-            const llama_seq_id s = runs[blk_run[b]].s;
+        // each run's slot, once: a block's row is one-hot (its sequence is one of the ubatch's, each in one slot)
+        std::vector<int64_t> run_slot(runs.size(), -1);
+        for (size_t k = 0; k < runs.size(); ++k) {
             for (int64_t sl = 0; sl < n_slots; ++sl) {
-                if (ubatch->seq_id_unq[sl] == s) {
-                    out.seq_blk[b*n_slots + sl] = 1.0f;
+                if (ubatch->seq_id_unq[sl] == runs[k].s) {
+                    run_slot[k] = sl;
                 }
+            }
+        }
+        for (int64_t b = 0; b < n_bid; ++b) {
+            const int64_t sl = run_slot[blk_run[b]];
+            if (sl >= 0) {
+                out.seq_blk[b*n_slots + sl] = 1.0f;
             }
         }
         out.seq_tok.assign(n_slots*n_tokens, 0.0f);
@@ -1159,7 +1170,9 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
         uint32_t kv_off) const {
     // strixllama: STRIX_QSA_RUN=0 scans every time; 2 takes both ways and aborts on any difference
     static const int run_mode = getenv("STRIX_QSA_RUN") ? atoi(getenv("STRIX_QSA_RUN")) : 1;
-    qsa_run_inputs ri;
+    qsa_run_inputs & ri = run_ri;
+    ri.clear_from.clear();
+    ri.set_stale = false;
     if (run_mode != 0 && blk_bias &&
             set_input_qsa_run(ri, cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, kb, mixed, active_only, kv_off)) {
         constexpr llama_pos none = std::numeric_limits<llama_pos>::max();

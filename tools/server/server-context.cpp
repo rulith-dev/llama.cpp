@@ -28,6 +28,7 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <thread>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -562,6 +563,18 @@ struct server_slot {
                 if (getenv("STRIX_STATE_HASH")) {
                     SLT_INF(*this, "STATE_HASH end state as it leaves: %zu bytes, %016llx (%lld tokens)\n", end_ckpt.data_tgt.size(),
                             (unsigned long long) XXH3_64bits(end_ckpt.data_tgt.data(), end_ckpt.data_tgt.size()), (long long) n_entry);
+                    // DEV: STRIX_STATE_DUMP=<dir> also writes the whole state (KV included) as the conversation leaves
+                    if (getenv("STRIX_STATE_DUMP")) {
+                        std::vector<uint8_t> st(llama_state_seq_get_size_ext(ctx_tgt, id, 0));
+                        llama_state_seq_get_data_ext(ctx_tgt, st.data(), st.size(), id, 0);
+                        const std::string fn = std::string(getenv("STRIX_STATE_DUMP")) + "/leave_" + std::to_string(n_entry) + ".bin";
+                        if (FILE * f = fopen(fn.c_str(), "wb")) {
+                            fwrite(st.data(), 1, st.size(), f);
+                            fclose(f);
+                        }
+                        SLT_INF(*this, "STATE_HASH whole as it leaves: %zu bytes, %016llx\n", st.size(),
+                                (unsigned long long) XXH3_64bits(st.data(), st.size()));
+                    }
                 }
                 end_ckpt.update_dft(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 common_speculative_get_state(spec, id, end_ckpt.data_spec);
@@ -4600,6 +4613,15 @@ private:
                                 llama_state_seq_get_data_ext(ctx_tgt, st.data(), st.size(), slot.id, fl);
                                 SLT_INF(slot, "STATE_HASH %s: %zu bytes, %016llx (%d tokens)\n", fl ? "recurrent" : "whole", st.size(),
                                         (unsigned long long) XXH3_64bits(st.data(), st.size()), slot.prompt.n_tokens());
+                                // DEV: STRIX_STATE_DUMP=<dir> writes the whole state as the task starts, to diff two runs
+                                if (!fl && getenv("STRIX_STATE_DUMP")) {
+                                    const std::string fn = std::string(getenv("STRIX_STATE_DUMP")) + "/state_" +
+                                        std::to_string(slot.prompt.n_tokens()) + "_" + std::to_string(slot.task->id) + ".bin";
+                                    if (FILE * f = fopen(fn.c_str(), "wb")) {
+                                        fwrite(st.data(), 1, st.size(), f);
+                                        fclose(f);
+                                    }
+                                }
                             }
                         }
 
@@ -5486,6 +5508,88 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+        // strixllama: the generating slots of a step are sampled at once, one thread each (STRIX_PARALLEL_SAMPLING, on by
+        // default; 0: one after the other). A slot's sampler, its candidates and its random state are its own, and the
+        // logits are only read once the context has synchronized, so each slot samples the token it did before; what
+        // follows - accepting it, the text, the stop checks, the responses - still runs slot by slot in order. With eight
+        // conversations this was ~1.6 ms of every step, the GPU idle.
+        std::vector<llama_token> pre_sampled(slots.size(), LLAMA_TOKEN_NULL);
+        {
+            // 2: also sample each slot again the old way from a copy of its sampler, taken first, and stop on a difference
+            static const int mode = getenv("STRIX_PARALLEL_SAMPLING") ? atoi(getenv("STRIX_PARALLEL_SAMPLING")) : 1;
+            const bool on = mode != 0;
+            std::vector<size_t> work;
+            if (on) {
+                for (size_t k = 0; k < slots.size(); ++k) {
+                    const server_slot & slot = slots[k];
+                    if (slot.state == SLOT_STATE_GENERATING && is_inside_view(slot.i_batch) && slot.task &&
+                            !(slot.can_speculate() && !slot.spec_draft.empty()) && !slot.task->params.sampling.backend_sampling) {
+                        work.push_back(k);
+                    }
+                }
+            }
+            if (work.size() >= 2) {
+                llama_synchronize(ctx_tgt);
+                const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt)));
+                std::vector<const float *> rows(work.size());
+                for (size_t w = 0; w < work.size(); ++w) {
+                    rows[w] = llama_get_logits_ith(slots[work[w]].ctx_tgt, slots[work[w]].i_batch - off);
+                }
+                bool ok = true;
+                for (const float * r : rows) {
+                    ok = ok && r != nullptr;
+                }
+                std::vector<common_sampler *> copies;
+                if (ok && mode == 2) {
+                    for (const size_t k : work) {
+                        copies.push_back(common_sampler_clone(slots[k].smpl.get()));
+                    }
+                }
+                if (ok) {
+                    scoped_timer timer(t_sampl, n_sampl);
+                    std::vector<std::thread> threads;
+                    threads.reserve(work.size() - 1);
+                    std::vector<std::exception_ptr> errors(work.size());
+                    auto run = [&](size_t w) {
+                        try {
+                            pre_sampled[work[w]] = common_sampler_sample_logits(slots[work[w]].smpl.get(), rows[w], n_vocab);
+                        } catch (...) {
+                            errors[w] = std::current_exception();
+                        }
+                    };
+                    for (size_t w = 1; w < work.size(); ++w) {
+                        threads.emplace_back(run, w);
+                    }
+                    run(0);
+                    for (auto & t : threads) {
+                        t.join();
+                    }
+                    // a slot whose sampling threw samples again the usual way below, where the error reaches iterate()
+                    for (size_t w = 0; w < work.size(); ++w) {
+                        if (errors[w]) {
+                            pre_sampled[work[w]] = LLAMA_TOKEN_NULL;
+                        }
+                    }
+                }
+                if (!copies.empty()) {
+                    static int64_t n_checked = 0;
+                    for (size_t w = 0; w < work.size(); ++w) {
+                        const server_slot & slot = slots[work[w]];
+                        const llama_token old_way = common_sampler_sample(copies[w], slot.ctx_tgt, slot.i_batch - off);
+                        common_sampler_free(copies[w]);
+                        if (pre_sampled[work[w]] != LLAMA_TOKEN_NULL && old_way != pre_sampled[work[w]]) {
+                            SRV_ERR("parallel sampling check: slot %d sampled %d, the old way %d\n", slot.id, pre_sampled[work[w]], old_way);
+                            GGML_ABORT("parallel sampling check failed");
+                        }
+                        ++n_checked;
+                    }
+                    if (n_checked % 512 < work.size()) {
+                        SRV_WRN("parallel sampling check: %lld tokens, the same as sampled one by one\n", (long long) n_checked);
+                    }
+                }
+            }
+        }
+
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
@@ -5545,8 +5649,8 @@ private:
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
 
-            llama_token id;
-            {
+            llama_token id = pre_sampled[&slot - slots.data()];
+            if (id == LLAMA_TOKEN_NULL) {
                 scoped_timer timer(t_sampl, n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }

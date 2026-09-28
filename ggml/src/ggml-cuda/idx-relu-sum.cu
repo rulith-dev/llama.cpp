@@ -163,18 +163,39 @@ static __device__ __forceinline__ float idxd_wave(const half2 * __restrict__ k, 
 }
 
 // thread pair (2b, 2b + 1) takes key b: thread w the dims [64 w, 64 w + 64), the vector kernel's wave w
+//
+// strixllama: with several sequences in a strip a block is seen by the queries of its own sequence only, so each pair tests a
+// query's visibility first and skips the dot products of an invisible one (the pair shares its key and query, so both skip
+// together, and the shuffle stays inside it). A computed score is the same as before and a skipped one was -inf regardless.
+// The membership product's terms are 0 or 1, so it is above 0.5 exactly when the block and the query share a slot: with at
+// most 32 slots that is a test of two bit masks, the queries' made once a workgroup and a block's once a pair.
 static __global__ void __launch_bounds__(256) k_idx_score_dec(const half * __restrict__ kb, const int64_t kbs,
         const int32_t * __restrict__ rows, const int nb, const float * __restrict__ q, const int64_t qs, const int nq,
         const int32_t * __restrict__ starts, const int32_t * __restrict__ tails, float * __restrict__ out, const float zero,
         const float * __restrict__ seq_blk, const float * __restrict__ seq_tok, const int n_slots) {
     __shared__ float qsh[IDXD_MAXQ * 4 * 128];
+    __shared__ uint32_t tok_mask[IDXD_MAXQ];
+    const bool use_mask = seq_blk != nullptr && n_slots <= 32;
     for (int i = threadIdx.x; i < nq * 4 * 128; i += blockDim.x) {
         qsh[i] = q[(int64_t) (i / 128) * qs + i % 128];
+    }
+    if (use_mask && threadIdx.x < (unsigned) nq) {
+        uint32_t m = 0;
+        for (int sl = 0; sl < n_slots; ++sl) {
+            m |= (seq_tok[(int64_t) threadIdx.x * n_slots + sl] > 0.5f ? 1u : 0u) << sl;
+        }
+        tok_mask[threadIdx.x] = m;
     }
     __syncthreads();
     const int w = threadIdx.x & 1;
     const int b = (blockIdx.x * blockDim.x + threadIdx.x) >> 1;
     const bool valid = b < nb;
+    uint32_t blk_mask = 0;
+    if (valid && use_mask) {
+        for (int sl = 0; sl < n_slots; ++sl) {
+            blk_mask |= (seq_blk[(int64_t) b * n_slots + sl] > 0.5f ? 1u : 0u) << sl;
+        }
+    }
     half2 k[32];
     if (valid) {
         const uint4 * kp = (const uint4 *) (kb + (int64_t) rows[b] * kbs + 64 * w);
@@ -192,6 +213,25 @@ static __global__ void __launch_bounds__(256) k_idx_score_dec(const half * __res
     }
     const int st = valid ? starts[b] : 0;
     for (int t = 0; t < nq; ++t) {
+        bool vis = valid && tails[t] > st;
+        if (vis && seq_blk) {
+            if (use_mask) {
+                vis = (blk_mask & tok_mask[t]) != 0;
+            } else {
+                // the membership product's 0/1 terms: exact in any order
+                float m = 0.0f;
+                for (int sl = 0; sl < n_slots; ++sl) {
+                    m += seq_blk[(int64_t) b * n_slots + sl] * seq_tok[(int64_t) t * n_slots + sl];
+                }
+                vis = m > 0.5f;
+            }
+        }
+        if (!vis) {
+            if (valid && w == 0) {
+                out[(int64_t) t * nb + b] = -INFINITY;
+            }
+            continue;
+        }
         float acc = 0.0f;
 #pragma unroll
         for (int h = 0; h < 4; ++h) {
@@ -202,17 +242,8 @@ static __global__ void __launch_bounds__(256) k_idx_score_dec(const half * __res
             const float r = fmaxf(v, 0.0f);
             acc = h == 0 ? r : acc + r;
         }
-        if (valid && w == 0) {
-            bool vis = tails[t] > st;
-            if (seq_blk) {
-                // the membership product's 0/1 terms: exact in any order
-                float m = 0.0f;
-                for (int sl = 0; sl < n_slots; ++sl) {
-                    m += seq_blk[(int64_t) b * n_slots + sl] * seq_tok[(int64_t) t * n_slots + sl];
-                }
-                vis = vis && m > 0.5f;
-            }
-            out[(int64_t) t * nb + b] = vis ? acc + zero : -INFINITY;
+        if (w == 0) {
+            out[(int64_t) t * nb + b] = acc + zero;
         }
     }
 }

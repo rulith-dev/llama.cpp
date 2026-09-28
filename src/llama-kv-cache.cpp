@@ -1203,6 +1203,15 @@ void llama_kv_cache::set_move_hook(std::function<void(const cell_move_vec_t &, b
     move_hook = std::move(hook);
 }
 
+// strixllama: a conversation restored into cells another one just left was found with the last layer's values
+// for ~590 of its cells zeroed: the zeroing of the leaving conversation's cells, queued on the graphs' stream,
+// ran after the restore's rows, which ggml_backend_tensor_set writes on another stream. Wait for the queue first
+void llama_kv_cache::wait_queued_copies() const {
+    if (lctx_sync != nullptr) {
+        ggml_backend_sched_synchronize(lctx_sync->get_sched());
+    }
+}
+
 ggml_backend_t llama_kv_cache::backend_for(const ggml_tensor * t) const {
     if (lctx_sync == nullptr || t == nullptr || t->buffer == nullptr) {
         return nullptr;
@@ -1908,6 +1917,8 @@ bool llama_kv_cache::seq_rows_set(llama_seq_id seq_id, llama_pos p0, uint32_t n,
     if (n > src_rows || !seq_row_cells(seq_id, p0, n, true, runs)) {
         return false;
     }
+
+    wait_queued_copies();
 
     size_t off = 0;
     for (int kv = 0; kv < 2; ++kv) {
@@ -3292,6 +3303,11 @@ const slot_info_vec_t *   sinfos_in) {
 
         bool res = true;
         res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr);
+
+        // the cells state_read_meta freed or another conversation left are zeroed on the graphs' stream
+        if (res) {
+            wait_queued_copies();
+        }
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);

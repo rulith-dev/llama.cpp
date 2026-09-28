@@ -2855,6 +2855,12 @@ static bool strixllama_skip_op(const ggml_tensor * node) {
     if (wanted.empty()) { return false; }
     const char * op = ggml_op_name(node->op);
     for (const auto & w : wanted) {
+        // DEV: OP@ne0 skips only the nodes of that op whose ne[0] is ne0 (e.g. MUL_MAT@320)
+        const size_t at = w.find('@');
+        if (at != std::string::npos) {
+            if (w.compare(0, at, op) == 0 && atoll(w.c_str() + at + 1) == node->ne[0]) { return true; }
+            continue;
+        }
         const size_t colon = w.find(':');
         if (colon == std::string::npos) { if (w == op) { return true; } continue; }
         if (w.compare(0, colon, op) != 0) { continue; }
@@ -5672,7 +5678,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // strixllama ablation: STRIX_SKIP_OPS=SCALE,UNARY,UNARY:SIGMOID,... replaces those nodes by a
                 // zero fill so the per-token cost of an op class can be measured (output is garbage)
                 if (strixllama_skip_op(node)) {
-                    CUDA_CHECK(cudaMemsetAsync(node->data, 0, ggml_nbytes(node), cuda_ctx->stream()));
+                    // STRIX_SKIP_NOFILL=1: no zero fill either, so the dispatch itself goes (its cost with it)
+                    static const bool nofill = getenv("STRIX_SKIP_NOFILL") && atoi(getenv("STRIX_SKIP_NOFILL"));
+                    if (!nofill) {
+                        CUDA_CHECK(cudaMemsetAsync(node->data, 0, ggml_nbytes(node), cuda_ctx->stream()));
+                    }
                     continue;
                 }
 

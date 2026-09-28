@@ -416,6 +416,10 @@ private:
     // the backend of the device a tensor of this cache lives on, in the context that uses the cache
     ggml_backend_t backend_for(const ggml_tensor * t) const;
 
+    // strixllama: the zeroing of freed cells and the row moves are queued on the stream the graphs run on
+    // (zero_cells, copy_rows); a restore writes rows from the host on another stream, so it waits for them first
+    void wait_queued_copies() const;
+
     void apply_moves(const cell_move_vec_t & moves);
 
     size_t total_size() const;
