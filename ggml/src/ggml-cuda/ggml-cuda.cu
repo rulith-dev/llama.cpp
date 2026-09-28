@@ -2870,7 +2870,52 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 }
 
 #ifdef USE_CUDA_GRAPH
+// strixllama: a graph the scheduler did not split again - llama reused it, so the split keeps its cgraph and its uid - has the
+// HIP graph key and the compatibility it had. Hashing a decode graph's ~8000 nodes and walking them again for compatibility
+// took ~0.28 ms of every step on the host before the launch, the GPU idle
+struct ggml_cuda_graph_memo {
+    const ggml_cgraph * g   = nullptr;
+    uint64_t            uid = 0;
+    uint64_t            key = 0;
+    int                 compat = -1;
+};
+static ggml_cuda_graph_memo * ggml_cuda_graph_memo_find(const ggml_cgraph * cgraph, bool add) {
+    static ggml_cuda_graph_memo memo[8];
+    static int next = 0;
+    if (cgraph->uid == 0) {
+        return nullptr;
+    }
+    for (auto & m : memo) {
+        if (m.g == cgraph && m.uid == cgraph->uid) {
+            return &m;
+        }
+    }
+    if (!add) {
+        return nullptr;
+    }
+    ggml_cuda_graph_memo & m = memo[next];
+    next = (next + 1) % 8;
+    m = {};
+    m.g   = cgraph;
+    m.uid = cgraph->uid;
+    return &m;
+}
+
+static bool ggml_cuda_graph_check_compability_scan(ggml_cgraph * cgraph);
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+    ggml_cuda_graph_memo * m = ggml_cuda_graph_memo_find(cgraph, true);
+    if (m && m->compat >= 0) {
+        return m->compat != 0;
+    }
+    const bool res = ggml_cuda_graph_check_compability_scan(cgraph);
+    if (m) {
+        m->compat = res ? 1 : 0;
+    }
+    return res;
+}
+
+static bool ggml_cuda_graph_check_compability_scan(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
@@ -2925,6 +2970,10 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     if (!by_shape || cgraph->n_nodes == 0) {
         return cgraph->nodes[0];
     }
+    ggml_cuda_graph_memo * m = ggml_cuda_graph_memo_find(cgraph, true);
+    if (m && m->key != 0) {
+        return (const void *) (uintptr_t) m->key;
+    }
     uint64_t h = (uint64_t) (uintptr_t) cgraph->nodes[0];
     h ^= (uint64_t) cgraph->n_nodes * 0x9E3779B97F4A7C15ull;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
@@ -2933,6 +2982,9 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
         for (int d = 0; d < GGML_MAX_DIMS; ++d) {
             h = (h ^ (uint64_t) t->ne[d]) * 0x100000001B3ull;
         }
+    }
+    if (m) {
+        m->key = h;
     }
     return (const void *) (uintptr_t) h;
 }
@@ -4294,6 +4346,181 @@ static int ggml_cuda_match_idx_score(const ggml_cgraph * g, int i, ggml_cuda_idx
     return j + 10 - i;
 }
 
+// strixllama: the lightning indexer's score for a decode-sized strip (at most 8 queries, ggml_cuda_match_idx_score's gates
+// are for prefill strips): GET_ROWS (the block keys out of the block-key cache, F16 -> F32) -> RESHAPE, the strip's query
+// nodes, then MUL_MAT (keys x queries, four heads) -> RESHAPE -> RELU -> the head sum (CONT of head 0, then VIEW + ADD a head)
+// -> + log(step(tail - start)). k_idx_score_dec computes it from the cache in one kernel at the MUL_MAT; the GET_ROWS is
+// skipped, since the MUL_MAT was its only reader. At 110K tokens the chain took ~0.5 ms a layer, 12 layers a token.
+// STRIX_IDX_SCORE_DEC=0 keeps the nodes.
+struct ggml_cuda_idx_dec_match {
+    int gr  = -1;    // the GET_ROWS
+    int mm  = -1;    // the MUL_MAT
+    int end = -1;    // the visibility ADD, the chain's output
+    ggml_cuda_idx_score_dec_args a;
+    const ggml_tensor * sbv = nullptr;   // several sequences: the membership inputs' views
+    const ggml_tensor * stv = nullptr;
+    bool check = false;                  // STRIX_IDX_SCORE_DEC=2: the chain runs, the kernel is compared with it at `end`
+};
+
+static bool ggml_cuda_match_idx_score_dec(const ggml_cgraph * g, int i, ggml_cuda_idx_dec_match & m) {
+    static const bool on = !getenv("STRIX_IDX_SCORE_DEC") || atoi(getenv("STRIX_IDX_SCORE_DEC")) != 0;
+    if (!on || i + 24 >= g->n_nodes) return false;
+    const ggml_tensor * gr = g->nodes[i];
+    if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32) return false;
+    const ggml_tensor * kb = gr->src[0], * rows = gr->src[1];
+    if (!kb || !rows || kb->type != GGML_TYPE_F16 || kb->ne[0] != 128 || kb->ne[2] != 1 || kb->ne[3] != 1 ||
+        kb->nb[0] != sizeof(half) || kb->nb[1] % 16 != 0 || ((uintptr_t) kb->data) % 16 != 0 ||
+        rows->type != GGML_TYPE_I32 || rows->ne[1] != 1 || rows->ne[2] != 1 || rows->ne[3] != 1 || !ggml_is_contiguous(rows) ||
+        gr->ne[0] != 128 || gr->ne[1] != rows->ne[0] || gr->ne[2] != 1 || gr->ne[3] != 1 || !ggml_is_contiguous(gr) ||
+        rows->ne[0] < 1 || rows->ne[0] > INT_MAX || !ggml_node_has_n_uses(g, i, 1)) return false;
+    const ggml_tensor * rs = g->nodes[i + 1];
+    if (rs->op != GGML_OP_RESHAPE || rs->src[0] != gr || ggml_node_get_use_count(g, i + 1) != 1) return false;
+    // the MUL_MAT that reads the keys, past the strip's query nodes, none of which reads them
+    int j = i + 2;
+    for (; j < i + 32 && j < g->n_nodes; ++j) {
+        const ggml_tensor * n = g->nodes[j];
+        if (n->op == GGML_OP_MUL_MAT && n->src[0] == rs) break;
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (n->src[s] == gr || n->src[s] == rs) return false;
+        }
+    }
+    if (j >= i + 32 || j + 20 >= g->n_nodes) return false;
+    const ggml_tensor * mm = g->nodes[j];
+    const ggml_tensor * q = mm->src[1];
+    const int64_t nb = gr->ne[1];
+    if (mm->type != GGML_TYPE_F32 || !ggml_node_has_n_uses(g, j, 1) || !ggml_is_contiguous(mm) ||
+        q->type != GGML_TYPE_F32 || q->ne[0] != 128 || q->ne[1] % 4 != 0 || q->ne[1] < 4 || q->ne[1] > 32 ||
+        q->ne[2] != 1 || q->ne[3] != 1 || q->nb[0] != sizeof(float) || q->nb[1] % 8 != 0 || ((uintptr_t) q->data) % 8 != 0 ||
+        mm->ne[0] != nb || mm->ne[1] != q->ne[1]) return false;
+    const int64_t nq = q->ne[1] / 4;
+    // RESHAPE [nb, 4, nq] -> RELU -> CONT(head 0) and VIEW + ADD for heads 1..3, as build_qsa_top_k leaves them
+    const ggml_tensor * rs2 = g->nodes[j + 1], * relu = g->nodes[j + 2];
+    if (rs2->op != GGML_OP_RESHAPE || rs2->src[0] != mm || rs2->ne[0] != nb || rs2->ne[1] != 4 || rs2->ne[2] != nq || rs2->ne[3] != 1 ||
+        ggml_node_get_use_count(g, j + 1) != 1) return false;
+    if (relu->op != GGML_OP_UNARY || ggml_get_unary_op(relu) != GGML_UNARY_OP_RELU || relu->src[0] != rs2 ||
+        relu->type != GGML_TYPE_F32 || !ggml_is_contiguous(relu)) return false;
+    auto is_slice = [&](const ggml_tensor * v, int64_t h) {
+        return v->op == GGML_OP_VIEW && v->view_src == relu && v->type == GGML_TYPE_F32 &&
+               v->ne[0] == nb && v->ne[1] == nq && v->ne[2] == 1 && v->ne[3] == 1 &&
+               v->nb[0] == sizeof(float) && v->nb[1] == relu->nb[2] && v->view_offs == (size_t) h * relu->nb[1];
+    };
+    const ggml_tensor * cont = g->nodes[j + 4];
+    if (!is_slice(g->nodes[j + 3], 0) || cont->op != GGML_OP_CONT || cont->src[0] != g->nodes[j + 3] ||
+        ggml_node_get_use_count(g, j + 4) != 1) return false;
+    const ggml_tensor * summed = cont;
+    int k = j + 5;
+    for (int64_t h = 1; h < 4; ++h) {
+        const ggml_tensor * v = g->nodes[k], * add = g->nodes[k + 1];
+        if (!is_slice(v, h) || add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 || add->src[0] != summed || add->src[1] != v ||
+            !ggml_are_same_shape(add, cont) || !ggml_is_contiguous(add) || ggml_node_get_use_count(g, k + 1) != 1) return false;
+        summed = add;
+        k += 2;
+    }
+    if (ggml_node_get_use_count(g, j + 2) != 4) return false;   // the relu feeds its four head slices only
+    // the visibility: VIEW(limits) CPY RESHAPE REPEAT VIEW(limits) CPY SUB STEP LOG ADD, as in ggml_cuda_match_idx_score; with
+    // several sequences in the strip VIEW(seq_blk) CPY(F16) VIEW(seq_tok) MUL_MAT SCALE STEP MUL between the STEP and the LOG
+    if (k + 9 >= g->n_nodes) return false;
+    const ggml_tensor * const * n = g->nodes + k;
+    const ggml_tensor * tv = n[0], * tc = n[1], * tr = n[2], * rp = n[3], * sv = n[4], * sc = n[5], * sub = n[6], * st = n[7], * lg = n[8], * add = n[9];
+    const ggml_tensor * mbv = nullptr, * mtv = nullptr;
+    if (lg->op == GGML_OP_VIEW) {
+        if (k + 16 >= g->n_nodes) return false;
+        const ggml_tensor * bv = n[8], * bc = n[9], * tvw = n[10], * mm2 = n[11], * sb = n[12], * st2 = n[13], * mul = n[14];
+        lg = n[15];
+        add = n[16];
+        const int64_t ns = bv->ne[0];
+        float sb_scale = 0.0f, sb_bias = 0.0f;
+        if (sb->op == GGML_OP_SCALE) {
+            memcpy(&sb_scale, (const float *) sb->op_params + 0, sizeof(float));
+            memcpy(&sb_bias,  (const float *) sb->op_params + 1, sizeof(float));
+        }
+        if (ns < 1 || ns > 64 ||
+            bv->type != GGML_TYPE_F32 || bv->ne[1] < nb || bv->ne[2] != 1 || bv->ne[3] != 1 || bv->nb[0] != sizeof(float) ||
+            bv->nb[1] != ns * sizeof(float) || !bv->view_src ||
+            bc->op != GGML_OP_CPY || bc->src[0] != bv || bc->type != GGML_TYPE_F16 || bc->ne[0] != ns || bc->ne[1] != nb ||
+            tvw->op != GGML_OP_VIEW || tvw->type != GGML_TYPE_F32 || tvw->ne[0] != ns || tvw->ne[1] != nq || tvw->nb[0] != sizeof(float) ||
+            tvw->nb[1] != ns * sizeof(float) || !tvw->view_src ||
+            mm2->op != GGML_OP_MUL_MAT || mm2->src[0] != bc || mm2->src[1] != tvw || mm2->ne[0] != nb || mm2->ne[1] != nq ||
+            sb->op != GGML_OP_SCALE || sb->src[0] != mm2 || sb_scale != 1.0f || sb_bias != -0.5f ||
+            st2->op != GGML_OP_UNARY || ggml_get_unary_op(st2) != GGML_UNARY_OP_STEP || st2->src[0] != sb ||
+            mul->op != GGML_OP_MUL || mul->src[0] != st || mul->src[1] != st2 || !ggml_are_same_shape(mul, summed) ||
+            lg->op != GGML_OP_LOG || lg->src[0] != mul) return false;
+        const int uses_m[7] = {1, 2, 1, 1, 1, 1, 1};
+        for (int u = 0; u < 7; ++u) {
+            if (ggml_node_get_use_count(g, k + 8 + u) != uses_m[u]) return false;
+        }
+        mbv = bv;
+        mtv = tvw;
+    }
+    auto limits_view = [](const ggml_tensor * v, int64_t len) {
+        return v->op == GGML_OP_VIEW && v->type == GGML_TYPE_I32 && v->view_src && v->view_src->type == GGML_TYPE_I32 &&
+               v->ne[0] == len && v->ne[1] == 1 && v->ne[2] == 1 && v->ne[3] == 1 && v->nb[0] == sizeof(int32_t);
+    };
+    auto cast_of = [](const ggml_tensor * c, const ggml_tensor * v) {
+        return c->op == GGML_OP_CPY && c->src[0] == v && c->type == GGML_TYPE_F32 && ggml_nelements(c) == ggml_nelements(v) && ggml_is_contiguous(c);
+    };
+    if (!limits_view(tv, nq) || !cast_of(tc, tv) || tr->op != GGML_OP_RESHAPE || tr->src[0] != tc || tr->ne[0] != 1 || tr->ne[1] != nq ||
+        rp->op != GGML_OP_REPEAT || rp->src[0] != tr || !ggml_are_same_shape(rp, summed) ||
+        !limits_view(sv, nb) || sv->view_src != tv->view_src || !cast_of(sc, sv) ||
+        sub->op != GGML_OP_SUB || sub->src[0] != rp || sub->src[1] != sc ||
+        st->op != GGML_OP_UNARY || ggml_get_unary_op(st) != GGML_UNARY_OP_STEP || st->src[0] != sub ||
+        (!mbv && (lg->op != GGML_OP_LOG || lg->src[0] != st)) ||
+        add->op != GGML_OP_ADD || add->src[0] != summed || add->src[1] != lg || add->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(add, summed) || !ggml_is_contiguous(add)) return false;
+    const int uses[9] = {1, 2, 1, 1, 1, 2, 1, 1, 1};
+    for (int u = 0; u < 8; ++u) {
+        if (ggml_node_get_use_count(g, k + u) != uses[u]) return false;
+    }
+    if (!mbv && ggml_node_get_use_count(g, k + 8) != 1) return false;
+    if (mbv && ggml_node_get_use_count(g, k + 15) != 1) return false;
+    if (!ggml_node_has_n_uses(g, k - 1, 1)) return false;   // the head sum feeds only the ADD
+    m.gr = i; m.mm = j; m.end = mbv ? k + 16 : k + 9;
+    m.a.kb = kb; m.a.rows = rows; m.a.q = q; m.a.out = (ggml_tensor *) add;
+    m.a.starts = (const int32_t *) sv->data; m.a.tails = (const int32_t *) tv->data;
+    if (mbv) {
+        m.a.seq_blk = (const float *) mbv->data;
+        m.a.seq_tok = (const float *) mtv->data;
+        m.a.n_slots = (int) mbv->ne[0];
+        m.sbv = mbv;
+        m.stv = mtv;
+    }
+    return true;
+}
+
+// a matched decode strip: the GET_ROWS skipped, the kernel run at the MUL_MAT (reset at every graph evaluation)
+static ggml_cuda_idx_dec_match g_idx_dec_pending;
+
+static int ggml_cuda_idx_dec_mode() {
+    static const int mode = getenv("STRIX_IDX_SCORE_DEC") ? atoi(getenv("STRIX_IDX_SCORE_DEC")) : 1;
+    return mode;
+}
+
+// STRIX_IDX_SCORE_DEC=2, after the chain's last node ran: the kernel into scratch, both copied back and compared
+static void ggml_cuda_idx_dec_check(ggml_backend_cuda_context & ctx, const ggml_cuda_idx_dec_match & m) {
+    const size_t n = ggml_nelements(m.a.out);
+    ggml_cuda_pool_alloc<float> scratch(ctx.pool(), n);
+    ggml_tensor out = *m.a.out;
+    out.data = scratch.get();
+    ggml_cuda_idx_score_dec_args a = m.a;
+    a.out = &out;
+    ggml_cuda_op_idx_score_dec(ctx, a);
+    std::vector<float> want(n), got(n);
+    CUDA_CHECK(cudaMemcpyAsync(want.data(), m.a.out->data, n*sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaMemcpyAsync(got.data(), scratch.get(), n*sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    static int64_t n_checked = 0;
+    if (memcmp(want.data(), got.data(), n*sizeof(float)) != 0) {
+        size_t k = 0;
+        while (k < n && memcmp(&want[k], &got[k], sizeof(float)) == 0) { ++k; }
+        fprintf(stderr, "IDX_SCORE_DEC check: element %zu of %zu differs: chain %.9g, kernel %.9g (%lld queries, %d slots)\n",
+                k, n, want[k], got[k], (long long) (m.a.q->ne[1]/4), m.a.n_slots);
+        GGML_ABORT("IDX_SCORE_DEC check failed");
+    }
+    if (++n_checked % 64 == 0) {
+        fprintf(stderr, "IDX_SCORE_DEC check: %lld strips, the kernel's scores equal the chain's\n", (long long) n_checked);
+    }
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4302,6 +4529,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // strixllama: a decode strip's indexer score (ggml_cuda_match_idx_score_dec): skip the keys' GET_ROWS and its RESHAPE,
+    // run the whole score at the MUL_MAT
+    if (node->op == GGML_OP_MUL_MAT && g_idx_dec_pending.mm == i && g_idx_dec_pending.a.out) {
+        ggml_cuda_op_idx_score_dec(*cuda_ctx, g_idx_dec_pending.a);
+        const int skip = g_idx_dec_pending.end - i;
+        g_idx_dec_pending = {};
+        return skip;
+    }
+    if (node->op == GGML_OP_GET_ROWS && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        ggml_cuda_idx_dec_match m;
+        if (ggml_cuda_match_idx_score_dec(cgraph, i, m)) {
+            if (ggml_cuda_idx_dec_mode() == 2) {
+                m.check = true;
+                m.mm = -1;
+                g_idx_dec_pending = m;
+                return 0;
+            }
+            g_idx_dec_pending = m;
+            return 1;
+        }
+    }
 
     if (node->op == GGML_OP_CONT) {
         int sk = ggml_cuda_qsa_pack_fuse(*cuda_ctx, cgraph, i);
@@ -5181,6 +5430,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
+    g_idx_dec_pending = {};
+
     // strixllama: whether HIP graphs actually engage decides how much of a decode step is kernel
     // launch overhead, and the upstream notice is a GGML_LOG_DEBUG compiled out of a release
     // build. Report the first few graphs either way under LLAMA_GRAPH_TRACE=1.
@@ -5476,6 +5727,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif  // NDEBUG
 
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                if (ok && g_idx_dec_pending.check && i == g_idx_dec_pending.end) {
+                    ggml_cuda_idx_dec_check(*cuda_ctx, g_idx_dec_pending);
+                    g_idx_dec_pending = {};
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -5917,6 +6172,26 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             ggml_tensor * src_root = nullptr, * out = nullptr;
             if (ggml_cuda_qsa_pack_deps(cgraph, i, &src_root, &out) || ggml_cuda_cont_sigmoid_deps(cgraph, i, &src_root, &out)) {
                 params->add_alloc_dep(params->user_data, src_root, out);
+            }
+        }
+    }
+
+    {   // strixllama: the decode strip's fused score reads the rows, the queries and the limits at the MUL_MAT, after the rows'
+        // GET_ROWS would have: all three stay allocated until the result is written
+        auto root = [](const ggml_tensor * t) { return const_cast<ggml_tensor *>(t->view_src ? t->view_src : t); };
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i]->op != GGML_OP_GET_ROWS) continue;
+            ggml_cuda_idx_dec_match m;
+            if (ggml_cuda_match_idx_score_dec(cgraph, i, m)) {
+                // the limits' starts view: five nodes before the end in the one-sequence chain, twelve with the membership
+                const ggml_tensor * sv = cgraph->nodes[m.end - (m.sbv ? 12 : 5)];
+                params->add_alloc_dep(params->user_data, root(m.a.rows), m.a.out);
+                params->add_alloc_dep(params->user_data, root(m.a.q), m.a.out);
+                params->add_alloc_dep(params->user_data, root(sv), m.a.out);
+                if (m.sbv) {
+                    params->add_alloc_dep(params->user_data, root(m.sbv), m.a.out);
+                    params->add_alloc_dep(params->user_data, root(m.stv), m.a.out);
+                }
             }
         }
     }

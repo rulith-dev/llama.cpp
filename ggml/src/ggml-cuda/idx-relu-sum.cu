@@ -127,3 +127,104 @@ void ggml_cuda_op_idx_score(ggml_backend_cuda_context & ctx, const ggml_cuda_idx
     static unsigned hits = 0;
     if (hits++ < 2) fprintf(stderr, "IDX_SCORE fused: blocks=%d queries=%d\n", nb, nq);
 }
+
+// strixllama: the indexer score of a decode-sized strip (at most 8 queries), whole: out[t][b] = s + log(step(tails[t] - starts[b]))
+// with s = ((relu(s0) + relu(s1)) + relu(s2)) + relu(s3), s_h = q[t][h] . kb[rows[b]] - what the graph computes as GET_ROWS (the
+// F16 block keys out of the cache as F32) -> MUL_MAT -> RELU -> the head sum -> the visibility, one pass over each key instead of
+// an F32 copy of every key and seven passes over the scores. Each dot product is the one the vector kernel takes for K = 128
+// (mul_mat_vec_f, 64 threads a row): thread l accumulates dims 2l and 2l + 1 with ggml_cuda_mad from 0, each wave of 32 sums its
+// partials by butterfly (offsets 16, 8, 4, 2, 1: lane 0 ends with ((((p0 + p16) + (p8 + p24)) + ...)), and the two waves' sums
+// are reduced again by butterfly with zeros in the other lanes, (w0 + 0) + (w1 + 0). Here one thread takes a key and spells that
+// tree out, so the scores are the chain's, bit for bit. `zero` is 0.0f, passed in so those additions stay in the code.
+#define IDXD_MAXQ 8
+
+static __device__ __forceinline__ float idxd_partial(const half2 k, const float * __restrict__ q) {
+    const float2 kx = __half22float2(k);
+    float s = 0.0f;
+    ggml_cuda_mad(s, kx.x, q[0]);
+    ggml_cuda_mad(s, kx.y, q[1]);
+    return s;
+}
+
+// one wave's butterfly sum of its 32 partials: k and q hold that wave's 64 dims
+static __device__ __forceinline__ float idxd_wave(const half2 * __restrict__ k, const float * __restrict__ q) {
+    float a[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        a[i] = idxd_partial(k[i], q + 2 * i) + idxd_partial(k[i + 16], q + 2 * (i + 16));
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { a[i] = a[i] + a[i + 8]; }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) { a[i] = a[i] + a[i + 4]; }
+#pragma unroll
+    for (int i = 0; i < 2; ++i) { a[i] = a[i] + a[i + 2]; }
+    return a[0] + a[1];
+}
+
+// thread pair (2b, 2b + 1) takes key b: thread w the dims [64 w, 64 w + 64), the vector kernel's wave w
+static __global__ void __launch_bounds__(256) k_idx_score_dec(const half * __restrict__ kb, const int64_t kbs,
+        const int32_t * __restrict__ rows, const int nb, const float * __restrict__ q, const int64_t qs, const int nq,
+        const int32_t * __restrict__ starts, const int32_t * __restrict__ tails, float * __restrict__ out, const float zero,
+        const float * __restrict__ seq_blk, const float * __restrict__ seq_tok, const int n_slots) {
+    __shared__ float qsh[IDXD_MAXQ * 4 * 128];
+    for (int i = threadIdx.x; i < nq * 4 * 128; i += blockDim.x) {
+        qsh[i] = q[(int64_t) (i / 128) * qs + i % 128];
+    }
+    __syncthreads();
+    const int w = threadIdx.x & 1;
+    const int b = (blockIdx.x * blockDim.x + threadIdx.x) >> 1;
+    const bool valid = b < nb;
+    half2 k[32];
+    if (valid) {
+        const uint4 * kp = (const uint4 *) (kb + (int64_t) rows[b] * kbs + 64 * w);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const uint4 v = kp[i];
+            k[4 * i + 0] = __builtin_bit_cast(half2, v.x);
+            k[4 * i + 1] = __builtin_bit_cast(half2, v.y);
+            k[4 * i + 2] = __builtin_bit_cast(half2, v.z);
+            k[4 * i + 3] = __builtin_bit_cast(half2, v.w);
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < 32; ++i) { k[i] = __builtin_bit_cast(half2, 0u); }
+    }
+    const int st = valid ? starts[b] : 0;
+    for (int t = 0; t < nq; ++t) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int h = 0; h < 4; ++h) {
+            const float mine  = idxd_wave(k, qsh + (t * 4 + h) * 128 + 64 * w);
+            const float other = __shfl_xor_sync(0xffffffff, mine, 1, 32);
+            const float w0 = w == 0 ? mine : other, w1 = w == 0 ? other : mine;
+            const float v = (w0 + zero) + (w1 + zero);
+            const float r = fmaxf(v, 0.0f);
+            acc = h == 0 ? r : acc + r;
+        }
+        if (valid && w == 0) {
+            bool vis = tails[t] > st;
+            if (seq_blk) {
+                // the membership product's 0/1 terms: exact in any order
+                float m = 0.0f;
+                for (int sl = 0; sl < n_slots; ++sl) {
+                    m += seq_blk[(int64_t) b * n_slots + sl] * seq_tok[(int64_t) t * n_slots + sl];
+                }
+                vis = vis && m > 0.5f;
+            }
+            out[(int64_t) t * nb + b] = vis ? acc + zero : -INFINITY;
+        }
+    }
+}
+
+void ggml_cuda_op_idx_score_dec(ggml_backend_cuda_context & ctx, const ggml_cuda_idx_score_dec_args & a) {
+    const int nb = (int) a.rows->ne[0], nq = (int) (a.q->ne[1] / 4);
+    GGML_ASSERT(nq >= 1 && nq <= IDXD_MAXQ && a.kb->nb[1] % 16 == 0 && ((uintptr_t) a.kb->data) % 16 == 0);
+    const dim3 grid((unsigned) ((2 * (int64_t) nb + 255) / 256));
+    k_idx_score_dec<<<grid, 256, 0, ctx.stream()>>>((const half *) a.kb->data, (int64_t) (a.kb->nb[1] / sizeof(half)),
+        (const int32_t *) a.rows->data, nb, (const float *) a.q->data, (int64_t) (a.q->nb[1] / sizeof(float)), nq,
+        a.starts, a.tails, (float *) a.out->data, 0.0f, a.seq_blk, a.seq_tok, a.n_slots);
+    CUDA_CHECK(cudaGetLastError());
+    static unsigned hits = 0;
+    if (hits++ < 2) fprintf(stderr, "IDX_SCORE_DEC fused: blocks=%d queries=%d\n", nb, nq);
+}

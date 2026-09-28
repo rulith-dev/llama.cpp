@@ -3474,6 +3474,67 @@ private:
             ckpts.erase(at[victim]);
         }
 
+        // strixllama: the checkpoints of every slot share one budget in RAM (STRIX_CKPT_BUDGET, 24 by default, ~2.7 GB at
+        // ~113 MiB each; 0: only each slot's n_ctx_checkpoints). Eight conversations of three turns held 6.5 GB of them, and
+        // more with every turn. Over the budget, the slot holding the most in RAM (of equals the least recently used) gives
+        // one up: its least valuable by the measure above, never its first (the end of the system prompt), this task's last.
+        // So one busy conversation still keeps n_ctx_checkpoints, and eight keep three each. Checkpoints the disk tier holds
+        // for an idle slot (no bytes here) do not count.
+        {
+            static const int budget = getenv("STRIX_CKPT_BUDGET") ? atoi(getenv("STRIX_CKPT_BUDGET")) : 24;
+            while (budget > 0) {
+                int           total  = 0;
+                server_slot * most   = nullptr;
+                size_t        most_n = 0;
+                for (auto & s : slots) {
+                    size_t n = 0;
+                    for (const auto & c : s.prompt.checkpoints) {
+                        n += !c.data_tgt.empty();
+                    }
+                    total += (int) n;
+                    if (n >= 2 && (n > most_n || (n == most_n && most != nullptr && s.t_last_used < most->t_last_used))) {
+                        most   = &s;
+                        most_n = n;
+                    }
+                }
+                if (total + 1 <= budget || most == nullptr) {
+                    break;
+                }
+                auto & cl = most->prompt.checkpoints;
+                cl.sort([](const common_prompt_checkpoint & a, const common_prompt_checkpoint & b) {
+                    return a.n_tokens < b.n_tokens;
+                });
+                std::vector<std::list<common_prompt_checkpoint>::iterator> at;
+                for (auto it = cl.begin(); it != cl.end(); ++it) {
+                    at.push_back(it);
+                }
+                const int64_t n_end  = most->prompt.n_tokens();
+                size_t        victim = at.size();
+                for (int pass = 0; pass < 2 && victim == at.size(); ++pass) {
+                    double v_min = 0.0;
+                    for (size_t i = 1; i < at.size(); ++i) {
+                        if (at[i]->data_tgt.empty() || (pass == 0 && most == &slot && at[i]->id_task == id_task)) {
+                            continue;
+                        }
+                        const int64_t n_i  = at[i]->n_tokens;
+                        const int64_t prev = at[i - 1]->n_tokens;
+                        const int64_t next = i + 1 < at.size() ? at[i + 1]->n_tokens : std::max<int64_t>(n_end, n_i);
+                        const double v = double(n_i - prev + 1) * double(next - n_i + 1) / double(std::max<int64_t>(n_end - n_i, 0) + 4096);
+                        if (victim == at.size() || v < v_min) {
+                            v_min  = v;
+                            victim = i;
+                        }
+                    }
+                }
+                if (victim == at.size()) {
+                    break;
+                }
+                SLT_INF(*most, "erasing context checkpoint at n_tokens = %" PRId64 " for the RAM budget (%d in RAM across the slots, budget %d)\n",
+                        at[victim]->n_tokens, total, budget);
+                cl.erase(at[victim]);
+            }
+        }
+
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
         {
             const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;

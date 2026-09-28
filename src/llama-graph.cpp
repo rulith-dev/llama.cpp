@@ -17,6 +17,8 @@
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
+#include <map>
+#include <typeinfo>
 #include <cmath>
 #include <cstring>
 #include <numeric>
@@ -1387,7 +1389,43 @@ void llm_graph_result::reset() {
     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
 }
 
+// strixllama: where a step's host input work goes (STRIX_INPUT_TIMING=1): per input class, the time its set_input and its
+// can_reuse take, averaged over 128 calls and logged as "IT <phase> <class> <us a call>". The per-cell scans grow with
+// the context. Off by default: one static bool per call.
+namespace {
+struct strixllama_input_timing {
+    static bool enabled() { static const bool e = getenv("STRIX_INPUT_TIMING") && atoi(getenv("STRIX_INPUT_TIMING")); return e; }
+    std::map<std::string, std::pair<int64_t, int64_t>> acc;   // phase + class -> (us, calls)
+    int64_t n = 0;
+    void add(const char * phase, const llm_graph_input_i & in, int64_t us) {
+        auto & e = acc[std::string(phase) + " " + typeid(in).name()];
+        e.first += us;
+        e.second += 1;
+    }
+    void tick() {
+        if (++n % 128 != 0) {
+            return;
+        }
+        for (const auto & [k, v] : acc) {
+            fprintf(stderr, "IT %s %.1f us\n", k.c_str(), v.second ? (double) v.first / v.second : 0.0);
+        }
+        acc.clear();
+    }
+};
+static strixllama_input_timing g_input_timing_set;
+static strixllama_input_timing g_input_timing_reuse;
+}
+
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+    if (strixllama_input_timing::enabled()) {
+        for (auto & input : inputs) {
+            const int64_t t0 = ggml_time_us();
+            input->set_input(ubatch);
+            g_input_timing_set.add("set", *input, ggml_time_us() - t0);
+        }
+        g_input_timing_set.tick();
+        return;
+    }
     for (auto & input : inputs) {
         input->set_input(ubatch);
     }
@@ -1453,7 +1491,11 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
     for (auto & input : inputs) {
+        const int64_t t_cr = strixllama_input_timing::enabled() ? ggml_time_us() : 0;
         const bool cur = input->can_reuse(params);
+        if (t_cr) {
+            g_input_timing_reuse.add("reuse", *input, ggml_time_us() - t_cr);
+        }
 
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
@@ -1464,6 +1506,10 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 
     if (debug > 0) {
         LLAMA_LOG_DEBUG("%s: can reuse graph = %d\n", __func__, res);
+    }
+
+    if (strixllama_input_timing::enabled()) {
+        g_input_timing_reuse.tick();
     }
 
     return res;

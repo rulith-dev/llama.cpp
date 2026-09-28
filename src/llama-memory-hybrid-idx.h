@@ -186,6 +186,21 @@ private:
                             const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias,
                             const qsa_kb_inputs * kb, const qsa_mixed_inputs * mixed = nullptr,
                             bool active_only = false, uint32_t kv_off = 0) const;
+    // strixllama: what set_input_qsa_scan writes, for one conversation that is one run (llama_kv_cells::seq_run)
+    struct qsa_run_inputs {
+        std::vector<int32_t> blk_cells, blk_pos, limits, tail, bid_rows, dirty_cells, dirty_pos, dirty_dst;
+        std::vector<float>   seq_blk, seq_tok;
+        std::vector<llama_seq_id> clear_from;   // kb_from[s] = none for these
+        bool set_stale = false;                 // and kb_stale[s] = 1
+    };
+    bool set_input_qsa_run(qsa_run_inputs & out, ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                           ggml_tensor * bias, ggml_tensor * tail_idxs, const llama_ubatch * ubatch, uint32_t ratio,
+                           const qsa_kb_inputs * kb, const qsa_mixed_inputs * mixed, bool active_only, uint32_t kv_off) const;
+    void set_input_qsa_scan(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                            ggml_tensor * bias, ggml_tensor * tail_idxs,
+                            const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias,
+                            const qsa_kb_inputs * kb, const qsa_mixed_inputs * mixed,
+                            bool active_only, uint32_t kv_off) const;
 
     // strixllama: block-key cache storage, one tensor per indexer layer, in the layer's device buffer
     std::vector<ggml_context_ptr>        kb_ctxs;
