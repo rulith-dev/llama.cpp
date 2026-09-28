@@ -386,6 +386,11 @@ struct server_slot {
     int32_t  tail_n    = 0;
     uint64_t tail_hash_v = 0;
 
+    // strixllama: the pool guard (pool_guard_on) holds this slot's prompt back until there are cells for it, or its
+    // answer for a step
+    bool pool_waiting = false;
+    bool pool_paused  = false;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -843,6 +848,9 @@ struct server_slot {
         n_accepted_per_pos.clear();
 
         n_predict_max = -1;
+
+        pool_waiting = false;
+        pool_paused  = false;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -1375,6 +1383,11 @@ private:
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
 
     int n_empty_consecutive = 0;
+
+    // strixllama: the pool guard (pool_guard_on) - the last get_available_slot() found no room for the prompt; steps in
+    // a row where every busy conversation waited for cells
+    bool pool_deferred = false;
+    int  n_pool_stalls = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
@@ -2419,6 +2432,21 @@ private:
             // room for this prompt and a margin to generate into, before anything is restored
             const size_t margin = task.params.n_predict > 0 ? (size_t) std::min<int32_t>(task.params.n_predict, 32768) : 4096;
             if (task.type == SERVER_TASK_TYPE_COMPLETION) {
+                // strixllama: with the pool guard the prompt starts only when it fits beside what the busy conversations
+                // will hold, and waits in the queue until then; the conversation it would copy from stays only if that
+                // fits as well
+                if (pool_guard_on() && params_base.kv_unified && !task.is_parent() && pool_any_busy()) {
+                    const int64_t need = (int64_t) task.tokens.size() + pool_answer_room(task_n_predict(task));
+                    if (!pool_fits(need, ret, src)) {
+                        if (src == nullptr || !pool_fits(need, ret, nullptr)) {
+                            pool_deferred = true;
+                            return nullptr;
+                        }
+                        src   = nullptr;
+                        n_src = 0;
+                    }
+                    make_room(*ret, (size_t) need, src, /* future = */ true);
+                }
                 make_room(*ret, task.tokens.size() + margin, src);
             }
 
@@ -2520,24 +2548,100 @@ private:
         }
     }
 
+    // strixllama: the pool guard. The unified KV pool is shared by every conversation, and upstream fails every
+    // request of a step that does not fit in it, and clears their caches: on 2026-09-28 eight agents held ~870K tokens
+    // in a 680K pool and seven failed at once. With the guard (STRIX_POOL_GUARD=0: as upstream)
+    // - a prompt starts only when it fits beside what the busy conversations will hold - their prompts and a reserve
+    //   for their answers - once the idle ones are on disk; until then it waits in the queue, holding no slot
+    // - a prompt's next piece and an answer's next tokens go into a step only as far as there are cells; otherwise
+    //   they wait for another conversation to finish
+    // - when every busy conversation waits for cells, the one that arrived last gives way: a prompt with an error a
+    //   client may retry, an answer by ending as if its context were full
+    static bool pool_guard_on() {
+        static const bool on = !getenv("STRIX_POOL_GUARD") || atoi(getenv("STRIX_POOL_GUARD")) != 0;
+        return on;
+    }
+
+    static constexpr int64_t POOL_STEP_MARGIN = 16;   // cells a step leaves free
+    static constexpr int64_t POOL_ANSWER_KEEP = 64;   // cells a prompt piece leaves each answer being generated
+
+    // the reserve for an answer: 8192 tokens (STRIX_POOL_ANSWER_ROOM, for tests), less when the request allows less
+    static int64_t pool_answer_room(int32_t n_predict) {
+        static const int64_t room = getenv("STRIX_POOL_ANSWER_ROOM") ? std::max(atoi(getenv("STRIX_POOL_ANSWER_ROOM")), 16) : 8192;
+        return n_predict > 0 ? std::min<int64_t>(n_predict, room) : room;
+    }
+
+    int32_t task_n_predict(const server_task & task) const {
+        return task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+    }
+
+    // the cells a conversation will hold: an idle one what it holds, a busy one its whole prompt and the reserve for
+    // its answer - an eighth of it more once the answer has outgrown it
+    int64_t pool_future(const server_slot & s) const {
+        const int64_t n = s.prompt.n_tokens();
+        if (!s.is_processing() || !s.task) {
+            return n;
+        }
+        if (s.state == SLOT_STATE_GENERATING) {
+            const int64_t room = pool_answer_room(-1);
+            int64_t r = std::max<int64_t>(room - (int64_t) s.stats.n_gen, room / 8);
+            if (s.n_predict_max > 0) {
+                r = std::min<int64_t>(r, std::max<int64_t>((int64_t) s.n_predict_max - s.stats.n_gen, 0));
+            }
+            return n + r;
+        }
+        return std::max<int64_t>(n, s.task->n_tokens()) + pool_answer_room(s.n_predict_max);
+    }
+
+    bool pool_any_busy() const {
+        return std::any_of(slots.begin(), slots.end(), [](const server_slot & s) { return s.is_processing(); });
+    }
+
+    // whether `need` more cells fit beside what the busy conversations will hold, the idle ones but `keep` on disk and
+    // `target`'s own cells replaced
+    bool pool_fits(int64_t need, const server_slot * target = nullptr, const server_slot * keep = nullptr) const {
+        int64_t used = 0;
+        for (const auto & s : slots) {
+            if (&s == target) {
+                continue;
+            }
+            if (s.is_processing()) {
+                used += pool_future(s);
+            } else if (&s == keep) {
+                used += s.prompt.n_tokens();
+            }
+        }
+        return used + need <= (int64_t) llama_n_ctx(ctx_tgt);
+    }
+
+    // cells of the unified pool no conversation holds
+    int64_t pool_free() const {
+        int64_t used = 0;
+        for (const auto & s : slots) {
+            used += s.prompt.n_tokens();
+        }
+        return (int64_t) llama_n_ctx(ctx_tgt) - used;
+    }
+
     // strixllama: before `target` takes a prompt of `need` tokens, free least recently used idle slots - on
     // disk first - until the other conversations and this one fit in the unified pool. Kept conversations can
     // fill it, and a restore from the cache needs free cells: without them it fails and the whole prompt is
     // processed instead, where the decode path would only have purged idle slots once prefill ran out.
-    void make_room(const server_slot & target, size_t need, const server_slot * keep = nullptr) {
+    // With `future` a busy conversation counts for what it will hold (pool_future). False: they do not fit.
+    bool make_room(const server_slot & target, size_t need, const server_slot * keep = nullptr, bool future = false) {
         if (!params_base.kv_unified) {
-            return;
+            return true;
         }
         const size_t n_pool = llama_n_ctx(ctx_tgt);
         while (true) {
             size_t used = 0;
             for (const auto & slot : slots) {
                 if (&slot != &target) {
-                    used += slot.prompt.n_tokens();
+                    used += future ? (size_t) pool_future(slot) : (size_t) slot.prompt.n_tokens();
                 }
             }
             if (used + need <= n_pool) {
-                return;
+                return true;
             }
             server_slot * victim = nullptr;
             for (auto & slot : slots) {
@@ -2549,7 +2653,7 @@ private:
                 }
             }
             if (!victim) {
-                return;                                     // the rest are busy; decoding copes as upstream does
+                return false;                               // the rest are busy (see pool_guard_on)
             }
             if (prompt_cache && prompt_cache->has_disk()) {
                 victim->prompt_save(*prompt_cache, /* ram = */ false, /* wait = */ true);
@@ -3433,12 +3537,16 @@ private:
 
                     const int id_task = task.id;
 
+                    // strixllama: whether it waits for room in the pool is decided afresh below (pool_guard_on)
+                    task.wait_pool = false;
+
                     // strixllama: another slot is computing this prompt's prefix right now: wait for it
                     if (wait_for_prefix(task)) {
                         queue_tasks.defer(std::move(task));
                         break;
                     }
 
+                    pool_deferred = false;
                     server_slot * slot = get_available_slot(task);
 
                     //
@@ -3446,6 +3554,16 @@ private:
                     //
 
                     if (slot == nullptr) {
+                        // strixllama: no room in the unified pool for it yet: it waits, holding no slot, until there is
+                        // (the deferred tasks in update_slots)
+                        if (pool_deferred) {
+                            task.wait_pool = true;
+                            if (task.wait_pool_t0 == 0) {
+                                task.wait_pool_t0 = ggml_time_us();
+                                SRV_INF("task %d waits for room in the KV pool: %zu prompt tokens, %u cells, %" PRId64 " free\n",
+                                        id_task, task.tokens.size(), llama_n_ctx(ctx_tgt), pool_free());
+                            }
+                        }
                         // if no slot is available, we defer this task for processing later
                         SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
                         queue_tasks.defer(std::move(task));
@@ -3457,6 +3575,10 @@ private:
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
                         queue_tasks.defer(std::move(task));
                         break;
+                    }
+
+                    if (task.wait_pool_t0 != 0) {
+                        SRV_INF("task %d starts after %.1f s waiting for room in the KV pool\n", id_task, (ggml_time_us() - task.wait_pool_t0) / 1e6);
                     }
 
                     if (task.is_parent()) {
@@ -3583,6 +3705,7 @@ private:
                     res->id           = task.id;
                     res->slots_data   = std::move(slots_data);
                     res->n_idle_slots = n_idle_slots;
+                    res->n_tasks_deferred = (int) queue_tasks.queue_tasks_deferred_size();
 
                     queue_results.send(std::move(res));
                 } break;
@@ -3913,10 +4036,20 @@ private:
         }
 
         // strixllama: prompts waiting for another slot's prefix (wait_for_prefix) go back to the queue once that slot
-        // is past it, has left that prompt, or two minutes went by
+        // is past it, has left that prompt, or two minutes went by; prompts waiting for room in the pool once they fit
+        // (pool_guard_on) - one that has waited a minute holds back those behind it, so it is not passed for ever
         {
             const int64_t now = ggml_time_us();
+            bool pool_blocked = false;
             queue_tasks.pop_deferred_if([&](const server_task & t) {
+                if (t.wait_pool) {
+                    if (pool_blocked) {
+                        return false;
+                    }
+                    const bool fits = !pool_any_busy() || pool_fits((int64_t) t.tokens.size() + pool_answer_room(task_n_predict(t)));
+                    pool_blocked = !fits && now - t.wait_pool_t0 > 60 * 1000 * 1000;
+                    return fits;
+                }
                 if (t.wait_slot < 0 || t.wait_slot >= (int) slots.size()) {
                     return false;
                 }
@@ -4137,10 +4270,31 @@ private:
             }
         }
 
+        // strixllama: the cells this step's answers take so far (see pool_guard_on)
+        int64_t n_pool_step = 0;
+        const int64_t n_spec_max = spec ? std::min<int64_t>(common_speculative_n_max(spec.get()), n_draft_cap) : 0;
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
                 return;
+            }
+
+            // strixllama: no cells for this answer's next tokens: idle conversations go to disk, and failing that it
+            // waits a step for another conversation to finish (see pool_guard_on)
+            if (pool_guard_on() && params_base.kv_unified) {
+                const int64_t need = 1 + std::max<int64_t>(n_spec_max, (int64_t) slot.spec_draft.size());
+                while (pool_free() - n_pool_step < need + POOL_STEP_MARGIN && try_clear_idle_slots()) {
+                }
+                if (pool_free() - n_pool_step < need + POOL_STEP_MARGIN) {
+                    if (!slot.pool_paused) {
+                        SLT_WRN(slot, "the KV pool (%u cells) is full: the answer waits for another conversation to finish\n", llama_n_ctx(ctx_tgt));
+                    }
+                    slot.pool_paused = true;
+                    return;
+                }
+                slot.pool_paused = false;
+                n_pool_step += need;
             }
 
             // check if we can batch this slot with the previous one
@@ -4722,6 +4876,47 @@ private:
                         }
                     }
 
+                    // strixllama: the prompt's next piece only as far as there are cells for it, a few left to each answer
+                    // being generated; an image goes whole. Idle conversations go to disk to make room, and otherwise the
+                    // prompt waits for another conversation to finish (see pool_guard_on)
+                    int32_t n_batch_slot = n_batch_prompt;
+                    if (pool_guard_on() && params_base.kv_unified && slot.prompt.n_tokens() < slot.task->n_tokens()) {
+                        slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);   // what the cache held past the prompt
+
+                        int64_t n_media = 0;
+                        for (size_t i = slot.prompt.n_tokens(); i < (size_t) slot.task->n_tokens() && input_tokens[i] == LLAMA_TOKEN_NULL; ) {
+                            const size_t n = mtmd_input_chunk_get_n_tokens(input_tokens.find_chunk(i).get());
+                            n_media += (int64_t) n;
+                            i += std::max<size_t>(n, 1);
+                        }
+                        const int64_t n_text = std::min<int64_t>(slot.task->n_tokens() - slot.prompt.n_tokens() - n_media, n_batch_prompt - batch.size());
+                        const int64_t n_want = n_media + std::max<int64_t>(n_text, 0);
+                        const int64_t n_min  = n_media + (n_text > 0 ? 1 : 0);
+
+                        auto keep_for_answers = [&]() {
+                            int64_t n = POOL_STEP_MARGIN;
+                            for (const auto & s : slots) {
+                                n += s.state == SLOT_STATE_GENERATING ? POOL_ANSWER_KEEP : 0;
+                            }
+                            return n;
+                        };
+                        int64_t room = pool_free() - keep_for_answers();
+                        if (room < n_want) {
+                            make_room(slot, (size_t) (slot.prompt.n_tokens() + n_want + keep_for_answers()));
+                            room = pool_free() - keep_for_answers();
+                        }
+                        if (room < n_min || room <= 0) {
+                            if (!slot.pool_waiting) {
+                                SLT_WRN(slot, "the KV pool (%u cells) is full: the prompt waits for another conversation to finish (%d of %d tokens in)\n",
+                                        llama_n_ctx(ctx_tgt), slot.prompt.n_tokens(), slot.task->n_tokens());
+                            }
+                            slot.pool_waiting = true;
+                            return;
+                        }
+                        slot.pool_waiting = false;
+                        n_batch_slot = (int32_t) std::min<int64_t>(n_batch_prompt, batch.size() + room - n_media);
+                    }
+
                     // note: the prompt timing is advanced in post_decode(), so it does not cover
                     //       the tokens added to the batch below
                     slot.print_timings_pp();
@@ -4863,7 +5058,7 @@ private:
                     }
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_prompt) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_slot) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -5019,6 +5214,47 @@ private:
                     slot_batched = &slot;
                 }
             });
+        }
+
+        // strixllama: nothing went into the step, three times in a row, because every busy conversation waits for cells
+        // (see pool_guard_on): the one that arrived last gives way - a prompt that holds cells, with an error a client
+        // may retry, else an answer, by ending as if its context were full. Its conversation stays in the slot, to go to
+        // disk or be purged like any idle one as the others need the room
+        if (pool_guard_on() && params_base.kv_unified) {
+            const bool stalled = batch.size() == 0 && std::any_of(slots.begin(), slots.end(), [](const server_slot & s) {
+                return s.is_processing() && (s.pool_waiting || s.pool_paused);
+            });
+            n_pool_stalls = stalled ? n_pool_stalls + 1 : 0;
+            if (n_pool_stalls >= 3) {
+                n_pool_stalls = 0;
+                auto last_of = [&](const std::function<bool(const server_slot &)> & which) {
+                    server_slot * last = nullptr;
+                    for (auto & s : slots) {
+                        if (s.is_processing() && which(s) && (!last || s.task->id > last->task->id)) {
+                            last = &s;
+                        }
+                    }
+                    return last;
+                };
+                server_slot * prompt = last_of([](const server_slot & s) { return s.pool_waiting && s.prompt.n_tokens() > 0; });
+                server_slot * answer = prompt ? nullptr : last_of([](const server_slot & s) { return s.pool_paused; });
+                if (prompt == nullptr && answer == nullptr) {
+                    prompt = last_of([](const server_slot & s) { return s.pool_waiting; });
+                }
+                if (prompt != nullptr) {
+                    SLT_WRN(*prompt, "the KV pool (%u cells) is full and every busy conversation waits for room: this request gives way\n", llama_n_ctx(ctx_tgt));
+                    send_error(*prompt, "The KV cache is full with other conversations; try again shortly.", ERROR_TYPE_UNAVAILABLE);
+                    prompt->release();
+                } else if (answer != nullptr) {
+                    SLT_WRN(*answer, "the KV pool (%u cells) is full and every busy conversation waits for room: this answer ends here\n", llama_n_ctx(ctx_tgt));
+                    answer->truncated      = true;
+                    answer->stop           = STOP_TYPE_LIMIT;
+                    answer->has_next_token = false;
+                    answer->print_timings();
+                    send_final_response(*answer);
+                    answer->release();
+                }
+            }
         }
     }
 
@@ -6186,6 +6422,8 @@ void server_routes::init_routes() {
             }
         }
 
+        // strixllama: the requests waiting in the queue, beside the slots (the app's Logs page)
+        res->headers["X-Strix-Waiting"] = std::to_string(res_task->n_tasks_deferred);
         res->ok(res_task->to_json());
         return res;
     };

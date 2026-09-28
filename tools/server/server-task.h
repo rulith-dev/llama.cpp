@@ -160,6 +160,10 @@ struct server_task {
     int64_t wait_n    = 0;
     int64_t wait_t0   = 0;
 
+    // strixllama: a deferred prompt waiting for room in the unified KV pool (pool_guard_on), and since when
+    bool    wait_pool    = false;
+    int64_t wait_pool_t0 = 0;
+
     // used by parallel sampling (multiple completions from same prompt)
     int id_parent  = -1;
     // temporary store of child tasks for scheduling
@@ -527,6 +531,7 @@ struct server_task_result_metrics : server_task_result {
 // used by /slots API
 struct server_task_result_slots : server_task_result {
     int n_idle_slots = 0;
+    int n_tasks_deferred = 0; // strixllama: requests waiting for a slot or for room in the KV pool (X-Strix-Waiting)
 
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result

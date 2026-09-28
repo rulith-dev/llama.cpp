@@ -101,10 +101,11 @@ void server_queue::pop_deferred_task(int id_slot) {
                 break;
             }
         }
-        // strixllama: then the first that waits for a slot rather than for another slot's prefix (wait_slot): that
-        // one would only be deferred again, and the free slot would stay free under the tasks behind it
+        // strixllama: then the first that waits for a slot rather than for another slot's prefix (wait_slot) or for
+        // room in the pool (wait_pool, handed back by the server once it fits): those would only be deferred again, and
+        // the free slot would stay free under the tasks behind them
         for (auto it = queue_tasks_deferred.begin(); !found && it != queue_tasks_deferred.end(); ++it) {
-            if (it->wait_slot < 0) {
+            if (it->wait_slot < 0 && !it->wait_pool) {
                 QUE_DBG("pop deferred task, id_task = %d\n", it->id);
                 queue_tasks.emplace_front(std::move(*it));
                 queue_tasks_deferred.erase(it);
@@ -112,8 +113,8 @@ void server_queue::pop_deferred_task(int id_slot) {
                 break;
             }
         }
-        // if not tasks found using the slot, just pop the first deferred task (default behavior)
-        if (!found) {
+        // if not tasks found using the slot, just pop the first deferred task (default behavior) - not one waiting for room
+        if (!found && !queue_tasks_deferred.front().wait_pool) {
             QUE_DBG("pop deferred task, id_task = %d\n", queue_tasks_deferred.front().id);
             queue_tasks.emplace_front(std::move(queue_tasks_deferred.front()));
             queue_tasks_deferred.pop_front();
@@ -126,15 +127,20 @@ void server_queue::pop_deferred_task(int id_slot) {
 void server_queue::pop_deferred_if(const std::function<bool(const server_task &)> & ready) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     bool moved = false;
+    // strixllama: the ready ones go to the front of the queue in the order they were deferred
+    std::vector<server_task> ready_tasks;
     for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ) {
         if (ready(*it)) {
             QUE_DBG("pop deferred task (ready), id_task = %d\n", it->id);
-            queue_tasks.emplace_front(std::move(*it));
+            ready_tasks.push_back(std::move(*it));
             it = queue_tasks_deferred.erase(it);
             moved = true;
         } else {
             ++it;
         }
+    }
+    for (auto it = ready_tasks.rbegin(); it != ready_tasks.rend(); ++it) {
+        queue_tasks.emplace_front(std::move(*it));
     }
     if (moved) {
         time_last_task = ggml_time_ms();
