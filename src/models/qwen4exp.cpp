@@ -549,6 +549,67 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_build_forward_expand(gf, cur);
 }
 
+static bool qwen4exp_pos_scalar(const llama_ubatch & ubatch);
+
+// strixllama: IndexShare (see llama_memory_hybrid_idx::share_sel). A catch-up keeps the selections of its tokens (at most
+// QWEN4EXP_SHARE_KEEP_ALL of them - a verify's catch-up, several slots at once; a prompt keeps none) when a sequence's
+// latest kept selection is more than LLAMA_MTP_INDEX_SHARE_REFRESH positions behind. A draft step attends to that
+// selection plus up to QWEN4EXP_SHARE_EXTRA cells of the positions since: the refresh distance, the catch-up, the draft
+// steps. The gather pads the selection to 2304 cells anyway, so the extra columns are free up to 253.
+static constexpr int64_t QWEN4EXP_SHARE_KEEP_ALL = 32;
+static constexpr int64_t QWEN4EXP_SHARE_EXTRA    = llama_memory_hybrid_idx::share_extra;
+
+// the refresh distance, at most the widest gap a draft step's extra columns cover
+static llama_pos qwen4exp_share_refresh() {
+    static const llama_pos v = getenv("LLAMA_MTP_INDEX_SHARE_REFRESH") ? atoi(getenv("LLAMA_MTP_INDEX_SHARE_REFRESH")) : 32;
+    return std::max<llama_pos>(0, std::min<llama_pos>(v, llama_memory_hybrid_idx::share_max_gap));
+}
+
+// whether the MTP layer's graph for this ubatch takes part in IndexShare: the memory keeps selections, the layer is
+// sparse, one stream, 1-D positions, and a view long enough to pay. A draft step's dense read of a short view costs
+// next to nothing, so below LLAMA_MTP_INDEX_SHARE_MIN_KV cells nothing is kept and the draft runs as without it
+// (measured 09-28: -0.6% a pass at 30K, -3.6% at 86K, -6.5% at 212K; the old every-catch-up design lost 4% at 4K).
+static bool qwen4exp_mtp_share_on(const llama_memory_hybrid_idx_context * mctx_hyb, const llama_ubatch & ubatch,
+        const llama_hparams & hparams) {
+    static const int64_t min_kv = getenv("LLAMA_MTP_INDEX_SHARE_MIN_KV") ? atoll(getenv("LLAMA_MTP_INDEX_SHARE_MIN_KV")) : 32768;
+    const auto * mem = mctx_hyb ? mctx_hyb->get_mem() : nullptr;
+    const uint32_t il = hparams.n_layer();
+    return mem && mem->share_sel() != nullptr && il < hparams.n_layer_all && hparams.dsv4_compress_ratios[il] > 0 &&
+        mctx_hyb->get_idx() != nullptr && mctx_hyb->get_n_stream() == 1 && qwen4exp_pos_scalar(ubatch) &&
+        (int64_t) mctx_hyb->get_idx()->get_n_kv() >= min_kv;
+}
+
+// whether an MTP ubatch without outputs runs the indexer to keep its tokens' selections
+static bool qwen4exp_mtp_capture(const llama_memory_hybrid_idx_context * mctx_hyb, const llama_ubatch & ubatch,
+        const llama_hparams & hparams) {
+    if (!qwen4exp_mtp_share_on(mctx_hyb, ubatch, hparams) || (int64_t) ubatch.n_tokens > QWEN4EXP_SHARE_KEEP_ALL) {
+        return false;
+    }
+    const int64_t r = hparams.dsv4_compress_ratios[hparams.n_layer()];
+    if ((int64_t) mctx_hyb->get_idx()->get_n_kv() <= (int64_t) hparams.indexer_top_k + r - 1) {
+        return false;
+    }
+    return mctx_hyb->get_mem()->share_capture_due(ubatch, qwen4exp_share_refresh());
+}
+
+// the choice qwen4exp_mtp_capture made when the graph was built, re-checked before the graph is reused
+class llama_model_qwen4exp::llm_graph_input_mtp_capture : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_mtp_capture(bool capture) : capture(capture) {}
+    virtual ~llm_graph_input_mtp_capture() = default;
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        const auto * m = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+        return qwen4exp_mtp_capture(m, params.ubatch, params.hparams) == capture;
+    }
+
+    const bool capture;
+};
+
 llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
     graph(model, params, no_build_t{}) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN4EXP MTP requires n_layer_nextn > 0");
@@ -663,21 +724,31 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
+    // strixllama: a ubatch without outputs - the catch-up after a verify, a prompt - only fills the draft's caches: its
+    // attention output reaches no output row (the FFN and the head see only those), so K, V and the indexer keys are
+    // stored and the query, the attention and wo are not built (LLAMA_MTP_STORE_ONLY=0 builds them)
+    static const bool store_only_on = !getenv("LLAMA_MTP_STORE_ONLY") || atoi(getenv("LLAMA_MTP_STORE_ONLY")) != 0;
+    const bool store_only = store_only_on && n_outputs == 0 && inp_out_ids != nullptr;
+
+    ggml_tensor * Qcur = nullptr;
+    ggml_tensor * gate = nullptr;
+    if (!store_only) {
     ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
     cb(Qcur_full, "mtp_Qcur_full", il);
 
-    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+    Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
         ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
     Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "mtp_Qcur_normed", il);
 
-    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+    gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
         ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
         ggml_element_size(Qcur_full) * n_embd_head);
     gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
     cb(gate, "mtp_gate", il);
+    }
 
     ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
@@ -688,13 +759,15 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
     cb(Vcur, "mtp_Vcur", il);
 
+    if (Qcur) {
     Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
+    cb(Qcur, "mtp_Qcur", il);
+    }
     Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
-    cb(Qcur, "mtp_Qcur", il);
     cb(Kcur, "mtp_Kcur", il);
 
     const float kq_scale = hparams.f_attention_scale == 0.0f
@@ -713,22 +786,48 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         // (its own q->ne[1] < 128 gate), so the sparse path would land on the slow split-D kernel.
         // build_qsa_store_k still runs, so the indexer cache stays complete for later sparse ubatches.
         static const int64_t mtp_min_t = getenv("LLAMA_MTP_QSA_MIN_T") ? atoll(getenv("LLAMA_MTP_QSA_MIN_T")) : 128;
-        if (r > 0 && n_kv_idx > width && (int64_t) n_tokens >= mtp_min_t) {
+        if (qwen4exp_mtp_share_on(mctx_hyb, ubatch, hparams) && cparams.mtp_share_reuse && !store_only) {
+            // strixllama: IndexShare - a draft step attends to the selection a catch-up kept, plus the positions since
+            build_qsa_store_k(mctx_hyb, cur, il);
+            top_k = build_mtp_share_reuse(mctx_hyb);
+        } else if (store_only) {
+            // strixllama: IndexShare - a catch-up keeps its tokens' selections when the latest kept one is too far behind
+            // (qwen4exp_mtp_capture); the graph fixes the choice, so an input re-checks it before the graph is reused
+            const bool capture = qwen4exp_mtp_capture(mctx_hyb, ubatch, hparams);
+            if (capture) {
+                ggml_tensor * sel = build_qsa_top_k(mctx_hyb, cur, inp_pos, inp_attn->get_kq_mask(), sections, il);
+                GGML_ASSERT(sel->ne[0] == mctx_hyb->get_mem()->share_width() && sel->ne[1] == n_tokens &&
+                        sel->ne[2] == 1 && sel->ne[3] == 1);
+                build_mtp_share_capture(mctx_hyb, sel);
+            } else if (r > 0) {
+                build_qsa_store_k(mctx_hyb, cur, il);
+            }
+            res->add_input(std::make_unique<llm_graph_input_mtp_capture>(capture));
+        } else if (r > 0 && n_kv_idx > width && (int64_t) n_tokens >= mtp_min_t) {
             top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos, inp_attn->get_kq_mask(), sections, il);
         } else if (r > 0) {
             build_qsa_store_k(mctx_hyb, cur, il);
         }
-        if (top_k) {
+        if (store_only) {
+            build_mtp_store_kv(inp_attn, Kcur, Vcur, il);
+        } else if (top_k) {
             cur = build_attn_qsa(inp_attn, Qcur, Kcur, Vcur, top_k, kq_scale, il);
         } else {
             cur = build_attn(inp_attn, nullptr, nullptr, nullptr,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
         }
+    } else if (store_only) {
+        build_mtp_store_kv(inp_attn, Kcur, Vcur, il);
     } else {
     cur = build_attn(inp_attn,
             nullptr, nullptr, nullptr,
             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     }
+
+    if (store_only) {
+        // no row is an output: every node from here on is empty, so the rows are taken before the attention's place
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    } else {
     cb(cur, "mtp_attn_pregate", il);
 
     cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
@@ -736,9 +835,12 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     cur = build_lora_mm(layer.wo, cur, layer.wo_s);
     cb(cur, "mtp_attn_out", il);
+    }
 
     if (inp_out_ids) {
+        if (!store_only) {
         cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
+        }
         inject = ggml_get_rows(ctx0, inject, inp_out_ids);
 
         res_hc = ggml_reshape_2d(ctx0, res_hc, hc_dim, res_hc->ne[2]);
@@ -923,6 +1025,13 @@ static std::vector<int64_t> qwen4exp_score_key_limits(const llama_memory_hybrid_
     return limits;
 }
 
+// strixllama: the rows of a block-key dirty list: the blocks a ubatch of n_tps tokens (per stream) completes, up to two per
+// sequence at its ends, and per sequence the blocks of a pending span (llama_memory_hybrid_idx::kb_pending_max positions,
+// in up to two runs beside the ubatch's own)
+static int64_t qwen4exp_kb_dirty_max(int64_t n_tps, int64_t ratio, int64_t n_seqs) {
+    return n_tps/ratio + 2*n_seqs + 2 + n_seqs*(llama_memory_hybrid_idx::kb_pending_max/ratio + 4);
+}
+
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
 public:
     llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias) :
@@ -1002,7 +1111,7 @@ public:
         if (kb_bid_rows) {
             res &= kb_full == mctx->kb_needs_full(params.ubatch);
             res &= kb_bid_rows->ne[0] == n_blocks;
-            if (kb_dirty_dst) { res &= kb_dirty_dst->ne[0] == params.ubatch.n_tokens/n_stream/ratio + 2*(int64_t) params.ubatch.n_seqs_unq + 2; }
+            if (kb_dirty_dst) { res &= kb_dirty_dst->ne[0] == qwen4exp_kb_dirty_max(params.ubatch.n_tokens/n_stream, ratio, params.ubatch.n_seqs_unq); }
         }
 
         return res;
@@ -1047,6 +1156,8 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
+        // strixllama: these keys are written without the indexer, so their blocks' cached keys are not refreshed
+        mctx->kb_note_unrefreshed(*ubatch);
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -1064,6 +1175,202 @@ public:
 
     const llama_memory_hybrid_idx_context * mctx;
 };
+
+class llama_model_qwen4exp::llm_graph_input_mtp_share : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp_share(const llama_memory_hybrid_idx_context * mctx, bool reuse) : mctx(mctx), reuse(reuse) {}
+    virtual ~llm_graph_input_mtp_share() = default;
+
+    void set_input(const llama_ubatch * ubatch) override {
+        const auto * mem  = mctx->get_mem();
+        const auto * attn = mctx->get_attn();
+        const int64_t kv_off = attn->get_kv_off();
+
+        llama_host_write(off);
+        ((float *) off->data)[0] = (float) kv_off;
+        ((float *) off->data)[1] = (float) attn->get_n_kv();
+
+        llama_host_write(rows);
+        int32_t * r = (int32_t *) rows->data;
+        const uint32_t n_tokens = ubatch->n_tokens;
+
+        if (!reuse) {
+            llama_host_write(dst);
+            int32_t * d = (int32_t *) dst->data;
+            // each sequence's last position in the ubatch
+            std::map<llama_seq_id, llama_pos> last;
+            std::map<llama_seq_id, uint32_t>  last_i;
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                const llama_seq_id s = ubatch->seq_id[i][0];
+                if (!last.count(s) || ubatch->pos[i] >= last[s]) {
+                    last[s]   = ubatch->pos[i];
+                    last_i[s] = i;
+                }
+            }
+            const llama_pos ring = (llama_pos) mem->share_ring_len();
+            if ((int64_t) n_tokens == rows->ne[0]) {
+                for (uint32_t i = 0; i < n_tokens; ++i) {
+                    const llama_seq_id s = ubatch->seq_id[i][0];
+                    const llama_pos    p = ubatch->pos[i];
+                    r[i] = (int32_t) i;
+                    // only the last `ring` positions of a sequence: two tokens must never write one row
+                    if (p > last[s] - ring && s >= 0 && s < mem->share_n_seqs()) {
+                        d[i] = mem->share_row(s, p);
+                        mem->share_note(s, p);
+                    } else {
+                        d[i] = mem->share_scratch_row();
+                    }
+                }
+            } else {
+                int64_t k = 0;
+                for (const auto & [s, i] : last_i) {
+                    if (k >= rows->ne[0]) {
+                        break;
+                    }
+                    r[k] = (int32_t) i;
+                    if (s >= 0 && s < mem->share_n_seqs()) {
+                        d[k] = mem->share_row(s, ubatch->pos[i]);
+                        mem->share_note(s, ubatch->pos[i]);
+                    } else {
+                        d[k] = mem->share_scratch_row();
+                    }
+                    ++k;
+                }
+                for (; k < rows->ne[0]; ++k) {
+                    r[k] = 0;
+                    d[k] = mem->share_scratch_row();
+                }
+            }
+            return;
+        }
+
+        llama_host_write(extra);
+        int32_t * e = (int32_t *) extra->data;
+        const int64_t n_extra = extra->ne[0];
+        const int64_t n_kv    = attn->get_n_kv();
+        std::vector<int64_t> since;
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            const llama_seq_id s = ubatch->seq_id[i][0];
+            const llama_pos    p = ubatch->pos[i];
+            // the latest selection kept before this position, and the cells of the positions after it up to this one:
+            // the tokens accepted since, the ones drafted in this loop, this one (its cell is already in the cache)
+            const llama_pos cap = mem->share_latest(s, p);
+            r[i] = cap >= 0 ? mem->share_row(s, cap) : mem->share_none_row();
+            mem->share_cells(s, cap >= 0 ? cap + 1 : std::max<llama_pos>(0, p - (llama_pos) n_extra + 1), p, since);
+            // the most recent positions if there are more than the columns hold
+            const size_t first = since.size() > (size_t) n_extra ? since.size() - (size_t) n_extra : 0;
+            for (int64_t k = 0; k < n_extra; ++k) {
+                const size_t  j = first + (size_t) k;
+                const int64_t c = j < since.size() ? since[j] - kv_off : -1;
+                e[i*n_extra + k] = c >= 0 && c < n_kv ? (int32_t) c : -1;
+            }
+        }
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+        if (params.cparams.mtp_share_reuse != reuse) {
+            return false;
+        }
+        const int64_t n_tokens = params.ubatch.n_tokens;
+        if (reuse) {
+            return rows->ne[0] == n_tokens && extra->ne[1] == n_tokens;
+        }
+        return rows->ne[0] == (n_tokens <= QWEN4EXP_SHARE_KEEP_ALL ? n_tokens : (int64_t) params.ubatch.n_seqs_unq);
+    }
+
+    ggml_tensor * off   = nullptr;   // F32 [2]: the first cell of the graph's view of the cache, and the view's length
+    ggml_tensor * rows  = nullptr;   // I32 capture: the ubatch rows kept [n_keep]; reuse: each token's share row [n_tokens]
+    ggml_tensor * dst   = nullptr;   // I32 [n_keep]: capture: the share rows written (scratch for rows not kept)
+    ggml_tensor * extra = nullptr;   // I32 [QWEN4EXP_SHARE_EXTRA, n_tokens]: reuse: view cells of the positions since, -1 padding
+
+    const llama_memory_hybrid_idx_context * mctx;
+    const bool reuse;
+};
+
+void llama_model_qwen4exp::graph::build_mtp_store_kv(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor *             k_cur,
+        ggml_tensor *             v_cur,
+        int                       il) {
+    // rotated before a quantized cache and stored exactly as build_attn and build_attn_qsa do it
+    if (inp->self_k_rot) {
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+    }
+    if (inp->self_v_rot) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
+    }
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_cur = inp->mctx;
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il));
+}
+
+void llama_model_qwen4exp::graph::build_mtp_share_capture(
+        const llama_memory_hybrid_idx_context * mctx_hyb,
+        ggml_tensor *                           top_k) {
+    const auto * mem = mctx_hyb->get_mem();
+    const int64_t w = mem->share_width();
+    GGML_ASSERT(top_k->ne[0] == w && top_k->ne[1] == n_tokens && top_k->ne[2] == 1 && top_k->ne[3] == 1);
+
+    const int64_t n_keep = n_tokens <= QWEN4EXP_SHARE_KEEP_ALL ? (int64_t) n_tokens : (int64_t) ubatch.n_seqs_unq;
+    auto inp = std::make_unique<llm_graph_input_mtp_share>(mctx_hyb, false);
+    inp->off  = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 2);
+    inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_keep);
+    inp->dst  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_keep);
+    ggml_set_input(inp->off);
+    ggml_set_input(inp->rows);
+    ggml_set_input(inp->dst);
+
+    // a view cell c becomes absolute c + 1 (the view moves between graphs), "no cell" (-1) becomes 0
+    ggml_tensor * off   = ggml_view_1d(ctx0, inp->off, 1, 0);
+    ggml_tensor * sel   = ggml_cast(ctx0, ggml_reshape_2d(ctx0, ggml_cont(ctx0, top_k), w, n_tokens), GGML_TYPE_F32);
+    ggml_tensor * valid = ggml_step(ctx0, ggml_scale_bias(ctx0, sel, 1.0f, 0.5f));
+    ggml_tensor * abs1  = ggml_mul(ctx0, ggml_add(ctx0, ggml_scale_bias(ctx0, sel, 1.0f, 1.0f), off), valid);
+    ggml_tensor * keep  = ggml_get_rows(ctx0, abs1, inp->rows);
+    cb(keep, "mtp_share_keep", -1);
+
+    ggml_tensor * t    = mem->share_sel();
+    ggml_tensor * view = ggml_view_2d(ctx0, t, t->ne[0], t->ne[1], t->nb[1], 0);
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, view, keep, inp->dst));
+
+    res->add_input(std::move(inp));
+}
+
+ggml_tensor * llama_model_qwen4exp::graph::build_mtp_share_reuse(
+        const llama_memory_hybrid_idx_context * mctx_hyb) {
+    const auto * mem = mctx_hyb->get_mem();
+    const int64_t w = mem->share_width();
+
+    auto inp = std::make_unique<llm_graph_input_mtp_share>(mctx_hyb, true);
+    inp->off   = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 2);
+    inp->rows  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    inp->extra = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, QWEN4EXP_SHARE_EXTRA, n_tokens);
+    ggml_set_input(inp->off);
+    ggml_set_input(inp->rows);
+    ggml_set_input(inp->extra);
+
+    ggml_tensor * off  = ggml_view_1d(ctx0, inp->off, 1, 0);
+    ggml_tensor * n_kv = ggml_view_1d(ctx0, inp->off, 1, ggml_element_size(inp->off));
+    ggml_tensor * t    = mem->share_sel();
+    ggml_tensor * view = ggml_view_2d(ctx0, t, t->ne[0], t->ne[1], t->nb[1], 0);
+    ggml_tensor * g    = ggml_get_rows(ctx0, view, inp->rows);                    // [w, n_tokens]: absolute + 1, 0 = none
+    // back to cells of this graph's view: d = absolute - off + 1 is a cell of the view when 1 <= d <= n_kv. "None" and a
+    // cell outside the view (a row the bookkeeping failed to drop) both become -1: the gather must never read past the view
+    ggml_tensor * d     = ggml_sub(ctx0, g, off);
+    ggml_tensor * valid = ggml_mul(ctx0,
+            ggml_step(ctx0, ggml_scale_bias(ctx0, d, 1.0f, -0.5f)),
+            ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_sub(ctx0, d, n_kv), -1.0f, 0.5f)));
+    ggml_tensor * rel  = ggml_scale_bias(ctx0, ggml_mul(ctx0, d, valid), 1.0f, -1.0f);
+    rel = ggml_cast(ctx0, rel, GGML_TYPE_I32);
+    ggml_tensor * sel  = ggml_concat(ctx0, rel, inp->extra, 0);                  // [w + extra, n_tokens]
+    cb(sel, "mtp_share_sel", -1);
+
+    res->add_input(std::move(inp));
+    return ggml_reshape_4d(ctx0, sel, w + QWEN4EXP_SHARE_EXTRA, n_tokens, 1, 1);
+}
 
 void llama_model_qwen4exp::graph::build_qsa_store_k(
         const llama_memory_hybrid_idx_context * mctx_hyb,
@@ -1209,8 +1516,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         qsa->kb_dup = mctx_hyb->kb_pos_dup();
         if (mctx_hyb->get_kb(il) != nullptr && n_stream == 1 && qwen4exp_pos_scalar(ubatch) &&
                 !qsa->kb_dup) {
-            // strixllama: a ubatch of several sequences can complete up to two blocks per sequence
-            const int64_t dirty_max = n_tps/r + 2*(int64_t) ubatch.n_seqs_unq + 2;
+            // strixllama: a ubatch of several sequences can complete up to two blocks per sequence, and each can bring
+            // the blocks of up to kb_pending_max positions a graph without the indexer left (kb_note_unrefreshed)
+            const int64_t dirty_max = qwen4exp_kb_dirty_max(n_tps, r, ubatch.n_seqs_unq);
             // an input no node reads is never allocated, so a full-rebuild graph gets only the rows tensor
             qsa->kb_full        = mctx_hyb->kb_needs_full(ubatch);
             qsa->kb_bid_rows    = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_blocks);

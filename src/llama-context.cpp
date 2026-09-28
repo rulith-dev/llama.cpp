@@ -1225,6 +1225,19 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+// strixllama: IndexShare (LLAMA_MTP_INDEX_SHARE=1). While on, a draft step attends to the latest selection a catch-up kept
+// for its sequence plus the cells of every position since (llama_memory_hybrid_idx::share_sel)
+void llama_context::set_mtp_share_reuse(bool reuse) {
+    cparams.mtp_share_reuse = reuse;
+}
+
+bool llama_context::mtp_share_ready(llama_seq_id seq_id, llama_pos pos) const {
+    const auto * mem = dynamic_cast<const llama_memory_hybrid_idx *>(memory.get());
+    // a selection too far behind (the previous turn's, before a prompt) would leave the steps blind to the positions since
+    const llama_pos c = mem != nullptr ? mem->share_latest(seq_id, pos + 1) : -1;
+    return c >= 0 && pos - c <= llama_memory_hybrid_idx::share_max_gap;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -4045,6 +4058,14 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+void llama_set_mtp_share_reuse(llama_context * ctx, bool reuse) {
+    ctx->set_mtp_share_reuse(reuse);
+}
+
+bool llama_mtp_share_ready(llama_context * ctx, llama_seq_id seq_id, llama_pos pos) {
+    return ctx->mtp_share_ready(seq_id, pos);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

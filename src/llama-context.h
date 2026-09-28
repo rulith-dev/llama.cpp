@@ -116,6 +116,8 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+    void set_mtp_share_reuse(bool reuse);
+    bool mtp_share_ready(llama_seq_id seq_id, llama_pos pos) const;
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 

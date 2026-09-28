@@ -4,6 +4,7 @@
 
 #include "ggml-cpp.h"
 
+#include <limits>
 #include <map>
 #include <memory>
 #include <vector>
@@ -140,11 +141,44 @@ public:
     // of order; the next graph of a ubatch holding it rebuilds every key of that ubatch's sequences
     bool          kb_needs_full(const llama_ubatch & ubatch) const;
     void          kb_mark_full(const llama_ubatch & ubatch) const;
+    // strixllama: a graph that writes indexer keys without running the indexer (the dense shortcut, build_qsa_store_k)
+    // refreshes no block key, so it leaves its sequences' blocks from its first position on pending (kb_from). The
+    // next graph of a sequence that runs the indexer refreshes them: up to kb_pending_max positions besides its own
+    // tokens in its dirty list, more with a full rebuild. Without this, a conversation's first ~2K tokens (a view that
+    // small takes the shortcut) kept the block keys of the conversation the slot held before.
+    static constexpr int32_t kb_pending_max = 64;
+    void          kb_note_unrefreshed(const llama_ubatch & ubatch) const;
     // strixllama: true once a ubatch with per-axis positions (an image under M-RoPE) has been written.
     // Such cells repeat one position across the image, so set_input_qsa ranks cells instead of using
     // the position, which the block-key cache cannot track - the graph must not wire the cache in.
     bool          kb_pos_dup() const;
 
+    // strixllama: IndexShare for a QSA MTP draft context (LLAMA_MTP_INDEX_SHARE=1, llama_set_mtp_share_reuse). A catch-up
+    // that runs the indexer keeps the sparse-attention selection of the positions it decodes in a ring of share_ring rows
+    // per sequence (row seq*share_ring + pos % share_ring). A draft step then attends to the latest selection kept before
+    // it plus every cell of the positions since, instead of running the indexer; a catch-up runs it again only when that
+    // selection is more than a refresh distance behind. A row holds absolute cell + 1 for each selected cell (0 = none), so
+    // it survives the graph's view of the cache moving; whatever drops, moves or rewrites a sequence's cells forgets its rows.
+    //   share_sel F32 [share_width, n_seq_max*share_ring + 2]: the rows, then a scratch row and an all-zero row
+    // a draft step's extra columns (cells of the positions after the reused selection) and the widest gap it may cover:
+    // the rest is room for 16 draft positions
+    static constexpr int32_t share_extra   = 64;
+    static constexpr int32_t share_max_gap = share_extra - 16;
+    ggml_tensor * share_sel()   const { return share_t; }
+    int64_t       share_width() const { return share_w; }
+    llama_seq_id  share_n_seqs() const { return (llama_seq_id) share_n_seq; }
+    uint32_t      share_ring_len() const { return share_ring; }
+    int32_t       share_row(llama_seq_id seq_id, llama_pos pos) const;
+    int32_t       share_scratch_row() const;
+    int32_t       share_none_row() const;
+    void          share_note(llama_seq_id seq_id, llama_pos pos) const;   // a graph being set up captures (seq_id, pos)
+    bool          share_ready(llama_seq_id seq_id, llama_pos pos) const;  // a selection is kept for exactly pos
+    llama_pos     share_latest(llama_seq_id seq_id, llama_pos below) const;   // the latest kept position < below, -1: none
+    // the absolute cells of seq_id's positions in [p0, p1], in position order
+    void          share_cells(llama_seq_id seq_id, llama_pos p0, llama_pos p1, std::vector<int64_t> & out) const;
+    // whether a catch-up ubatch has to run the indexer to keep selections: a sequence of it has none kept before it, or
+    // the latest is more than `refresh` positions behind the ubatch's last
+    bool          share_capture_due(const llama_ubatch & ubatch, llama_pos refresh) const;
 
 private:
     void set_input_qsa_impl(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
@@ -161,11 +195,26 @@ private:
     // a clear, so the first graph of every sequence builds its keys the way it always has
     mutable std::bitset<LLAMA_MAX_SEQ>   kb_stale = std::bitset<LLAMA_MAX_SEQ>().set();
     void kb_mark_stale(llama_seq_id seq_id);   // < 0: every sequence
+    // per sequence, the first position whose block key a graph left pending (kb_note_unrefreshed), max() for none
+    mutable std::vector<llama_pos>       kb_from = std::vector<llama_pos>(LLAMA_MAX_SEQ, std::numeric_limits<llama_pos>::max());
+    // the positions of seq_id's pending span outside [pmin, pmax], the ubatch's own positions of it (0: none pending)
+    llama_pos kb_pending_extra(llama_seq_id seq_id, llama_pos pmin, llama_pos pmax) const;
     // strixllama: regions - block-key rows follow their cells (llama_kv_cache::move_cells)
     void kb_move_rows(const llama_kv_cache::cell_move_vec_t & moves);
     // set in init_batch when an image ubatch or a position gap arrives, cleared only when every
     // sequence is dropped - see kb_pos_dup() and the reset in seq_rm()
     bool                                 kb_dup      = false;
+
+    // strixllama: IndexShare storage and bookkeeping (see share_sel)
+    ggml_context_ptr                     share_ctx;
+    ggml_backend_buffer_ptr              share_buf;
+    ggml_tensor *                        share_t     = nullptr;
+    int64_t                              share_w     = 0;
+    uint32_t                             share_ring  = 8;
+    uint32_t                             share_n_seq = 0;
+    mutable std::vector<llama_pos>       share_pos;     // the position each ring row holds, -1 none
+    // drop seq_id's rows for positions in [p0, p1) (p1 < 0: to the end); seq_id < 0: every sequence
+    void share_forget(llama_seq_id seq_id, llama_pos p0 = -1, llama_pos p1 = -1) const;
 
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
@@ -240,7 +289,11 @@ public:
     uint32_t      kb_scratch_row() const;
     bool          kb_needs_full(const llama_ubatch & ubatch) const;
     void          kb_mark_full(const llama_ubatch & ubatch) const;
+    void          kb_note_unrefreshed(const llama_ubatch & ubatch) const;
     bool          kb_pos_dup() const;
+
+    // strixllama: IndexShare pass-throughs (see llama_memory_hybrid_idx::share_sel)
+    const llama_memory_hybrid_idx * get_mem() const { return mem; }
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;

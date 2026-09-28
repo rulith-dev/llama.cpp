@@ -100,6 +100,14 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// strixllama: IndexShare for a QSA MTP draft context (LLAMA_MTP_INDEX_SHARE=1). Its catch-up decodes keep the sparse-attention
+// selections of the positions they decode (every LLAMA_MTP_INDEX_SHARE_REFRESH positions); between
+// llama_set_mtp_share_reuse(ctx, true) and (ctx, false) a draft step reuses the latest selection kept for its sequence plus
+// every position since, instead of running the indexer. llama_mtp_share_ready: whether a selection is kept for seq_id at
+// or before pos.
+LLAMA_API void llama_set_mtp_share_reuse(struct llama_context * ctx, bool reuse);
+LLAMA_API bool llama_mtp_share_ready(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);

@@ -1,6 +1,7 @@
 #include "llama-memory-hybrid-idx.h"
 
 #include <cstdlib>
+#include <limits>
 
 #include "prefix.h"
 
@@ -130,6 +131,36 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         LLAMA_LOG_INFO("%s: QSA block-key cache: %zu layers, %.1f MiB\n", __func__, kb_map.size(), bytes/1024.0/1024.0);
     }
 
+    // strixllama: IndexShare rows for the MTP layer's selection (LLAMA_MTP_INDEX_SHARE=1), when that layer has an indexer
+    {
+        const char * env = getenv("LLAMA_MTP_INDEX_SHARE");
+        const uint32_t il = model.hparams.n_layer();
+        const int64_t  r  = il < model.hparams.n_layer_all ? (int64_t) model.hparams.dsv4_compress_ratios[il] : 0;
+        if (env && atoi(env) != 0 && mem_idx && model.hparams.n_layer_nextn > 0 && il < model.hparams.n_layer_all &&
+                filter_idx(il) && r > 0 && model.hparams.indexer_top_k > 0) {
+            share_w     = (int64_t) model.hparams.indexer_top_k + r - 1;
+            share_n_seq = n_seq_max;
+            ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
+            ggml_context * ctx = ggml_init(params);
+            if (ctx == nullptr) {
+                throw std::runtime_error("failed to create ggml context for the IndexShare rows");
+            }
+            share_ctx.reset(ctx);
+            share_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, share_w, (int64_t) n_seq_max*share_ring + 2);
+            ggml_format_name(share_t, "cache_idx_share_l%u", il);
+            ggml_backend_buffer_type_t buft = offload ? ggml_backend_dev_buffer_type(model.dev_layer(il)) : ggml_backend_cpu_buffer_type();
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+            if (buf == nullptr) {
+                throw std::runtime_error("failed to allocate the IndexShare rows");
+            }
+            ggml_backend_buffer_clear(buf, 0);   // 0 = no cell, so the all-zero row selects nothing
+            share_buf.reset(buf);
+            share_pos.assign((size_t) n_seq_max*share_ring, -1);
+            LLAMA_LOG_INFO("%s: IndexShare: %u sequences x %u positions, %lld cells a selection\n", __func__,
+                    n_seq_max, share_ring, (long long) share_w);
+        }
+    }
+
     // strixllama: regions (llama_kv_cache::set_regions) - with several sequences in one unified pool, each
     // conversation keeps one run of cells and a batch's graph views only its own. The indexer mirrors the
     // attention cells, so both caches take the window, and the moves, together. LLAMA_KV_REGIONS=0 turns it off.
@@ -169,18 +200,72 @@ uint32_t llama_memory_hybrid_idx::kb_scratch_row() const {
 }
 
 bool llama_memory_hybrid_idx::kb_needs_full(const llama_ubatch & ubatch) const {
-    if (kb_stale.none() || !ubatch.seq_id || !ubatch.n_seq_id) {
+    if (!ubatch.seq_id || !ubatch.n_seq_id) {
         return false;
+    }
+    constexpr llama_pos none = std::numeric_limits<llama_pos>::max();
+    bool pending = false;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        for (int32_t k = 0; k < ubatch.n_seq_id[i]; ++k) {
+            const llama_seq_id s = ubatch.seq_id[i][k];
+            if (s < 0 || s >= LLAMA_MAX_SEQ) {
+                continue;
+            }
+            if (kb_stale.test(s)) {
+                return true;
+            }
+            pending |= kb_from[s] != none;
+        }
+    }
+    if (!pending) {
+        return false;
+    }
+    // strixllama: a pending span longer than the dirty list takes on top of the ubatch's own blocks
+    std::map<llama_seq_id, std::pair<llama_pos, llama_pos>> own;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        for (int32_t k = 0; k < ubatch.n_seq_id[i]; ++k) {
+            const llama_seq_id s = ubatch.seq_id[i][k];
+            if (s >= 0 && s < LLAMA_MAX_SEQ && kb_from[s] != none) {
+                auto & r = own.try_emplace(s, none, -1).first->second;
+                r.first  = std::min(r.first,  ubatch.pos[i]);
+                r.second = std::max(r.second, ubatch.pos[i]);
+            }
+        }
+    }
+    for (const auto & [s, r] : own) {
+        if (kb_pending_extra(s, r.first, r.second) > kb_pending_max) {
+            return true;
+        }
+    }
+    return false;
+}
+
+llama_pos llama_memory_hybrid_idx::kb_pending_extra(llama_seq_id seq_id, llama_pos pmin, llama_pos pmax) const {
+    const llama_pos from = kb_from[seq_id];
+    const llama_pos hi   = get_mem_attn()->seq_pos_max(seq_id);
+    if (from == std::numeric_limits<llama_pos>::max() || hi < from) {
+        return 0;
+    }
+    if (pmax < pmin) {
+        return hi - from + 1;
+    }
+    const llama_pos below = std::max<llama_pos>(0, std::min(hi, pmin - 1) - from + 1);
+    const llama_pos above = std::max<llama_pos>(0, hi - std::max(from, pmax + 1) + 1);
+    return below + above;
+}
+
+void llama_memory_hybrid_idx::kb_note_unrefreshed(const llama_ubatch & ubatch) const {
+    if (kb_map.empty() || !ubatch.seq_id || !ubatch.n_seq_id) {
+        return;
     }
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         for (int32_t k = 0; k < ubatch.n_seq_id[i]; ++k) {
             const llama_seq_id s = ubatch.seq_id[i][k];
-            if (s >= 0 && s < LLAMA_MAX_SEQ && kb_stale.test(s)) {
-                return true;
+            if (s >= 0 && s < LLAMA_MAX_SEQ) {
+                kb_from[s] = std::min(kb_from[s], ubatch.pos[i]);
             }
         }
     }
-    return false;
 }
 
 void llama_memory_hybrid_idx::kb_mark_full(const llama_ubatch & ubatch) const {
@@ -192,6 +277,7 @@ void llama_memory_hybrid_idx::kb_mark_full(const llama_ubatch & ubatch) const {
             const llama_seq_id s = ubatch.seq_id[i][k];
             if (s >= 0 && s < LLAMA_MAX_SEQ) {
                 kb_stale.reset(s);
+                kb_from[s] = std::numeric_limits<llama_pos>::max();   // a full rebuild refreshes the pending blocks too
             }
         }
     }
@@ -209,12 +295,97 @@ bool llama_memory_hybrid_idx::kb_pos_dup() const {
     return kb_dup;
 }
 
+int32_t llama_memory_hybrid_idx::share_row(llama_seq_id seq_id, llama_pos pos) const {
+    GGML_ASSERT(seq_id >= 0 && (uint32_t) seq_id < share_n_seq && pos >= 0);
+    return (int32_t) (seq_id*share_ring + (uint32_t) pos % share_ring);
+}
+
+int32_t llama_memory_hybrid_idx::share_scratch_row() const {
+    return (int32_t) (share_n_seq*share_ring);
+}
+
+int32_t llama_memory_hybrid_idx::share_none_row() const {
+    return (int32_t) (share_n_seq*share_ring + 1);
+}
+
+void llama_memory_hybrid_idx::share_note(llama_seq_id seq_id, llama_pos pos) const {
+    if (share_t && seq_id >= 0 && (uint32_t) seq_id < share_n_seq && pos >= 0) {
+        share_pos[share_row(seq_id, pos)] = pos;
+    }
+}
+
+bool llama_memory_hybrid_idx::share_ready(llama_seq_id seq_id, llama_pos pos) const {
+    return share_t && seq_id >= 0 && (uint32_t) seq_id < share_n_seq && pos >= 0 && share_pos[share_row(seq_id, pos)] == pos;
+}
+
+llama_pos llama_memory_hybrid_idx::share_latest(llama_seq_id seq_id, llama_pos below) const {
+    if (!share_t || seq_id < 0 || (uint32_t) seq_id >= share_n_seq) {
+        return -1;
+    }
+    llama_pos best = -1;
+    for (uint32_t k = 0; k < share_ring; ++k) {
+        const llama_pos p = share_pos[seq_id*share_ring + k];
+        if (p >= 0 && p < below && p > best) {
+            best = p;
+        }
+    }
+    return best;
+}
+
+void llama_memory_hybrid_idx::share_cells(llama_seq_id seq_id, llama_pos p0, llama_pos p1, std::vector<int64_t> & out) const {
+    out.clear();
+    const auto & sp = get_mem_attn()->get_cells(seq_id).seq_pos_cells(seq_id);
+    for (auto it = sp.lower_bound({ p0, 0 }); it != sp.end() && it->first <= p1; ++it) {
+        out.push_back((int64_t) it->second);
+    }
+}
+
+bool llama_memory_hybrid_idx::share_capture_due(const llama_ubatch & ubatch, llama_pos refresh) const {
+    if (!share_t || !ubatch.seq_id || !ubatch.n_seq_id) {
+        return false;
+    }
+    std::map<llama_seq_id, std::pair<llama_pos, llama_pos>> own;   // per sequence: its first and last position here
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        const llama_seq_id s = ubatch.seq_id[i][0];
+        auto & r = own.try_emplace(s, ubatch.pos[i], ubatch.pos[i]).first->second;
+        r.first  = std::min(r.first,  ubatch.pos[i]);
+        r.second = std::max(r.second, ubatch.pos[i]);
+    }
+    for (const auto & [s, r] : own) {
+        const llama_pos c = share_latest(s, r.first);
+        if (c < 0 || r.second - c > refresh) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void llama_memory_hybrid_idx::share_forget(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    if (!share_t) {
+        return;
+    }
+    const llama_pos lo = p0 < 0 ? 0 : p0;
+    const llama_pos hi = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
+    for (uint32_t s = 0; s < share_n_seq; ++s) {
+        if (seq_id >= 0 && (uint32_t) seq_id != s) {
+            continue;
+        }
+        for (uint32_t k = 0; k < share_ring; ++k) {
+            llama_pos & p = share_pos[s*share_ring + k];
+            if (p >= lo && p < hi) {
+                p = -1;
+            }
+        }
+    }
+}
+
 // A block's key sits at the row of its first cell. The moves lay a sequence out in position order, so its keys
 // can follow their cells only if its cells were in that order already (then every block keeps its first cell);
 // a sequence whose cells were not has its keys rebuilt once instead.
 void llama_memory_hybrid_idx::kb_move_rows(const llama_kv_cache::cell_move_vec_t & moves) {
     llama_kv_cache::cell_move_vec_t rows;
     for (const auto & m : moves) {
+        share_forget(m.seq);   // strixllama: the IndexShare rows name the cells before the move
         if (m.ordered) {
             rows.push_back(m);
         } else {
@@ -407,6 +578,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lc
 }
 
 void llama_memory_hybrid_idx::clear(bool data) {
+    share_forget(-1);    // strixllama: IndexShare rows name cells
     kb_mark_stale(-1);   // strixllama: block keys depend on positions and cell contents; rebuild them once
     kb_dup = false;   // strixllama: no cells left, so no image cells either
     llama_memory_hybrid::clear(data);
@@ -434,6 +606,10 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         mem_idx->seq_rm(seq_id, p0, p1);
     }
 
+    // strixllama: a selection names cells of its own and earlier positions, so every selection from p0 on goes (a
+    // later one may name a removed cell); one of an earlier position names only cells that stay
+    share_forget(seq_id, p0, -1);
+
     return get_mem_attn()->seq_rm(seq_id, p0, p1);
 }
 
@@ -442,15 +618,25 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
     if (seq_id_src >= 0 && seq_id_src < LLAMA_MAX_SEQ && kb_stale.test(seq_id_src)) {
         kb_mark_stale(seq_id_dst);
     }
+    if (seq_id_src >= 0 && seq_id_src < LLAMA_MAX_SEQ && seq_id_dst >= 0 && seq_id_dst < LLAMA_MAX_SEQ) {
+        kb_from[seq_id_dst] = std::min(kb_from[seq_id_dst], kb_from[seq_id_src]);   // and the blocks it left pending
+    }
 
     llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
 
     if (mem_idx) {
         mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     }
+
+    share_forget(seq_id_dst);   // strixllama: the destination's cells changed under its IndexShare rows
 }
 
 void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
+    for (uint32_t s = 0; s < share_n_seq; ++s) {
+        if ((llama_seq_id) s != seq_id) {
+            share_forget((llama_seq_id) s);
+        }
+    }
     llama_memory_hybrid::seq_keep(seq_id);
 
     if (mem_idx) {
@@ -459,6 +645,7 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    share_forget(-1);    // strixllama: positions move under the IndexShare rows
     kb_mark_stale(-1);   // strixllama: block keys depend on positions; a shifted cell can be shared, so all of them
     llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
 
@@ -468,6 +655,7 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
 }
 
 void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    share_forget(-1);    // strixllama: positions move under the IndexShare rows
     kb_mark_stale(-1);   // strixllama: block keys depend on positions; a shifted cell can be shared, so all of them
     llama_memory_hybrid::seq_div(seq_id, p0, p1, d);
 
@@ -505,6 +693,7 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
 }
 
 void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    share_forget(seq_id);   // strixllama: the restored cells are not the ones the IndexShare rows name
     kb_mark_stale(seq_id);   // strixllama: the restored cells' block keys were never written; rebuild them once
     // note: repeats llama_memory_hybrid::state_read
     // the indexer needs the attention cache's cells, and a half-failed restore must leave all three caches alike
@@ -581,6 +770,7 @@ bool llama_memory_hybrid_idx::kv_rows_set(llama_seq_id seq_id, llama_pos p0, uin
     if (kv_row_size() == 0) {
         return false;
     }
+    share_forget(seq_id);
     return get_mem_attn()->seq_rows_set(seq_id, p0, n, src, src_rows) &&
            (!mem_idx || mem_idx->seq_rows_set(seq_id, p0, n, src + (size_t) src_rows*get_mem_attn()->row_size(), src_rows));
 }
@@ -589,6 +779,7 @@ bool llama_memory_hybrid_idx::kv_rows_copy(llama_seq_id seq_src, llama_seq_id se
     if (kv_row_size() == 0) {
         return false;
     }
+    share_forget(seq_dst);
     return get_mem_attn()->seq_rows_copy(seq_src, seq_dst, p0, n) &&
            (!mem_idx || mem_idx->seq_rows_copy(seq_src, seq_dst, p0, n));
 }
@@ -1048,14 +1239,31 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
                 pmin = std::min(pmin, ubatch->pos[i]);
                 pmax = std::max(pmax, ubatch->pos[i]);
             }
+            // strixllama: and the blocks graphs without the indexer left pending (kb_from, kb_note_unrefreshed): a group
+            // is 1 when the ubatch writes one of its cells, 2 when it only holds a pending cell of a ubatch sequence
+            constexpr llama_pos none = std::numeric_limits<llama_pos>::max();
+            std::vector<std::pair<llama_seq_id, llama_pos>> pend;
+            llama_pos pend_min = none;
+            for (int sq = 0; sq < LLAMA_MAX_SEQ; ++sq) {
+                if (active_seqs.test(sq) && kb_from[sq] != none) {
+                    pend.emplace_back((llama_seq_id) sq, kb_from[sq]);
+                    pend_min = std::min(pend_min, kb_from[sq]);
+                }
+            }
             std::vector<uint8_t> grp_dirty(grp_first.size(), 0);
             for (int64_t j = 0; j < n_kv; ++j) {
                 const int32_t g = cell_grp[j];
-                if (g < 0 || grp_bid[g] < 0) { continue; }
+                if (g < 0 || grp_bid[g] < 0 || grp_dirty[g] == 1) { continue; }
                 const llama_pos p = cells.pos_get(j);
-                if (p < pmin || p > pmax) { continue; }
-                for (int64_t i = 0; i < n_tokens; ++i) {
-                    if (ubatch->pos[i] == p && cells.seq_has(j, ubatch->seq_id[i][0])) { grp_dirty[g] = 1; break; }
+                if (p >= pmin && p <= pmax) {
+                    for (int64_t i = 0; i < n_tokens; ++i) {
+                        if (ubatch->pos[i] == p && cells.seq_has(j, ubatch->seq_id[i][0])) { grp_dirty[g] = 1; break; }
+                    }
+                }
+                if (grp_dirty[g] == 0 && p >= pend_min) {
+                    for (const auto & [sq, from] : pend) {
+                        if (p >= from && cells.seq_has(j, sq)) { grp_dirty[g] = 2; break; }
+                    }
                 }
             }
 
@@ -1063,22 +1271,34 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
             int32_t * dp = (int32_t *) kb->dirty_pos->data;
             int32_t * dd = (int32_t *) kb->dirty_dst->data;
             int64_t n_dirty = 0;
-            int64_t n_dirty_total = 0;
-            for (int32_t b = 0; b < n_bid; ++b) {
-                bool dirty = false;
-                for (int64_t slot = 0; slot < r; ++slot) {
-                    const int32_t g = cell_grp[cur_blk_cells[b*r + slot]];
-                    if (g >= 0 && grp_dirty[g]) { dirty = true; break; }
+            int64_t n_dirty_total = 0;   // the blocks the ubatch writes, which must fit
+            bool    left = false;        // a pending block the list had no room for
+            for (uint8_t pass = 1; pass <= 2; ++pass) {
+                for (int32_t b = 0; b < n_bid; ++b) {
+                    uint8_t dirty = 0;
+                    for (int64_t slot = 0; slot < r; ++slot) {
+                        const int32_t g = cell_grp[cur_blk_cells[b*r + slot]];
+                        if (g >= 0 && grp_dirty[g]) { dirty = grp_dirty[g]; break; }
+                    }
+                    if (dirty != pass) { continue; }
+                    n_dirty_total += pass == 1;
+                    if (n_dirty >= dirty_max) { left |= pass == 2; continue; }
+                    for (int64_t slot = 0; slot < r; ++slot) { dc[n_dirty*r + slot] = cur_blk_cells[b*r + slot]; }
+                    for (int64_t sec = 0; sec < 4; ++sec) { dp[sec*dirty_max + n_dirty] = dst_blk_pos[sec*n_blocks + b]; }
+                    dd[n_dirty] = (int32_t) kv_off + bid_cell[b];
+                    ++n_dirty;
                 }
-                if (!dirty) { continue; }
-                ++n_dirty_total;
-                if (n_dirty >= dirty_max) { continue; }
-                for (int64_t slot = 0; slot < r; ++slot) { dc[n_dirty*r + slot] = cur_blk_cells[b*r + slot]; }
-                for (int64_t sec = 0; sec < 4; ++sec) { dp[sec*dirty_max + n_dirty] = dst_blk_pos[sec*n_blocks + b]; }
-                dd[n_dirty] = (int32_t) kv_off + bid_cell[b];
-                ++n_dirty;
             }
             GGML_ASSERT(n_dirty_total <= dirty_max && "qsa block-key cache: more blocks completed than the graph can refresh");
+            // nothing of these sequences is pending any more: refreshed by this list, or - what did not fit - by a full
+            // rebuild on their next graph. qwen4exp gives every indexer layer of a graph this one input set (one ratio),
+            // so the list reaches every layer's cache
+            for (const auto & [sq, from] : pend) {
+                kb_from[sq] = none;
+                if (left) {
+                    kb_stale.set(sq);
+                }
+            }
             for (int64_t d = n_dirty; d < dirty_max; ++d) {
                 for (int64_t slot = 0; slot < r; ++slot) { dc[d*r + slot] = (int32_t) std::min<int64_t>(slot, n_kv - 1); }
                 for (int64_t sec = 0; sec < 4; ++sec) { dp[sec*dirty_max + d] = 0; }
@@ -1300,6 +1520,10 @@ bool llama_memory_hybrid_idx_context::kb_pos_dup() const {
 
 void llama_memory_hybrid_idx_context::kb_mark_full(const llama_ubatch & ubatch) const {
     if (mem) { mem->kb_mark_full(ubatch); }
+}
+
+void llama_memory_hybrid_idx_context::kb_note_unrefreshed(const llama_ubatch & ubatch) const {
+    if (mem) { mem->kb_note_unrefreshed(ubatch); }
 }
 
 void llama_memory_hybrid_idx_context::set_input_qsa_blocks(

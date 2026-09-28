@@ -21,6 +21,10 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    // strixllama: IndexShare for a QSA MTP draft (llama_set_mtp_share_reuse): the draft steps reuse the sparse-attention
+    // selection the catch-up captured instead of running the indexer
+    bool     mtp_share_reuse = false;
+
     float rope_freq_base;
     float rope_freq_scale;
 

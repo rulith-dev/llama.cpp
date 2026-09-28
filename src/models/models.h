@@ -2358,6 +2358,8 @@ struct llama_model_qwen4exp : public llama_model_base {
 
     class llm_graph_input_qsa;
     class llm_graph_input_qsa_k;
+    class llm_graph_input_mtp_share;
+    class llm_graph_input_mtp_capture;
 
     // --lazy-mode on-direct: pread() the lazy PLE table rows
     // host-side instead of faulting them in through the mmap; see qwen4exp.cpp
@@ -2415,6 +2417,23 @@ struct llama_model_qwen4exp : public llama_model_base {
         void build_qsa_store_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
+                            int   il);
+
+        // strixllama: IndexShare for the MTP draft (LLAMA_MTP_INDEX_SHARE=1, llama_set_mtp_share_reuse): a catch-up
+        // keeps its tokens' selections; a draft step takes the one kept for the position before its loop, plus the
+        // cells of the positions drafted since, as its own top_k
+        void build_mtp_share_capture(
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+                    ggml_tensor * top_k);
+
+        ggml_tensor * build_mtp_share_reuse(
+  const llama_memory_hybrid_idx_context * mctx_hyb);
+
+        // strixllama: a ubatch without outputs stores K and V (rotated as build_attn would) and attends to nothing
+        void build_mtp_store_kv(
+        llm_graph_input_attn_kv * inp,
+                    ggml_tensor * k_cur,
+                    ggml_tensor * v_cur,
                             int   il);
 
 

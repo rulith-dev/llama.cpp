@@ -895,6 +895,11 @@ struct llm_graph_params {
             return false;
         }
 
+        // strixllama: a draft step that reuses the captured selection builds a different graph (IndexShare)
+        if (cparams.mtp_share_reuse != other.cparams.mtp_share_reuse) {
+            return false;
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&

@@ -1663,6 +1663,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         std::vector<int>  conf_len(n_seq, 0);
         int n_confident = n_drafting;
 
+        // strixllama: IndexShare (LLAMA_MTP_INDEX_SHARE=1): the draft steps reuse the sparse-attention selection the
+        // catch-up kept for the position before each sequence's first step, when every drafting sequence has one
+        static const bool share_env = getenv("LLAMA_MTP_INDEX_SHARE") && atoi(getenv("LLAMA_MTP_INDEX_SHARE")) != 0;
+        bool share = share_env && !chain_heads && !is_mem_shared && n_drafting > 0;
+        for (llama_seq_id seq_id = 0; share && seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (drafting[seq_id]) {
+                share = llama_mtp_share_ready(ctx_dft, seq_id, dparams[seq_id].pos0 - 1);
+            }
+        }
+        if (share) {
+            llama_set_mtp_share_reuse(ctx_dft, true);
+        }
+
         int i = 0;
 
         while (n_drafting > 0) {
@@ -1784,6 +1797,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (chain_heads) {
             llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+        }
+        if (share) {
+            llama_set_mtp_share_reuse(ctx_dft, false);
         }
 
         if (even) {
