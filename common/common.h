@@ -1178,6 +1178,11 @@ struct common_prompt_checkpoint {
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
 
+    // strixllama: (optional) the logits of the last token before the checkpoint - kept with the checkpoint taken where
+    // an answer starts, so that answer is sampled again from them without processing a token. Memory only: the disk
+    // tier does not store them
+    std::vector<float> logits;
+
     size_t size() const;
 
     bool empty() const;

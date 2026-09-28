@@ -325,6 +325,32 @@ struct server_batch {
     }
 };
 
+// strixllama: what the disk tier knows about a conversation's last answer across its trips to the store: whether its
+// client drops answers (server_slot::tail_forks), and the answer's first tokens as generated (a hash of up to
+// tail_hash_max), to compare the next request with. A conversation that leaves its slot files them under its tokens up
+// to where that answer started (n_prompt_end); one loaded back finds them under its answer-start checkpoint's position.
+// Memory only: a restarted server does not know, and writes the answer until the next request shows what it does
+struct tail_known {
+    bool     forks = false;
+    int32_t  n     = 0;         // the answer tokens hashed
+    uint64_t hash  = 0;
+};
+
+static constexpr int32_t tail_hash_max = 64;
+
+static std::unordered_map<uint64_t, tail_known> & tail_forks_known() {
+    static std::unordered_map<uint64_t, tail_known> known;
+    return known;
+}
+
+static uint64_t tail_hash(const llama_tokens & text, int64_t p0, int32_t n) {
+    return XXH3_64bits(text.data() + p0, (size_t) n*sizeof(llama_token));
+}
+
+static uint64_t tail_forks_key(const llama_tokens & text, int64_t n) {
+    return XXH3_64bits(text.data(), (size_t) n*sizeof(llama_token)) ^ (uint64_t) n;
+}
+
 struct server_slot {
     int id;
 
@@ -346,6 +372,19 @@ struct server_slot {
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
+
+    // strixllama: the length of the last prompt the slot processed, less a last token the next request re-renders (a
+    // thinking prompt's, see think_tail); 0: none since it was cleared or loaded. The answer after it is the
+    // conversation's main line only once the next request continues it (n_mainline)
+    int64_t n_prompt_end = 0;
+    // the conversation's last request went past its prompt's end and kept less than the answer: its client re-renders
+    // answers (drops the reasoning, re-serializes a tool call, sends a cut one back), so the answer in the slot is
+    // expected to be dropped as well
+    bool tail_forks = false;
+    // a conversation loaded back from the store without its last answer: that answer's first tokens as generated
+    // (tail_known), which the next request is compared with
+    int32_t  tail_n    = 0;
+    uint64_t tail_hash_v = 0;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -450,9 +489,26 @@ struct server_slot {
             return n;
         };
         // the positions both the prompt and the cache hold: a token just sampled is not in the cache yet
-        const int64_t n_tok   = prompt.n_tokens();
-        const int64_t end_tgt = std::min<int64_t>(n_tok, llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id) + 1);
-        const int64_t end_dft = ctx_dft ? std::min<int64_t>(n_tok, llama_memory_seq_pos_max(llama_get_memory(ctx_dft), id) + 1) : 0;
+        const int64_t n_tok    = prompt.n_tokens();
+        const int64_t live_tgt = std::min<int64_t>(n_tok, llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id) + 1);
+        // strixllama: only the conversation's main line (n_mainline): an answer the next request has not continued yet
+        // waits - a client that drops the reasoning forks every one - and goes as the conversation leaves unless its
+        // client is expected to drop it (tail_forks). STRIX_DISK_MAINLINE=0 writes all of it, as up to 0.3.1
+        static const bool mainline = !getenv("STRIX_DISK_MAINLINE") || atoi(getenv("STRIX_DISK_MAINLINE")) != 0;
+        const int64_t n_main  = !mainline || (leaving && !tail_forks) ? n_tok : n_mainline();
+        if (mainline && leaving && n_prompt_end > 0 && n_prompt_end <= (int64_t) text.size()) {
+            auto & known = tail_forks_known();
+            if (known.size() >= 4096) {
+                known.clear();                      // a bound, not a cache policy: what is lost is relearnt in a turn
+            }
+            tail_known k;
+            k.forks = tail_forks;
+            k.n     = (int32_t) std::min<int64_t>(tail_hash_max, (int64_t) text.size() - n_prompt_end);
+            k.hash  = k.n > 0 ? tail_hash(text, n_prompt_end, k.n) : 0;
+            known[tail_forks_key(text, n_prompt_end)] = k;
+        }
+        const int64_t end_tgt = std::min<int64_t>(live_tgt, n_main);
+        const int64_t end_dft = ctx_dft ? std::min<int64_t>(std::min<int64_t>(n_tok, llama_memory_seq_pos_max(llama_get_memory(ctx_dft), id) + 1), n_main) : 0;
 
         auto new_tgt = runs.tgt;
         auto new_dft = runs.dft;
@@ -492,7 +548,8 @@ struct server_slot {
         // entry's end (a token sampled last and not decoded is not in the entry; the next prompt brings it again)
         common_prompt_checkpoint end_ckpt;
         const common_prompt_checkpoint * end = nullptr;
-        if (leaving && n_entry == end_tgt) {
+        // the state now is the state at the entry's end only when the entry reaches the cache's end
+        if (leaving && n_entry == live_tgt) {
             end_ckpt.update_pos(n_entry, llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id),
                                          llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id));
             try {
@@ -672,6 +729,30 @@ struct server_slot {
         if (replaced) {
             common_speculative_set_state(spec, id, spec_state);
         }
+        // strixllama: where the restored conversation's last answer started, and what its client does with answers, if a
+        // slot filed it as the conversation left (tail_forks_known): its answer-start checkpoint came back with it
+        if (replaced) {
+            n_prompt_end = 0;
+            tail_forks   = false;
+            tail_n       = 0;
+            tail_hash_v  = 0;
+            const auto & known = tail_forks_known();
+            if (res && !known.empty() && prompt.tokens.get_text_tokens().size() == prompt.tokens.size()) {
+                const llama_tokens & text = prompt.tokens.get_text_tokens();
+                for (const auto & c : prompt.checkpoints) {
+                    if (c.n_tokens <= n_prompt_end || c.n_tokens > (int64_t) text.size()) {
+                        continue;
+                    }
+                    const auto it = known.find(tail_forks_key(text, c.n_tokens));
+                    if (it != known.end()) {
+                        n_prompt_end = c.n_tokens;
+                        tail_forks   = it->second.forks;
+                        tail_n       = it->second.n;
+                        tail_hash_v  = it->second.hash;
+                    }
+                }
+            }
+        }
 
         return res;
     }
@@ -689,6 +770,20 @@ struct server_slot {
         }
         ckpt_paged.clear();
         runs = {};
+        n_prompt_end = 0;
+        tail_forks   = false;
+        tail_n       = 0;
+        tail_hash_v  = 0;
+    }
+
+    // strixllama: the leading tokens known to be the conversation's main line - a prompt is, as it is processed; the
+    // answer after it only once the next request continues it. The disk tier is given only these (persist_runs)
+    int64_t n_mainline() const {
+        const int64_t n = prompt.n_tokens();
+        if (state == SLOT_STATE_STARTED || state == SLOT_STATE_PROCESSING_PROMPT || n_prompt_end <= 0) {
+            return n;
+        }
+        return std::min<int64_t>(n, n_prompt_end);
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -2762,7 +2857,8 @@ private:
         return slot.has_next_token; // continue
     }
 
-    void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
+    void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx,
+                              const std::vector<float> * logits = nullptr) const {
         const size_t n_probs_request = slot.task->params.sampling.n_probs;
 
         if (post_sampling) {
@@ -2794,7 +2890,8 @@ private:
                 });
             }
         } else {
-            std::vector<llama_token_data> cur = get_token_probabilities(ctx_tgt, idx, n_probs_request);
+            std::vector<llama_token_data> cur = logits ? get_token_probabilities(logits->data(), (int) logits->size(), n_probs_request)
+                                                       : get_token_probabilities(ctx_tgt, idx, n_probs_request);
             const size_t max_probs = cur.size();
             const size_t n_probs = std::min(max_probs, n_probs_request);
 
@@ -3112,6 +3209,119 @@ private:
     // regenerations land, sparse far back (a 100K prompt of short turns gets ~10)
     int64_t anchor_spacing(int64_t pos, int64_t n_prompt) const {
         return std::max<int64_t>(params_base.checkpoint_min_step, (n_prompt - pos) / 4);
+    }
+
+    // strixllama: checkpoints at an answer's edges instead of prompt batches cut short near their end (STRIX_CKPT_EDGES=0:
+    // the cuts at the end offsets and at the last user message, as up to 0.3.1). A regenerate, a client that drops the
+    // reasoning or re-renders a tool call, an answer cut by Stop: the next prompt forks at or inside the last answer,
+    // and the state where it started - the prompt's end, taken as the first token is sampled - serves them all. An edit
+    // of the new message forks where the answer before it ended: the slot's state as the continuing request arrives.
+    // Both are taken where the state already stands, so neither adds a pass.
+    static bool ckpt_edges() {
+        static const bool on = !getenv("STRIX_CKPT_EDGES") || atoi(getenv("STRIX_CKPT_EDGES")) != 0;
+        return on;
+    }
+
+    bool ckpt_wanted(const server_slot & slot) const {
+        return ckpt_edges() && params_base.n_ctx_checkpoints > 0 && slot.task && slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
+            (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS || n_swa > 0) &&
+            !slot.prompt.tokens.empty() && slot.prompt.tokens[slot.prompt.tokens.size() - 1] != LLAMA_TOKEN_NULL;
+    }
+
+    // strixllama: the tokens end in "<think>\n" - a thinking prompt. A client that drops the reasoning sends that answer
+    // back as "<think>\n\n</think>...", and "\n\n" is a single token, so the next prompt forks one token before this one
+    // ends: the checkpoint where the answer starts is taken there, one token early, by processing the last token alone.
+    // A regenerate then processes that token again for its logits.
+    bool think_tail(const server_tokens & toks, int64_t n) const {
+        if (!ckpt_edges() || n < 2) {
+            return false;
+        }
+        const llama_token last = toks[n - 1];
+        const llama_token prev = toks[n - 2];
+        return last != LLAMA_TOKEN_NULL && prev != LLAMA_TOKEN_NULL &&
+            common_token_to_piece(ctx_tgt, last, true) == "\n" && common_token_to_piece(ctx_tgt, prev, true) == "<think>";
+    }
+
+    // a checkpoint within `d` tokens before `pos`
+    static bool has_ckpt_near(const server_slot & slot, int64_t pos, int64_t d) {
+        for (const auto & c : slot.prompt.checkpoints) {
+            if (c.n_tokens <= pos && c.n_tokens >= pos - d) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // a checkpoint of the slot's state as it stands, whose memory must end where its tokens do; a failure costs a replay
+    // later, not the request
+    bool checkpoint_here(server_slot & slot) {
+        auto * mem = llama_get_memory(ctx_tgt);
+        const llama_pos pos_min = llama_memory_seq_pos_min(mem, slot.id);
+        const llama_pos pos_max = llama_memory_seq_pos_max(mem, slot.id);
+        if (pos_min < 0 || pos_max + 1 != slot.prompt.tokens.pos_next()) {
+            return false;
+        }
+        try {
+            create_checkpoint(slot, 0, pos_min, pos_max);
+        } catch (const std::exception & e) {
+            SLT_WRN(slot, "no checkpoint at %d tokens: %s\n", slot.prompt.n_tokens(), e.what());
+            return false;
+        }
+        return true;
+    }
+
+    // strixllama: a regenerate restored from the checkpoint where the answer started: its first token is sampled from the
+    // logits kept there, as post_decode samples a finished prompt's
+    void sample_regenerated(server_slot & slot, const std::vector<float> & logits) {
+        slot.stats.n_gen = 0;
+        slot.i_batch     = -1;
+        slot.init_sampler();
+
+        slot.state        = SLOT_STATE_GENERATING;
+        slot.n_prompt_end = slot.prompt.n_tokens();
+
+        if (slot.can_speculate()) {
+            common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+        }
+
+        llama_token id;
+        {
+            scoped_timer timer(t_sampl, n_sampl);
+            id = common_sampler_sample_logits(slot.smpl.get(), logits.data(), (int) logits.size());
+        }
+
+        common_sampler_accept(slot.smpl.get(), id, true);
+
+        const int64_t t_now = ggml_time_us();
+
+        slot.stats.n_gen += 1;
+        slot.stats.update_prompt_last();
+        slot.t_print_last = t_now;
+        slot.n_gen_last = 0;
+        slot.stats.update_gen_last();
+
+        const bool special = params_base.special ||
+            slot.task->params.sampling.preserved_tokens.find(id) != slot.task->params.sampling.preserved_tokens.end();
+
+        completion_token_output result;
+        result.tok          = id;
+        result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, special);
+        result.prob         = 1.0f;
+
+        if (slot.task->params.sampling.n_probs > 0) {
+            populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, -1, &logits);
+        }
+
+        SLT_INF(slot, "regenerate: the answer is sampled again where it started, %d tokens, nothing processed\n", slot.prompt.n_tokens());
+
+        if (!process_token(result, slot)) {
+            slot.print_timings();
+            send_final_response(slot);
+            slot.release();
+            return;
+        }
+
+        slot.print_timings_tg();
     }
 
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
@@ -4101,7 +4311,21 @@ private:
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate(slots, [&](server_slot & slot) {
+            // strixllama: prompts in the order their requests arrived (task ids grow with arrival), not by slot number:
+            // the request that came first gets its tokens into a step first (STRIX_PROMPT_ORDER=slot: by slot)
+            static const bool by_arrival = !getenv("STRIX_PROMPT_ORDER") || std::string(getenv("STRIX_PROMPT_ORDER")) != "slot";
+            std::vector<server_slot *> prompt_order;
+            prompt_order.reserve(slots.size());
+            for (auto & s : slots) {
+                prompt_order.push_back(&s);
+            }
+            if (by_arrival) {
+                std::stable_sort(prompt_order.begin(), prompt_order.end(), [](const server_slot * a, const server_slot * b) {
+                    return (a->task ? a->task->id : INT_MAX) < (b->task ? b->task->id : INT_MAX);
+                });
+            }
+
+            iterate(prompt_order, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch_prompt) {
                     return; // batch is full, skip remaining slots
                 }
@@ -4127,6 +4351,9 @@ private:
 
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.size();
+
+                    // strixllama: a regenerate restored where its answer started: the logits it is sampled from
+                    std::vector<float> regen_logits;
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
@@ -4289,6 +4516,24 @@ private:
                                 n_past = 0;
                             }
 
+                            // strixllama: how the client treats an answer. A request that goes past the last prompt's end and
+                            // keeps less than the answer re-rendered it (dropped the reasoning, re-serialized a tool call,
+                            // cut it); one that keeps it all continued it as generated; one that forks before the prompt's
+                            // end is another branch - nothing learnt. A regenerate (nothing new) says nothing either
+                            // A conversation loaded back from the store comes only as far as this prompt shares it, so its
+                            // answer is often not in the slot: then the prompt is compared with the answer's first tokens as
+                            // they were generated (tail_known)
+                            if (slot.n_prompt_end > 0 && n_past < slot.task->n_tokens()) {
+                                if (slot.prompt.n_tokens() > slot.n_prompt_end) {
+                                    slot.tail_forks = n_past >= slot.n_prompt_end && n_past < slot.prompt.n_tokens();
+                                } else if (slot.tail_n > 0 && slot.task->tokens.get_text_tokens().size() == slot.task->tokens.size() &&
+                                        (int64_t) slot.task->n_tokens() >= slot.n_prompt_end + slot.tail_n) {
+                                    slot.tail_forks = tail_hash(slot.task->tokens.get_text_tokens(), slot.n_prompt_end, slot.tail_n) != slot.tail_hash_v;
+                                }
+                            }
+                            slot.tail_n      = 0;
+                            slot.tail_hash_v = 0;
+
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
@@ -4347,7 +4592,27 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                // strixllama: a regenerate - the prompt is the cache's up to where its last answer started,
+                                // and the checkpoint taken there kept the logits the answer's first token came from: the
+                                // state goes back there and the token is sampled from them, nothing is processed
+                                if (ckpt_edges() && !has_new_tokens && pos_min >= pos_min_thold && !slot.task->is_parent() &&
+                                        lora_get_enabled_ids(slot.lora).empty()) {
+                                    for (auto it = slot.prompt.checkpoints.rbegin(); it != slot.prompt.checkpoints.rend(); ++it) {
+                                        if (it->n_tokens != n_past || it->logits.empty() || it->pos_max + 1 != pos_next) {
+                                            continue;
+                                        }
+                                        if (it->data_tgt.empty() && !(prompt_cache && prompt_cache->ckpt_page_in(slot.prompt.tokens, slot.ckpt_paged, *it))) {
+                                            break;
+                                        }
+                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                        regen_logits = it->logits;
+                                        break;
+                                    }
+                                }
+
+                                if (regen_logits.empty() && pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
                                     auto usable = [&](const auto & cur) {
                                         // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
@@ -4417,8 +4682,15 @@ private:
                             }
                         }
 
+                        // strixllama: the request continues the whole cache - the answer before it came back as it was
+                        // generated. The state now, at that answer's end, is where an edit of the new message goes back to
+                        if (regen_logits.empty() && n_past > 0 && n_past == slot.prompt.n_tokens() && n_past < slot.task->n_tokens() &&
+                                ckpt_wanted(slot) && !has_ckpt_near(slot, n_past, 0)) {
+                            checkpoint_here(slot);
+                        }
+
                         // [TAG_PROMPT_LOGITS]
-                        if (n_past == slot.task->n_tokens() && n_past > 0) {
+                        if (regen_logits.empty() && n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
                             n_past--;
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
@@ -4476,6 +4748,12 @@ private:
                                     "processing the prompt from its start\n", slot.prompt.n_tokens(), pos_min, pos_max);
                             slot.prompt_clear();
                         }
+                    }
+
+                    // strixllama: a regenerate restored where its answer started (above): sampled, nothing to process
+                    if (!regen_logits.empty() && slot.prompt.n_tokens() == slot.task->n_tokens()) {
+                        sample_regenerated(slot, regen_logits);
+                        return;
                     }
 
                     // If using an alora, there may be uncached tokens that come
@@ -4560,6 +4838,10 @@ private:
                     // end of the prompt, where edits and regenerations land (see anchor_spacing)
                     const auto first_user_pos = spans.first_user_message_pos();
                     const int64_t n_prompt_all = slot.task->n_tokens();
+                    // strixllama: the last user message starts right after the checkpoint where the answer before it
+                    // ended (a continuing request takes one): no cut there (see ckpt_edges)
+                    const bool last_user_covered = ckpt_edges() && last_user_pos >= 0 && has_ckpt_near(slot, last_user_pos, 16);
+                    const bool think_end = think_tail(input_tokens, n_prompt_all);
                     // the checkpoint n_ubatch before the end is upstream's cover for an edit near the end of a long
                     // last message; the last message's own start covers it when that is within the same distance
                     const bool ubatch_offset = !(last_user_pos >= 0 && n_prompt_all - last_user_pos <= 4 + (int64_t) n_ubatch);
@@ -4570,10 +4852,11 @@ private:
                     int64_t ckpt_ref = slot.prompt.checkpoints.empty() ? -1 : slot.prompt.checkpoints.back().n_tokens;
                     if (do_checkpoint && batch_start > 0) {
                         const bool start_anchor = spans.is_turn_start(batch_start) && (batch_start == first_user_pos ||
-                                batch_start == last_user_pos || ckpt_ref < 0 ||
+                                (batch_start == last_user_pos && !last_user_covered) || ckpt_ref < 0 ||
                                 batch_start >= ckpt_ref + anchor_spacing(batch_start, n_prompt_all));
-                        const bool start_offset = batch_start == n_prompt_all - std::min<int64_t>(n_batch, 4) ||
-                                (ubatch_offset && batch_start == n_prompt_all - std::min<int64_t>(n_batch, 4 + n_ubatch));
+                        const bool start_offset = (!ckpt_edges() && (batch_start == n_prompt_all - std::min<int64_t>(n_batch, 4) ||
+                                (ubatch_offset && batch_start == n_prompt_all - std::min<int64_t>(n_batch, 4 + n_ubatch)))) ||
+                                (think_end && batch_start == n_prompt_all - 1);
                         if (start_anchor || start_offset) {
                             ckpt_ref = batch_start;
                         }
@@ -4610,7 +4893,7 @@ private:
                         if (do_checkpoint && spans.is_turn_start(slot.prompt.n_tokens())) {
                             const int64_t pos = slot.prompt.n_tokens();
 
-                            if (pos == last_user_pos || pos == first_user_pos || ckpt_ref < 0 ||
+                            if ((pos == last_user_pos && !last_user_covered) || pos == first_user_pos || ckpt_ref < 0 ||
                                     pos >= ckpt_ref + anchor_spacing(pos, n_prompt_all)) {
                                 break;
                             }
@@ -4621,7 +4904,10 @@ private:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint) {
+                        if (do_checkpoint && think_end && slot.task->n_tokens() == slot.prompt.n_tokens() + 1) {
+                            break;
+                        }
+                        if (do_checkpoint && !ckpt_edges()) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
@@ -4676,11 +4962,12 @@ private:
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
                     // strixllama: the batch starts at an anchor (see first_user_pos above), or at one of the offsets
                     // before the end the loop cut it at
-                    const bool is_anchor = is_user_start && (n_tokens_start == first_user_pos || is_last_user_message ||
+                    const bool is_anchor = is_user_start && (n_tokens_start == first_user_pos || (is_last_user_message && !last_user_covered) ||
                             slot.prompt.checkpoints.empty() ||
                             n_tokens_start >= slot.prompt.checkpoints.back().n_tokens + anchor_spacing(n_tokens_start, n_prompt_all));
-                    const bool is_end_offset = n_tokens_start == n_prompt_all - std::min<int64_t>(n_batch, 4) ||
-                            (ubatch_offset && n_tokens_start == n_prompt_all - std::min<int64_t>(n_batch, 4 + n_ubatch));
+                    const bool is_end_offset = (!ckpt_edges() && (n_tokens_start == n_prompt_all - std::min<int64_t>(n_batch, 4) ||
+                            (ubatch_offset && n_tokens_start == n_prompt_all - std::min<int64_t>(n_batch, 4 + n_ubatch)))) ||
+                            (think_end && n_tokens_start == n_prompt_all - 1);
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
@@ -4938,6 +5225,17 @@ private:
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                }
+
+                // strixllama: where the answer starts - the prompt's end, the drafter caught up on it - with the logits the
+                // first token is sampled from next, for a regenerate (see ckpt_edges)
+                const bool think = think_tail(slot.prompt.tokens, slot.prompt.n_tokens());
+                slot.n_prompt_end = slot.prompt.n_tokens() - (think ? 1 : 0);
+                if (ckpt_wanted(slot) && !think && checkpoint_here(slot)) {
+                    const float * lg = llama_get_logits_ith(ctx_tgt, slot.i_batch - off);
+                    if (lg != nullptr) {
+                        slot.prompt.checkpoints.back().logits.assign(lg, lg + llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt))));
+                    }
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;

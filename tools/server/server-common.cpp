@@ -1514,6 +1514,17 @@ json format_response_rerank(
 // other utils
 //
 
+static std::vector<llama_token_data> token_probabilities_sorted(std::vector<llama_token_data> cur, size_t n_top);
+
+// strixllama: the same from a stored row of logits (a checkpoint's)
+std::vector<llama_token_data> get_token_probabilities(const float * logits, int n_logits, size_t n_top) {
+    std::vector<llama_token_data> cur(n_logits);
+    for (llama_token token_id = 0; token_id < n_logits; token_id++) {
+        cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+    }
+    return token_probabilities_sorted(std::move(cur), n_top);
+}
+
 std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t n_top) {
     std::vector<llama_token_data> cur;
 
@@ -1533,6 +1544,10 @@ std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int i
         }
     }
 
+    return token_probabilities_sorted(std::move(cur), n_top);
+}
+
+static std::vector<llama_token_data> token_probabilities_sorted(std::vector<llama_token_data> cur, size_t n_top) {
     // sort tokens by logits (partial: only the leading `n_top` need ordering)
     if (n_top > cur.size()) {
         n_top = cur.size();

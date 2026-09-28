@@ -505,6 +505,7 @@ struct server_metrics {
 //
 
 std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t n_top);
+std::vector<llama_token_data> get_token_probabilities(const float * logits, int n_logits, size_t n_top);
 
 std::string safe_json_to_str(const json & data);
 
