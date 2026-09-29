@@ -2327,6 +2327,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+// strixllama DEV: STRIX_REPEAT=topk:N,fa:N,kvrows:N,argsort:N,idxdec:N dispatches those ops N more times (each writes what
+// it wrote before), so a step's time grows by N times the op's in-graph cost; 0 when unset
+static int strix_repeat(const char * key) {
+    static const std::string spec = getenv("STRIX_REPEAT") ? getenv("STRIX_REPEAT") : "";
+    if (spec.empty()) { return 0; }
+    const std::string k = std::string(key) + ":";
+    const size_t at = spec.find(k);
+    return at == std::string::npos ? 0 : atoi(spec.c_str() + at + k.size());
+}
+
 bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     if (ggml_cuda_mmb_marks_count() > 0 && dst->op != GGML_OP_MUL_MAT && dst->op != GGML_OP_MUL_MAT_ID && dst->op != GGML_OP_VIEW &&
             dst->op != GGML_OP_RESHAPE && dst->op != GGML_OP_PERMUTE && dst->op != GGML_OP_TRANSPOSE && dst->op != GGML_OP_NONE) {
@@ -2352,6 +2362,9 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
             break;
         case GGML_OP_GET_ROWS:
             ggml_cuda_op_get_rows(ctx, dst);
+            if (dst->type == GGML_TYPE_F16 && dst->ne[0] == 512) {
+                for (int r = strix_repeat("kvrows"); r > 0; --r) { ggml_cuda_op_get_rows(ctx, dst); }
+            }
             break;
         case GGML_OP_GET_ROWS_BACK:
             ggml_cuda_op_get_rows_back(ctx, dst);
@@ -2632,12 +2645,19 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
             break;
         case GGML_OP_TOP_K:
             ggml_cuda_op_top_k(ctx, dst);
+            if (dst->ne[0] == 512) {
+                for (int r = strix_repeat("topk"); r > 0; --r) { ggml_cuda_op_top_k(ctx, dst); }
+            }
             break;
         case GGML_OP_ARGSORT:
             ggml_cuda_op_argsort(ctx, dst);
+            for (int r = strix_repeat("argsort"); r > 0; --r) { ggml_cuda_op_argsort(ctx, dst); }
             break;
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);
+            if (dst->ne[1] == 24 && dst->ne[2] == 1) {
+                for (int r = strix_repeat("fa"); r > 0; --r) { ggml_cuda_flash_attn_ext(ctx, dst); }
+            }
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
@@ -2855,10 +2875,17 @@ static bool strixllama_skip_op(const ggml_tensor * node) {
     if (wanted.empty()) { return false; }
     const char * op = ggml_op_name(node->op);
     for (const auto & w : wanted) {
-        // DEV: OP@ne0 skips only the nodes of that op whose ne[0] is ne0 (e.g. MUL_MAT@320)
+        // DEV: OP@ne0 skips only the nodes of that op whose ne[0] is ne0 (e.g. MUL_MAT@320); OP@lo-hi those whose ne[0]
+        // is in [lo, hi]; * for OP takes every op
         const size_t at = w.find('@');
         if (at != std::string::npos) {
-            if (w.compare(0, at, op) == 0 && atoll(w.c_str() + at + 1) == node->ne[0]) { return true; }
+            const bool any_op = at == 1 && w[0] == '*';
+            if (any_op || w.compare(0, at, op) == 0) {
+                const long long lo = atoll(w.c_str() + at + 1);
+                const size_t dash = w.find('-', at + 1);
+                const long long hi = dash != std::string::npos ? atoll(w.c_str() + dash + 1) : lo;
+                if (node->ne[0] >= lo && node->ne[0] <= hi) { return true; }
+            }
             continue;
         }
         const size_t colon = w.find(':');
@@ -4540,6 +4567,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // run the whole score at the MUL_MAT
     if (node->op == GGML_OP_MUL_MAT && g_idx_dec_pending.mm == i && g_idx_dec_pending.a.out) {
         ggml_cuda_op_idx_score_dec(*cuda_ctx, g_idx_dec_pending.a);
+        for (int r = strix_repeat("idxdec"); r > 0; --r) { ggml_cuda_op_idx_score_dec(*cuda_ctx, g_idx_dec_pending.a); }
         const int skip = g_idx_dec_pending.end - i;
         g_idx_dec_pending = {};
         return skip;

@@ -92,6 +92,18 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const int64_t  idx_dim = model.hparams.indexer_head_size;
         const uint32_t n_layer = model.hparams.n_layer_all;
 
+        // the rows' residue classes follow the block ratio of the indexer layers (one ratio for all of them, as the
+        // graph inputs assume); anything else keeps a row per cell in order
+        uint32_t ratio = 0;
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            if (filter_idx(il)) {
+                const uint32_t ril = model.hparams.dsv4_compress_ratios[il];
+                ratio = ratio == 0 || ratio == ril ? ril : UINT32_MAX;
+            }
+        }
+        kb_r = ratio >= 1 && ratio <= 64 ? ratio : 1;
+        kb_s = (kv_size + 1 + kb_r - 1)/kb_r;
+
         std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
         for (uint32_t il = 0; il < n_layer; ++il) {
             if (!filter_idx(il)) {
@@ -114,7 +126,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             } else {
                 ctx = it->second;
             }
-            ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, idx_dim, (int64_t) kv_size + 1);
+            ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, idx_dim, (int64_t) kb_r*kb_s);
             ggml_format_name(t, "cache_idx_kb_l%d", il);
             kb_map[(int32_t) il] = t;
         }
@@ -128,7 +140,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             bytes += ggml_backend_buffer_get_size(buf);
             kb_bufs.emplace_back(buf);
         }
-        LLAMA_LOG_INFO("%s: QSA block-key cache: %zu layers, %.1f MiB\n", __func__, kb_map.size(), bytes/1024.0/1024.0);
+        LLAMA_LOG_INFO("%s: QSA block-key cache: %zu layers, %.1f MiB, rows by residue mod %u\n", __func__, kb_map.size(),
+                bytes/1024.0/1024.0, kb_r);
     }
 
     // strixllama: IndexShare rows for the MTP layer's selection (LLAMA_MTP_INDEX_SHARE=1), when that layer has an indexer
@@ -196,7 +209,7 @@ ggml_tensor * llama_memory_hybrid_idx::get_kb(int32_t il) const {
 }
 
 uint32_t llama_memory_hybrid_idx::kb_scratch_row() const {
-    return mem_idx ? mem_idx->get_size() : 0;
+    return mem_idx ? kb_row(mem_idx->get_size()) : 0;
 }
 
 bool llama_memory_hybrid_idx::kb_needs_full(const llama_ubatch & ubatch) const {
@@ -379,7 +392,7 @@ void llama_memory_hybrid_idx::share_forget(llama_seq_id seq_id, llama_pos p0, ll
     }
 }
 
-// A block's key sits at the row of its first cell. The moves lay a sequence out in position order, so its keys
+// A block's key sits at the row of its first cell (kb_row). The moves lay a sequence out in position order, so its keys
 // can follow their cells only if its cells were in that order already (then every block keeps its first cell);
 // a sequence whose cells were not has its keys rebuilt once instead.
 void llama_memory_hybrid_idx::kb_move_rows(const llama_kv_cache::cell_move_vec_t & moves) {
@@ -387,7 +400,15 @@ void llama_memory_hybrid_idx::kb_move_rows(const llama_kv_cache::cell_move_vec_t
     for (const auto & m : moves) {
         share_forget(m.seq);   // strixllama: the IndexShare rows name the cells before the move
         if (m.ordered) {
-            rows.push_back(m);
+            // the cells src + i, i = j, j + kb_r, ... sit in consecutive rows from kb_row(src + j), and so do their
+            // destinations: a run per residue class. The cell runs do not overlap, so neither do these
+            for (uint32_t j = 0; j < kb_r && j < m.n; ++j) {
+                llama_kv_cache::cell_move rm = m;
+                rm.src = kb_row(m.src + j);
+                rm.dst = kb_row(m.dst + j);
+                rm.n   = (m.n - j + kb_r - 1)/kb_r;
+                rows.push_back(rm);
+            }
         } else {
             kb_mark_stale(m.seq);
         }
@@ -1071,7 +1092,7 @@ bool llama_memory_hybrid_idx::set_input_qsa_run(qsa_run_inputs & out, ggml_tenso
         const int32_t scratch = (int32_t) kb_scratch_row();
         out.bid_rows.resize(n_blocks);
         for (int64_t b = 0; b < n_blocks; ++b) {
-            out.bid_rows[b] = b < n_bid ? (int32_t) kv_off + bcell(b) : scratch;
+            out.bid_rows[b] = b < n_bid ? (int32_t) kb_row(kv_off + bcell(b)) : scratch;
         }
     }
     if (kb && kb->dirty_dst && kb->dirty_dst->data) {
@@ -1137,7 +1158,7 @@ bool llama_memory_hybrid_idx::set_input_qsa_run(qsa_run_inputs & out, ggml_tenso
                 for (int64_t sec = 0; sec < 4; ++sec) {
                     out.dirty_pos[sec*dirty_max + n_dirty] = bpos(b);
                 }
-                out.dirty_dst[n_dirty] = (int32_t) kv_off + bcell(b);
+                out.dirty_dst[n_dirty] = (int32_t) kb_row(kv_off + bcell(b));
                 ++n_dirty;
             }
         }
@@ -1642,7 +1663,7 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
             const int32_t scratch = (int32_t) kb_scratch_row();
             int32_t * br = (int32_t *) kb->bid_rows->data;
             for (int64_t b = 0; b < n_blocks; ++b) {
-                br[b] = b < n_bid ? (int32_t) kv_off + bid_cell[b] : scratch;
+                br[b] = b < n_bid ? (int32_t) kb_row(kv_off + bid_cell[b]) : scratch;
             }
         }
         // the dirty list exists only in incremental graphs (a full-rebuild graph reads no such input)
@@ -1703,7 +1724,7 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
                     if (n_dirty >= dirty_max) { left |= pass == 2; continue; }
                     for (int64_t slot = 0; slot < r; ++slot) { dc[n_dirty*r + slot] = cur_blk_cells[b*r + slot]; }
                     for (int64_t sec = 0; sec < 4; ++sec) { dp[sec*dirty_max + n_dirty] = dst_blk_pos[sec*n_blocks + b]; }
-                    dd[n_dirty] = (int32_t) kv_off + bid_cell[b];
+                    dd[n_dirty] = (int32_t) kb_row(kv_off + bid_cell[b]);
                     ++n_dirty;
                 }
             }

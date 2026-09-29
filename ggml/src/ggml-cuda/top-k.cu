@@ -1152,7 +1152,12 @@ static void top_k_rows_launch(const float * src, int * dst, int ncols, int nrows
 static bool top_k_rows_cuda(const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
     static const bool on = !getenv("STRIX_TOP_K_ROWS") || atoi(getenv("STRIX_TOP_K_ROWS")) != 0;
     static const int  bs = getenv("STRIX_TOP_K_ROWS_BLOCK") ? atoi(getenv("STRIX_TOP_K_ROWS_BLOCK")) : 1024;
-    if (!on || nrows < 32 || nrows > 65535 || ncols <= 1024 || k < 1 || k > ncols || ncols > 128 * bs) {
+    // strixllama: from one row up (it took 32 and more): the QSA decode's TOP_K has a row a query - eight conversations
+    // are eight rows of ~20-40K blocks - and top_k_parallel_radix_cuda's dozen launches cost ~340 us a strip there against
+    // ~10 us here (a step at 8 x 20K 103 -> 97.6 ms); one conversation, at 110K or 210K, is unchanged. The same set either
+    // way (see above). STRIX_TOP_K_ROWS_MIN=32 restores the old bound.
+    static const int  min_rows = getenv("STRIX_TOP_K_ROWS_MIN") ? atoi(getenv("STRIX_TOP_K_ROWS_MIN")) : 1;
+    if (!on || nrows < min_rows || nrows > 65535 || ncols <= 1024 || k < 1 || k > ncols || ncols > 128 * bs) {
         return false;
     }
     switch (bs) {

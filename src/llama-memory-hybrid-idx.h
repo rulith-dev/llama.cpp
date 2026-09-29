@@ -135,8 +135,15 @@ public:
                              const llama_ubatch * ubatch, uint32_t ratio, const qsa_kb_inputs * kb = nullptr,
                              const qsa_mixed_inputs * mixed = nullptr, bool active_only = false, uint32_t kv_off = 0) const;
 
-    ggml_tensor * get_kb(int32_t il) const;   // F16 [idx_dim, kv_size + 1]; null when off or no indexer on il
-    uint32_t      kb_scratch_row() const;     // the spare row: kv_size of the indexer cache
+    ggml_tensor * get_kb(int32_t il) const;   // F16 [idx_dim, kb_r*kb_s]; null when off or no indexer on il
+    uint32_t      kb_scratch_row() const;     // the spare row: kb_row(kv_size) of the indexer cache
+    // strixllama: a block's key sits in the row of its first cell, and the rows are laid out by residue class: cell c
+    // in row (c % kb_r)*kb_s + c/kb_r. A conversation's blocks start every kb_r cells (kb_r = the block ratio), so
+    // their keys are adjacent rows, and the decode score reads them as one run. With a row per cell they were 1 KB
+    // apart, and eight conversations' keys read that way ran at ~50 GB/s (205 us a layer at 8 x 20K, 45 us adjacent;
+    // one conversation at 110K: 33 us, 17 us adjacent): the DRAM channels alias on strides like that. Any c -> row
+    // bijection is correct whatever the block layout; this one is also dense.
+    uint32_t      kb_row(uint32_t cell) const { return (cell % kb_r)*kb_s + cell/kb_r; }
     // strixllama: a sequence's block keys go stale when its positions move or its cells are restored or moved out
     // of order; the next graph of a ubatch holding it rebuilds every key of that ubatch's sequences
     bool          kb_needs_full(const llama_ubatch & ubatch) const;
@@ -209,6 +216,8 @@ private:
     std::vector<ggml_context_ptr>        kb_ctxs;
     std::vector<ggml_backend_buffer_ptr> kb_bufs;
     std::map<int32_t, ggml_tensor *>     kb_map;
+    uint32_t                             kb_r = 1;   // rows laid out by residue class mod kb_r (kb_row)
+    uint32_t                             kb_s = 0;   // rows a class: ceil((kv_size + 1)/kb_r)
     // the sequences whose block keys have to be rebuilt (see kb_needs_full). All of them at the start and after
     // a clear, so the first graph of every sequence builds its keys the way it always has
     mutable std::bitset<LLAMA_MAX_SEQ>   kb_stale = std::bitset<LLAMA_MAX_SEQ>().set();
