@@ -5567,6 +5567,41 @@ void ggml_flash_attn_ext_set_n_kv_max(
     ggml_set_op_params_i32(a, 4, n_kv_max);
 }
 
+struct ggml_tensor * ggml_flash_attn_ext_gather(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * rows,
+        float                 scale) {
+    GGML_ASSERT((k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0) && v->type == k->type);
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && q->ne[1] == 1 && q->ne[0] == k->ne[0]);
+    GGML_ASSERT(k->ne[1] == v->ne[1] && k->ne[2] == v->ne[2] && k->ne[3] == 1 && v->ne[3] == 1 && q->ne[2] % k->ne[1] == 0);
+    GGML_ASSERT(k->nb[1] <= k->nb[2] && v->nb[1] <= v->nb[2]);
+    GGML_ASSERT(mask && mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask));
+    GGML_ASSERT(mask->ne[1] == 1 && mask->ne[2] == 1 && mask->ne[3] == q->ne[3]);
+    GGML_ASSERT(rows->type == GGML_TYPE_I32 && ggml_is_contiguous(rows) && ggml_nelements(rows) == mask->ne[0]*q->ne[3]);
+
+    // what ggml_flash_attn_ext makes of q and a [head, n_sel, n_head_kv, n_seq] K/V
+    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    float params[] = { scale, 0.0f, 0.0f };
+    ggml_set_op_params(result, params, sizeof(params));
+    ggml_set_op_params_i32(result, 3, (int32_t) GGML_PREC_F32);
+    ggml_set_op_params_i32(result, 5, GGML_FLASH_ATTN_EXT_GATHER);
+
+    result->op     = GGML_OP_FLASH_ATTN_EXT;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = mask;
+    result->src[8] = rows;
+
+    return result;
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {

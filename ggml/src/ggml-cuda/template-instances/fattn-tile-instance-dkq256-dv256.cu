@@ -3,3 +3,6 @@
 #include "../fattn-tile.cuh"
 
 DECL_FATTN_TILE_CASE(256, 256);
+
+// strixllama: ggml_flash_attn_ext_gather (Qwen3.8 Flash Next's decode sparse attention)
+template void ggml_cuda_flash_attn_ext_tile_gather_case<256, 256>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

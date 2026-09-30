@@ -5,6 +5,9 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 #include "qsa.cuh"
+#include "getrows.cuh"
+
+#include <cstring>
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 __launch_bounds__(256, 1)
@@ -515,11 +518,25 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
+// strixllama: ggml_flash_attn_ext_gather
+static bool ggml_cuda_fattn_is_gather(const ggml_tensor * dst) {
+    return ggml_get_op_params_i32(dst, 5) == GGML_FLASH_ATTN_EXT_GATHER && dst->src[8] != nullptr;
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;
 #endif// FLASH_ATTN_AVAILABLE
+
+    if (ggml_cuda_fattn_is_gather(dst)) {
+        // the tile kernel with a 256-wide head (ggml_cuda_flash_attn_ext_tile_gather_case)
+        const ggml_tensor * K = dst->src[1];
+        const ggml_tensor * V = dst->src[2];
+        const ggml_tensor * mask = dst->src[3];
+        return K->ne[0] == 256 && V->ne[0] == 256 && mask && mask->ne[0] % FATTN_KQ_STRIDE == 0 ?
+            BEST_FATTN_KERNEL_TILE : BEST_FATTN_KERNEL_NONE;
+    }
 
     const ggml_tensor * KQV   = dst;
     const ggml_tensor * Q     = dst->src[0];
@@ -695,6 +712,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
+    if (ggml_cuda_fattn_is_gather(dst)) {
+        return ggml_nbytes(dst);   // K and V are read where they are
+    }
+
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -728,8 +749,107 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+// strixllama: ggml_flash_attn_ext_gather. K and V as the tile kernel sees them are the cache itself, shaped as the
+// gathered copy would be - [head, n_sel, n_head_kv, n_seq] with a cell's and a head's strides - and the kernel reads cell
+// rows[s*n_sel + i] for position i of sequence s.
+//
+// STRIX_FA_GATHER_CHECK=1 (with GGML_CUDA_DISABLE_GRAPHS=1): every call also gathers the cells to f16 with ggml_get_rows's
+// kernel and runs the flash attention the graph ran before on them, compares the two results byte for byte and aborts
+// on a difference.
+static void ggml_cuda_flash_attn_ext_gather(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * Kc   = dst->src[1];
+    const ggml_tensor * Vc   = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * rows = dst->src[8];
+    GGML_ASSERT((Kc->type == GGML_TYPE_Q8_0 || Kc->type == GGML_TYPE_F16) && Vc->type == Kc->type);
+    GGML_ASSERT(Kc->ne[0] == 256 && Vc->ne[0] == 256);
+    // the tile loader reads 16 bytes of an f16 head at a time, and a q8_0 head's blocks with dword loads, which never
+    // pass the head's end when it starts 4-aligned
+    const size_t align = Kc->type == GGML_TYPE_F16 ? 16 : 4;
+    GGML_ASSERT((uintptr_t) Kc->data % align == 0 && Kc->nb[1] % align == 0 && Kc->nb[2] % align == 0);
+    GGML_ASSERT((uintptr_t) Vc->data % align == 0 && Vc->nb[1] % align == 0 && Vc->nb[2] % align == 0);
+    const int64_t n_sel = mask->ne[0];
+    const int64_t n_seq = Q->ne[3];
+    const int64_t n_head_kv = Kc->ne[1];
+
+    ggml_tensor K = *Kc;
+    K.ne[1] = n_sel;      K.ne[2] = n_head_kv;  K.ne[3] = n_seq;
+    K.nb[1] = Kc->nb[2];  K.nb[2] = Kc->nb[1];  K.nb[3] = 0;
+    ggml_tensor V = *Vc;
+    V.ne[1] = n_sel;      V.ne[2] = n_head_kv;  V.ne[3] = n_seq;
+    V.nb[1] = Vc->nb[2];  V.nb[2] = Vc->nb[1];  V.nb[3] = 0;
+    ggml_tensor fused = *dst;
+    fused.src[1] = &K;
+    fused.src[2] = &V;
+    ggml_cuda_flash_attn_ext_tile_gather_case<256, 256>(ctx, &fused);
+
+    static const bool check = getenv("STRIX_FA_GATHER_CHECK") && atoi(getenv("STRIX_FA_GATHER_CHECK")) != 0;
+    if (!check) {
+        return;
+    }
+    // the gathered path: get_rows of the cache as a [n_head_kv*head, cells] matrix into f16, then the tile kernel on
+    // [head, n_sel, n_head_kv, n_seq] views of the copy, as qwen4exp_gather_attn built it
+    cudaStream_t stream = ctx.stream();
+    const int64_t row = n_head_kv*256;
+    ggml_cuda_pool_alloc<half>  kg(ctx.pool(), row*n_sel*n_seq), vg(ctx.pool(), row*n_sel*n_seq);
+    ggml_cuda_pool_alloc<float> out(ctx.pool(), ggml_nelements(dst));
+    for (int which = 0; which < 2; ++which) {
+        const ggml_tensor * c = which == 0 ? Kc : Vc;
+        half * g = which == 0 ? kg.get() : vg.get();
+        ggml_tensor src0 = *c;
+        src0.ne[0] = row;  src0.ne[1] = c->ne[2]; src0.ne[2] = 1; src0.ne[3] = 1;
+        src0.nb[1] = c->nb[2]; src0.nb[2] = c->nb[2]*c->ne[2]; src0.nb[3] = src0.nb[2];
+        ggml_tensor src1 = *rows;
+        src1.ne[0] = n_sel*n_seq; src1.ne[1] = 1; src1.ne[2] = 1; src1.ne[3] = 1;
+        src1.nb[1] = src1.nb[0]*src1.ne[0]; src1.nb[2] = src1.nb[1]; src1.nb[3] = src1.nb[1];
+        ggml_tensor gr = {};
+        gr.type = GGML_TYPE_F16;
+        gr.op   = GGML_OP_GET_ROWS;
+        gr.ne[0] = row; gr.ne[1] = n_sel*n_seq; gr.ne[2] = 1; gr.ne[3] = 1;
+        gr.nb[0] = sizeof(half); gr.nb[1] = row*sizeof(half); gr.nb[2] = gr.nb[1]*gr.ne[1]; gr.nb[3] = gr.nb[2];
+        gr.data = g;
+        gr.src[0] = &src0;
+        gr.src[1] = &src1;
+        ggml_cuda_op_get_rows(ctx, &gr);
+    }
+    ggml_tensor Kf = {}, Vf = {};
+    for (ggml_tensor * t : {&Kf, &Vf}) {
+        t->type = GGML_TYPE_F16;
+        t->ne[0] = 256; t->ne[1] = n_sel; t->ne[2] = n_head_kv; t->ne[3] = n_seq;
+        t->nb[0] = sizeof(half); t->nb[1] = row*sizeof(half); t->nb[2] = 256*sizeof(half); t->nb[3] = row*sizeof(half)*n_sel;
+    }
+    Kf.data = kg.get();
+    Vf.data = vg.get();
+    ggml_tensor ref = *dst;
+    ref.src[1] = &Kf;
+    ref.src[2] = &Vf;
+    ref.src[8] = nullptr;
+    ggml_set_op_params_i32(&ref, 5, 0);
+    ref.data = out.get();
+    ggml_cuda_flash_attn_ext_tile(ctx, &ref);
+
+    const size_t n = ggml_nbytes(dst);
+    std::vector<char> a(n), b(n);
+    CUDA_CHECK(cudaMemcpyAsync(a.data(), dst->data, n, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(b.data(), out.get(), n, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    static long long calls = 0;
+    if (memcmp(a.data(), b.data(), n) != 0) {
+        GGML_ABORT("FA_GATHER check failed: call %lld (%s cache, %lld sequences, %lld cells each) differs from the "
+                   "gathered path", calls, ggml_type_name(Kc->type), (long long) n_seq, (long long) n_sel);
+    }
+    if (++calls % 1000 == 0) {
+        fprintf(stderr, "FA_GATHER check: %lld calls, the fused attention's equal\n", calls);
+    }
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    if (ggml_cuda_fattn_is_gather(dst)) {
+        ggml_cuda_flash_attn_ext_gather(ctx, dst);
+        return;
+    }
     if (ggml_cuda_flash_attn_ext_qsa_supported(ctx, dst)) {
         ggml_cuda_flash_attn_ext_qsa(ctx, dst);
         return;

@@ -958,6 +958,8 @@ static __global__ void mul_mat_vec_q8_0_i8(
 
     float tmp[ncols_dst] = {0.0f};
 
+    // two iterations' loads in flight: eight columns of [10240 -> 320] 26.3 -> 22.6 us (4: 24.9), the same bits
+#pragma unroll 2
     for (int kbx = k0; kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         int   u[NQ][vdr];
         float dy[ND];

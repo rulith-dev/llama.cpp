@@ -975,9 +975,13 @@ static __global__ void flash_attn_combine_results(
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE
+    const int nbatch_fa, const bool need_f16_K_in, const bool need_f16_V_in, const bool stream_k, const bool use_sparse,
+    const int warp_size = WARP_SIZE, const bool kv_gather = false, fattn_kernel_t occupancy_kernel = nullptr
 ) {
+    // strixllama: kv_gather (ggml_flash_attn_ext_gather): K and V stay the cache the kernel reads through the cell list,
+    // which goes in the sinks slot; the occupancy comes from occupancy_kernel when given
+    const bool need_f16_K = need_f16_K_in && !kv_gather;
+    const bool need_f16_V = need_f16_V_in && !kv_gather;
     constexpr int ncols = ncols1 * ncols2;
 
     const ggml_tensor * Q = dst->src[0];
@@ -1124,7 +1128,8 @@ void launch_fattn(
 
     const dim3 block_dim(warp_size, nwarps, 1);
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, occupancy_kernel ? occupancy_kernel : fattn_kernel,
+        block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
@@ -1237,7 +1242,7 @@ void launch_fattn(
         K_data,
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
-        sinks ? ((const char *) sinks->data) : nullptr,
+        kv_gather ? ((const char *) dst->src[8]->data) : sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,

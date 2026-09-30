@@ -2508,6 +2508,21 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // strixllama: flash attention over cells picked from an f16 or q8_0 KV cache (a decode step's sparse attention):
+    // position i of sequence s reads cell rows[s*n_sel + i] of k and v, n_sel = mask->ne[0]. The result is that of
+    // gathering those rows to f16 with ggml_get_rows and running ggml_flash_attn_ext (F32 precision) on
+    // [head, n_sel, n_head_kv, n_seq] K/V with this mask, bit for bit, without the gathered copy (CUDA backend only).
+    // op_params[5] of the node is GGML_FLASH_ATTN_EXT_GATHER, the cell list its src[8].
+    #define GGML_FLASH_ATTN_EXT_GATHER 0x47415448
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_gather(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,      // [head, 1, n_head, n_seq] f32
+            struct ggml_tensor  * k,      // [head, n_head_kv, n_cells] f16 or q8_0
+            struct ggml_tensor  * v,      // [head, n_head_kv, n_cells], the type of k
+            struct ggml_tensor  * mask,   // [n_sel, 1, 1, n_seq] f16
+            struct ggml_tensor  * rows,   // [n_sel*n_seq] i32, each in [0, n_cells)
+            float                 scale);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

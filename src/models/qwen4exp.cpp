@@ -1785,6 +1785,20 @@ static ggml_tensor * qwen4exp_gather_attn(ggml_context * ctx0, ggml_tensor * q, 
     ggml_tensor * mask  = ggml_cast(ctx0, ggml_log(ctx0, valid), GGML_TYPE_F16);   // 0 where selected, -inf elsewhere
     mask = ggml_cont(ctx0, ggml_reshape_4d(ctx0, mask, n_sel, 1, 1, n_query));
 
+    // strixllama: the cache is read in place through the cell list (ggml_flash_attn_ext_gather): the same numbers without
+    // the gathered f16 copy - its write and the attention's second read. Eight conversations at 20K spent ~3.0 ms of a
+    // step on the gathers and ~3.2 on the attention (STRIX_REPEAT, 0.3.5); fused, ~2.2 ms. STRIX_FA_GATHER=0 keeps the copy
+    static const bool fused = [] {
+        const char * e = getenv("STRIX_FA_GATHER");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (fused && (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0) && v->type == k->type && head_k == 256 &&
+            v->ne[0] == 256 && k->ne[3] == 1 && v->ne[3] == 1 && q->ne[1] % n_head_kv == 0) {
+        ggml_tensor * q4 = ggml_permute(ctx0, ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], 1, n_query,
+                q->nb[1], q->nb[2], q->nb[2], 0), 0, 2, 1, 3);
+        return ggml_flash_attn_ext_gather(ctx0, q4, k, v, mask, rows, kq_scale);   // [head_v, n_head_q, 1, n_query]
+    }
+
     // one K/V slab per query on the sequence axis: [head, n_sel, n_head_kv, n_query]
     ggml_tensor * kg = qwen4exp_get_rows_f16(ctx0, k2d, rows);
     ggml_tensor * vg = qwen4exp_get_rows_f16(ctx0, v2d, rows);
