@@ -374,6 +374,15 @@ struct server_slot {
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
 
+    // strixllama: speculative sampling (STRIX_SPEC_SAMPLING, see common_sampler_sample_and_accept_n_spec): when this
+    // task's sampler allows it, the drafter draws the draft from q with spec_draft_rng and records q in spec_draft_q,
+    // and the verification accepts by p / q with spec_verify_rng
+    bool spec_sampling = false;
+    common_speculative_sample_params spec_sample;
+    std::vector<std::vector<llama_token_data>> spec_draft_q;
+    std::mt19937 spec_draft_rng;
+    std::mt19937 spec_verify_rng;
+
     // strixllama: the length of the last prompt the slot processed, less a last token the next request re-renders (a
     // thinking prompt's, see think_tail); 0: none since it was cleared or loaded. The answer after it is the
     // conversation's main line only once the next request continues it (n_mainline)
@@ -846,6 +855,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_draft_q.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -2823,6 +2833,32 @@ private:
                     : task.params.sampling.seed;
                 slot.spec_synth_rng.seed(seed);
             }
+
+            // strixllama: speculative sampling, with a sampler whose distribution it can compute (temperature above 0,
+            // no mirostat, the chain ending in dist); greedy decoding keeps the exact match
+            {
+                static const bool on = !getenv("STRIX_SPEC_SAMPLING") || atoi(getenv("STRIX_SPEC_SAMPLING")) != 0;
+                static const float qscale = getenv("STRIX_SPEC_QSCALE") ? (float) atof(getenv("STRIX_SPEC_QSCALE")) : 1.0f;
+
+                slot.spec_sampling = on && spec && common_speculative_get_synth_probs(spec.get()).empty() &&
+                    common_sampler_spec_supported(slot.smpl.get());
+                SLT_DBG(slot, "speculative sampling %s (chain: %s)\n", slot.spec_sampling ? "on" : "off",
+                        common_sampler_print(slot.smpl.get()).c_str());
+                if (slot.spec_sampling) {
+                    const uint32_t seed = task.params.sampling.seed == LLAMA_DEFAULT_SEED
+                        ? std::random_device{}()
+                        : task.params.sampling.seed;
+                    slot.spec_draft_rng.seed(seed ^ 0x9e3779b9u);
+                    slot.spec_verify_rng.seed(seed ^ 0x85ebca6bu);
+
+                    const auto & sp = task.params.sampling;
+                    slot.spec_sample.temp   = sp.temp;
+                    slot.spec_sample.top_k  = sp.top_k;
+                    slot.spec_sample.top_p  = sp.top_p;
+                    slot.spec_sample.min_p  = sp.min_p;
+                    slot.spec_sample.qscale = qscale;
+                }
+            }
         } else {
             slot.smpl.reset();
         }
@@ -4321,32 +4357,39 @@ private:
         // several conversations already share the trunk's cost, so their drafts add verification they cannot
         // win back. STRIX_SPEC_DRAFT_BY_SLOTS caps the draft by how many slots generate this step: "3,2,2,0"
         // drafts 3 tokens for one, 2 for two or three and none from four on.
-        int n_draft_cap = INT_MAX;
+        // A request that samples (speculative sampling, see spec_sampling) has its drafts accepted less often than a
+        // greedy one - at temperature 0.7 on prose ~67% at the first position against ~86% - so a draft position pays
+        // for itself less often: STRIX_SPEC_DRAFT_BY_SLOTS_SAMPLED is its table, also with one slot (unset: as greedy).
+        int n_draft_cap         = INT_MAX;
+        int n_draft_cap_sampled = INT_MAX;
         if (spec) {
-            static const std::vector<int> by_slots = [] {
+            auto table = [](const char * name) {
                 std::vector<int> v;
-                const char * e = getenv("STRIX_SPEC_DRAFT_BY_SLOTS");
+                const char * e = getenv(name);
                 for (const char * p = e; p && *p; ) {
                     v.push_back(std::max(0, atoi(p)));
                     p = strchr(p, ',');
                     p = p ? p + 1 : nullptr;
                 }
                 return v;
-            }();
-            if (!by_slots.empty()) {
-                int n_gen = 0;
-                for (const auto & s : slots) {
-                    n_gen += s.state == SLOT_STATE_GENERATING;
-                }
-                if (n_gen > 0) {
-                    n_draft_cap = by_slots[std::min<size_t>(n_gen, by_slots.size()) - 1];
-                }
+            };
+            static const std::vector<int> by_slots         = table("STRIX_SPEC_DRAFT_BY_SLOTS");
+            static const std::vector<int> by_slots_sampled = table("STRIX_SPEC_DRAFT_BY_SLOTS_SAMPLED");
+            int n_gen = 0;
+            for (const auto & s : slots) {
+                n_gen += s.state == SLOT_STATE_GENERATING;
             }
+            if (n_gen > 0 && !by_slots.empty()) {
+                n_draft_cap = by_slots[std::min<size_t>(n_gen, by_slots.size()) - 1];
+            }
+            n_draft_cap_sampled = n_gen > 0 && !by_slots_sampled.empty()
+                ? by_slots_sampled[std::min<size_t>(n_gen, by_slots_sampled.size()) - 1]
+                : n_draft_cap;
         }
 
         // strixllama: the cells this step's answers take so far (see pool_guard_on)
         int64_t n_pool_step = 0;
-        const int64_t n_spec_max = spec ? std::min<int64_t>(common_speculative_n_max(spec.get()), n_draft_cap) : 0;
+        const int64_t n_spec_max = spec ? std::min<int64_t>(common_speculative_n_max(spec.get()), std::max(n_draft_cap, n_draft_cap_sampled)) : 0;
 
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
@@ -4386,7 +4429,7 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = std::min(slot.get_n_draft_max(), n_draft_cap);
+                const int n_draft_max = std::min(slot.get_n_draft_max(), slot.spec_sampling ? n_draft_cap_sampled : n_draft_cap);
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -4418,6 +4461,13 @@ private:
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
                         };
+
+                        slot.spec_draft_q.clear();
+                        if (slot.spec_sampling) {
+                            slot.spec_sample.rng = &slot.spec_draft_rng;
+                            slot.spec_sample.q   = &slot.spec_draft_q;
+                            common_speculative_get_draft_params(spec.get(), slot.id).sample = &slot.spec_sample;
+                        }
 
                         drafting.push_back(&slot);
                     }
@@ -5721,11 +5771,19 @@ private:
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
                 const int64_t t_smp0 = strixllama_spec_timing::enabled() ? ggml_time_us() : 0;
-                auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
-                    : server_sample_and_accept_synth(
+                // strixllama: a draft drawn from q (every token with its q) is verified by speculative sampling, as is a
+                // replay of one; a draft without q (another drafter's) by an exact match
+                const bool use_spec = synth_probs.empty() && slot.spec_sampling &&
+                    (slot.spec_is_replay || slot.spec_draft_q.size() >= slot.spec_draft.size());
+                auto accepted = !synth_probs.empty()
+                    ? server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
-                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay)
+                    : use_spec
+                    ? common_sampler_sample_and_accept_n_spec(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                            slot.spec_draft_q, slot.spec_verify_rng, slot.spec_is_replay)
+                    : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                slot.spec_draft_q.clear();
                 if (t_smp0) { g_spec_timing.sample += ggml_time_us() - t_smp0; }
                 slot.spec_i_batch.clear();
 

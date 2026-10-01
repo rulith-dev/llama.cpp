@@ -4,6 +4,7 @@
 
 #include "common.h"
 
+#include <random>
 #include <string>
 #include <vector>
 
@@ -90,6 +91,29 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+
+// strixllama: speculative sampling (Leviathan et al. 2023, Chen et al. 2023). Draft token i was drawn from draft_q[i]
+// (its support: id and p); it is accepted with probability min(1, p(x) / q(x)), p being the distribution the target's
+// sampler chain samples from (every sampler but the final dist, then dist's softmax). A rejected token is replaced
+// by a draw from max(0, p - q), normalized, and the draft ends; after a draft accepted whole, the next token is drawn
+// from p. Each emitted token is distributed exactly as common_sampler_sample's (with a grammar, a token it rejects is
+// resampled the way common_sampler_sample does, and the draft ends there), and the draft tokens are accepted far more
+// often than by an exact match when the draft is drawn from a q close to p. The random draws come from rng.
+// is_replay: the draft is tokens already accepted before a checkpoint restore - they are accepted again as they are.
+//
+// requires: idxs.size() == draft.size() + 1, draft_q.size() >= draft.size() unless is_replay
+bool common_sampler_spec_supported(const struct common_sampler * gsmpl);
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_spec(
+        struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft,
+        const std::vector<std::vector<llama_token_data>> & draft_q, std::mt19937 & rng, bool is_replay);
+
+// strixllama: a drafter's q for speculative sampling, from its candidates (sorted, highest first, their logits): the
+// target's top-k, then its top-p and min-p on their probabilities at temperature 1 (the target's chain applies them
+// before its temperature), then their softmax at the target's temperature times qscale. Returns a token drawn from q;
+// q receives q's support (id, the candidate's logit, p)
+llama_token common_sampler_spec_draw_q(const llama_token_data_array * cands, float temp, int32_t top_k, float top_p, float min_p,
+        float qscale, std::mt19937 & rng, std::vector<llama_token_data> & q);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 

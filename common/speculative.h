@@ -3,6 +3,9 @@
 #include "llama.h"
 #include "common.h"
 
+#include <random>
+#include <vector>
+
 struct common_speculative;
 
 // comma separated list the provided types
@@ -50,6 +53,22 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
 void common_speculative_free(common_speculative * spec);
 
+// strixllama: speculative sampling (see common_sampler_sample_and_accept_n_spec). A drafter that supports it (MTP)
+// draws each draft token from q - its own top candidates through the target's top-k, top-p and min-p (at temperature 1,
+// as the target's chain applies them) and the target's temperature times qscale - and records q's support
+struct common_speculative_sample_params {
+    float   temp   = 0.0f;
+    int32_t top_k  = 0;
+    float   top_p  = 1.0f;
+    float   min_p  = 0.0f;
+    float   qscale = 1.0f;
+
+    std::mt19937 * rng = nullptr;
+
+    // one entry per draft token, in step with the draft
+    std::vector<std::vector<llama_token_data>> * q = nullptr;
+};
+
 struct common_speculative_draft_params {
     // this flag is used to chain the drafts through all the available implementations
     // after the first successful draft from an implementation, we set it
@@ -69,6 +88,9 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // strixllama: set to draw the draft (nullptr: each step's top candidate, as before)
+    const common_speculative_sample_params * sample = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

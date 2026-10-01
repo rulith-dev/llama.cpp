@@ -1636,6 +1636,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
+            if (dp.sample) {
+                dp.sample->q->clear();
+            }
 
             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
             if (pending_pos[seq_id] >= 0 && pending_pos[seq_id] == dp.pos0 - 1) {
@@ -1725,7 +1728,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                llama_token id = cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
@@ -1742,10 +1745,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     }
                 }
 
-                common_sampler_accept(smpl, id, true);
-
                 auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
+
+                // strixllama: speculative sampling - the token drawn from q. Whether a step drafts at all (p_min above)
+                // depends only on the tokens before it, which keeps the verification exact
+                if (dp.sample) {
+                    const auto & sp = *dp.sample;
+                    id = common_sampler_spec_draw_q(cur_p, sp.temp, sp.top_k, sp.top_p, sp.min_p, sp.qscale, *sp.rng,
+                            sp.q->emplace_back());
+                }
+
+                common_sampler_accept(smpl, id, true);
 
                 result.push_back(id);
                 if (confident[seq_id]) {
@@ -1818,6 +1829,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (dparams[seq_id].drafting && (int) dparams[seq_id].result->size() > len) {
                     dparams[seq_id].result->resize(len);
+                    if (dparams[seq_id].sample) {
+                        dparams[seq_id].sample->q->resize(len);
+                    }
                 }
             }
         }
@@ -1828,8 +1842,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            if (dp.result->size() < (size_t) params.n_min) {
+            // strixllama: with drawn drafts and p_min, a short draft's length depends on the tokens it drew (the steps
+            // after them were unconfident): dropping it for that would bias the tokens kept, so it is kept
+            if (dp.result->size() < (size_t) params.n_min && !(dp.sample && params.p_min > 0.0f)) {
                 dp.result->clear();
+                if (dp.sample) {
+                    dp.sample->q->clear();
+                }
             }
         }
     }
