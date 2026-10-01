@@ -170,6 +170,48 @@ struct llama_lazy_reader {
     static constexpr int    UNBUF_WORKERS = 16;
     bool unbuffered = false;
 
+    // strixllama: the drive and its link drop to a low-power state within ~1 ms of idle; the first read after that
+    // takes ~640 us instead of ~150 (tmp/dec041/ssd_latency.cpp). A decode step's gather nearly always misses a row and
+    // starts ~0.5-1.5 ms after the GPU step ends, with the GPU idle: wake() reads one page ahead of it, so its reads find
+    // the drive up. Fire and forget; a wake still in flight is left alone. STRIX_PLE_WAKE=0: off
+    mutable std::mutex wake_mutex;
+    mutable OVERLAPPED wake_ov{};
+    mutable HANDLE     wake_event   = nullptr;
+    mutable uint8_t *  wake_buf     = nullptr;
+    mutable bool       wake_pending = false;
+
+    void wake() const {
+        static const bool off = getenv("STRIX_PLE_WAKE") && atoi(getenv("STRIX_PLE_WAKE")) == 0;
+        if (off || !unbuffered) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(wake_mutex);
+        if (wake_pending) {
+            if (!HasOverlappedIoCompleted(&wake_ov)) {
+                return;
+            }
+            DWORD got = 0;
+            GetOverlappedResult(fd, &wake_ov, &got, FALSE);
+            wake_pending = false;
+        }
+        if (!wake_buf) {
+            wake_buf   = (uint8_t *) _aligned_malloc(UNBUF_PAGE, UNBUF_PAGE);
+            wake_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (!wake_buf || !wake_event) {
+                return;
+            }
+        }
+        const uint64_t p0 = (uint64_t) base / UNBUF_PAGE * UNBUF_PAGE;
+        wake_ov = {};
+        wake_ov.Offset     = (DWORD) p0;
+        wake_ov.OffsetHigh = (DWORD) (p0 >> 32);
+        wake_ov.hEvent     = wake_event;
+        ResetEvent(wake_event);
+        if (ReadFile(fd, wake_buf, (DWORD) UNBUF_PAGE, nullptr, &wake_ov) || GetLastError() == ERROR_IO_PENDING) {
+            wake_pending = true;
+        }
+    }
+
     void run_range_unbuffered(const std::vector<std::pair<int32_t, int32_t>> & pairs,
                               int64_t begin, int64_t end, float * dst, uint8_t * raw) const {
         struct slot {
@@ -264,6 +306,7 @@ struct llama_lazy_reader {
 
 #else
     using file_handle = int;
+    void wake() const {}
 #endif
     llama_lazy_reader(file_handle fd, size_t base, size_t row_size, int64_t n_rows, int n_threads,
                       enum ggml_type type, int64_t head_dim, bool unbuffered = false)
@@ -293,6 +336,17 @@ struct llama_lazy_reader {
 #ifdef _WIN32
         if (prefetch_thread.joinable()) {
             prefetch_thread.join();
+        }
+        // a wake-up read still in flight writes its buffer until it completes
+        if (wake_pending) {
+            DWORD got = 0;
+            GetOverlappedResult(fd, &wake_ov, &got, TRUE);
+        }
+        if (wake_buf) {
+            _aligned_free(wake_buf);
+        }
+        if (wake_event) {
+            CloseHandle(wake_event);
         }
         if (fd != INVALID_HANDLE_VALUE) {
             CloseHandle(fd);

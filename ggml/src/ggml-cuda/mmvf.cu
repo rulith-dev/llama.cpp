@@ -4,7 +4,10 @@
 #include "mmvf.cuh"
 #include "convert.cuh"
 
-template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
+// strixllama: few_rows - fewer than 128 rows, so a handful of blocks: the F32 and BF16 loops keep four iterations' loads
+// in flight (the same elements a thread, the same multiply-adds in the same order)
+template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false,
+          bool few_rows = false>
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const int ncols2, const uint3 nchannels_y, const int stride_row, const int stride_col_y2, const int stride_col_dst,
@@ -135,6 +138,18 @@ static __global__ void mul_mat_vec_f(
             }
         }
 
+        if constexpr (few_rows && !has_fusion) {
+#pragma unroll 4
+            for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+                const float2 tmpx = x2[col2];
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const float2 tmpy = y2[j*stride_col_y2 + col2];
+                    ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
+                    ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
+                }
+            }
+        } else
         for (int col2 = tid; col2 < ncols2; col2 += block_size) {
             const float2 tmpx = x2[col2];
             float2 tmpx_gate = make_float2(0.0f, 0.0f);
@@ -243,6 +258,20 @@ static __global__ void mul_mat_vec_f(
                 gate_x2 = (const int *) gate_x;
             }
         }
+        if constexpr (few_rows && !has_fusion) {
+#pragma unroll 4
+            for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+                const int tmpx = x2[col2];
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const float2 tmpy = y2[j*stride_col_y2 + col2];
+                    const float tmpx0 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[0]);
+                    const float tmpx1 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[1]);
+                    ggml_cuda_mad(sumf[j], tmpx0, tmpy.x);
+                    ggml_cuda_mad(sumf[j], tmpx1, tmpy.y);
+                }
+            }
+        } else
         for (int col2 = tid; col2 < ncols2; col2 += block_size) {
             const int tmpx = x2[col2];
             int tmpx_gate = 0;
@@ -406,6 +435,17 @@ static void mul_mat_vec_f_switch_fusion(
     }
 
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+
+    if constexpr (block_size == 256 && !is_multi_token_id && (std::is_same_v<T, float> || std::is_same_v<T, nv_bfloat16>)) {
+        static const bool few_rows_on = !getenv("STRIX_MMVF_FEW_ROWS") || atoi(getenv("STRIX_MMVF_FEW_ROWS")) != 0;
+        if (few_rows_on && block_nums.x < 128 && ids == nullptr) {
+            ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id, true>, launch_params,
+                x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            return;
+        }
+    }
 
     ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id>, launch_params,
         x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,

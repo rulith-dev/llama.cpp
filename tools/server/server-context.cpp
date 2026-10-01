@@ -4425,6 +4425,12 @@ private:
             }
         });
 
+        // strixllama: STRIX_SPEC_TIMING=1 without drafts (MTP off) - the step begins here all the same
+        if (drafting.empty() && strixllama_spec_timing::enabled()) {
+            g_spec_timing.pre += ggml_time_us() - g_spec_timing.t_enter;
+            g_spec_timing.begin_pass();
+        }
+
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             const bool st = strixllama_spec_timing::enabled();
@@ -5514,6 +5520,7 @@ private:
         // follows - accepting it, the text, the stop checks, the responses - still runs slot by slot in order. With eight
         // conversations this was ~1.6 ms of every step, the GPU idle.
         std::vector<llama_token> pre_sampled(slots.size(), LLAMA_TOKEN_NULL);
+        const int64_t t_ps0 = strixllama_spec_timing::enabled() ? ggml_time_us() : 0;
         {
             // 2: also sample each slot again the old way from a copy of its sampler, taken first, and stop on a difference
             static const int mode = getenv("STRIX_PARALLEL_SAMPLING") ? atoi(getenv("STRIX_PARALLEL_SAMPLING")) : 1;
@@ -5589,6 +5596,8 @@ private:
                 }
             }
         }
+
+        if (t_ps0) { g_spec_timing.sample += ggml_time_us() - t_ps0; }
 
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress

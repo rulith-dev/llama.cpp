@@ -2514,6 +2514,10 @@ extern "C" {
     // [head, n_sel, n_head_kv, n_seq] K/V with this mask, bit for bit, without the gathered copy (CUDA backend only).
     // op_params[5] of the node is GGML_FLASH_ATTN_EXT_GATHER, the cell list its src[8].
     #define GGML_FLASH_ATTN_EXT_GATHER 0x47415448
+
+    // strixllama: op_params[0] of a weight that is the BF16 twin of an F32 weight (llama_model::build_bf16_twins): the
+    // CUDA backend multiplies it with mul_mat_vec_f up to 8 columns, as it does the F32 original
+    #define GGML_BF16_TWIN_MAGIC 0x54324642
     GGML_API struct ggml_tensor * ggml_flash_attn_ext_gather(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,      // [head, 1, n_head, n_seq] f32
@@ -2680,7 +2684,8 @@ extern "C" {
     // writes that state back (the new base) and, per token of this batch, the record a later replay needs - the
     // delta [S_v, H_v], the key [S_k, H_k] and the gate [H_v] - instead of a full state snapshot per token.
     //   rec  : [H_v*S_v + H_k*S_k + H_v, R, n_sets] F32, record sets of R records
-    //   info : [5, n_seqs] I32 per sequence: row read, row written, records replayed, set read, set written
+    //   info : [5, n_seqs] I32 per sequence: row read, row written (-1: the row is left as it is), records replayed,
+    //          the first record read and the first written (indices into rec's R * n_sets records)
     // Returns the attention scores [S_v*H_v, n_tokens*n_seqs]. q, k: [S_k, H_k, n_tokens, n_seqs] (not repeated to H_v).
     GGML_API struct ggml_tensor * ggml_gated_delta_net_lazy(
             struct ggml_context * ctx,

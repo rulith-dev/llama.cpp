@@ -754,6 +754,12 @@ void llama_context::synchronize() {
 
     ggml_backend_sched_synchronize(sched.get());
 
+    // strixllama: a small batch's GPU work is done; the next one's PLE gather will want the drive up
+    if (n_queued_tokens > 0 && n_queued_tokens <= 64) {
+        extern void qwen4exp_ple_wake(const llama_model & model);
+        qwen4exp_ple_wake(model);
+    }
+
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
     // this should only happen when using batch size 1 to evaluate a batch
@@ -1703,6 +1709,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
+
+    // strixllama: a small batch's PLE gather comes after the batch preparation: wake the drive now
+    if (batch_inp.n_tokens > 0 && batch_inp.n_tokens <= 64) {
+        extern void qwen4exp_ple_wake(const llama_model & model);
+        qwen4exp_ple_wake(model);
+    }
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);

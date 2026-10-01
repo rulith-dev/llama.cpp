@@ -13,6 +13,12 @@ struct topk_moe_config {
     bool delayed_softmax;
 };
 
+// strixllama: expf behind a call, so the sixteen unrolled exponentials of a lane share one copy of its code: the kernel
+// runs once a token between large products, which evict its instructions (STRIX_TOPK_MOE_NOINLINE=0: inlined)
+static __device__ __noinline__ float topk_moe_expf(const float x) {
+    return expf(x);
+}
+
 // Warp-local softmax used for both the pre-top-k logits and the post-top-k delayed path.
 template <int experts_per_thread, bool use_limit>
 __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
@@ -36,7 +42,7 @@ __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const in
         const int  idx    = lane + i * WARP_SIZE;
         const bool active = !use_limit || (idx < limit);
         if (active) {
-            const float val = expf(vals[i] - max_val);
+            const float val = topk_moe_expf(vals[i] - max_val);
             vals[i]         = val;
             sum += val;
         } else {
@@ -87,6 +93,40 @@ __device__ void sqrt_softplus_warp_inplace(float (&vals)[experts_per_thread], co
 
     It is intended as fusion of softmax->top-k->get_rows pipeline for MoE models
 */
+// strixllama: the wave's argmax of (val, expert) - the greatest val, of equals the lowest expert - with DPP row_xmask
+// (lanes l and l ^ m, m < 16) and permlanex16 (l and l ^ 16) on RDNA3/3.5 waves of 32. The same pair as the xor butterfly
+// of __shfl_xor_sync on every lane: the selection is exact and the order of the exchanges cannot change it.
+static __device__ __forceinline__ void topk_moe_take(float & v, int & e, const float ov, const int oe) {
+    if (ov > v || (ov == v && oe < e)) {
+        v = ov;
+        e = oe;
+    }
+}
+
+#if defined(RDNA3) && WARP_SIZE == 32
+#define TOPK_MOE_DPP 1
+template <int ctrl>
+static __device__ __forceinline__ int topk_moe_dpp(const int x) {
+    return __builtin_amdgcn_mov_dpp(x, ctrl, 0xf, 0xf, false);
+}
+
+static __device__ __forceinline__ void topk_moe_argmax_dpp(float & v, int & e) {
+    int vi = __float_as_int(v);
+    int ov, oe;
+    ov = __builtin_amdgcn_permlanex16(vi, vi, 0x76543210, 0xfedcba98, false, true);
+    oe = __builtin_amdgcn_permlanex16(e, e, 0x76543210, 0xfedcba98, false, true);
+    topk_moe_take(v, e, __int_as_float(ov), oe); vi = __float_as_int(v);
+    ov = topk_moe_dpp<0x168>(vi); oe = topk_moe_dpp<0x168>(e);   // row_xmask:8
+    topk_moe_take(v, e, __int_as_float(ov), oe); vi = __float_as_int(v);
+    ov = topk_moe_dpp<0x164>(vi); oe = topk_moe_dpp<0x164>(e);   // row_xmask:4
+    topk_moe_take(v, e, __int_as_float(ov), oe); vi = __float_as_int(v);
+    ov = topk_moe_dpp<0x162>(vi); oe = topk_moe_dpp<0x162>(e);   // row_xmask:2
+    topk_moe_take(v, e, __int_as_float(ov), oe); vi = __float_as_int(v);
+    ov = topk_moe_dpp<0x161>(vi); oe = topk_moe_dpp<0x161>(e);   // row_xmask:1
+    topk_moe_take(v, e, __int_as_float(ov), oe);
+}
+#endif
+
 template <int n_experts, bool has_bias>
 __launch_bounds__(TOPK_MOE_ROWS_PER_BLOCK * WARP_SIZE, 1)
 __global__ void topk_moe_cuda(const float *         logits,
@@ -97,7 +137,8 @@ __global__ void topk_moe_cuda(const float *         logits,
                               const int             n_expert_used,
                               const float           clamp_val,
                               const float           scale_val,
-                              const topk_moe_config config) {
+                              const topk_moe_config config,
+                              const bool            use_dpp) {
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= n_rows) {
         return;
@@ -222,6 +263,12 @@ __global__ void topk_moe_cuda(const float *         logits,
                 }
             }
 
+#ifdef TOPK_MOE_DPP
+            if (use_dpp) {
+                topk_moe_argmax_dpp(max_val, max_expert);
+            } else
+#endif
+            {
 #pragma unroll
             for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
                 const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
@@ -230,6 +277,7 @@ __global__ void topk_moe_cuda(const float *         logits,
                     max_val    = val;
                     max_expert = expert;
                 }
+            }
             }
 
             if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
@@ -291,55 +339,56 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
     dim3         block_dims(WARP_SIZE, rows_per_block, 1);
     cudaStream_t stream = ctx.stream();
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
+    static const bool use_dpp = !getenv("STRIX_TOPK_MOE_DPP") || atoi(getenv("STRIX_TOPK_MOE_DPP")) != 0;
 
     switch (n_expert) {
         case 1:
             ggml_cuda_kernel_launch(topk_moe_cuda<1, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, use_dpp);
             break;
         case 2:
             ggml_cuda_kernel_launch(topk_moe_cuda<2, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, use_dpp);
             break;
         case 4:
             ggml_cuda_kernel_launch(topk_moe_cuda<4, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, use_dpp);
             break;
         case 8:
             ggml_cuda_kernel_launch(topk_moe_cuda<8, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, use_dpp);
             break;
         case 16:
             ggml_cuda_kernel_launch(topk_moe_cuda<16, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, use_dpp);
             break;
         case 32:
             ggml_cuda_kernel_launch(topk_moe_cuda<32, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, use_dpp);
             break;
         case 64:
             ggml_cuda_kernel_launch(topk_moe_cuda<64, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, use_dpp);
             break;
         case 128:
             ggml_cuda_kernel_launch(topk_moe_cuda<128, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, use_dpp);
             break;
         case 256:
             ggml_cuda_kernel_launch(topk_moe_cuda<256, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, use_dpp);
             break;
         case 288: // StepFun 3.7
             ggml_cuda_kernel_launch(topk_moe_cuda<288, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, use_dpp);
             break;
         case 512:
             ggml_cuda_kernel_launch(topk_moe_cuda<512, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, use_dpp);
             break;
         case 576:
             ggml_cuda_kernel_launch(topk_moe_cuda<576, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, use_dpp);
             break;
         default:
             GGML_ASSERT(false && "fatal error");

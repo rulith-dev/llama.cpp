@@ -17,7 +17,12 @@ struct strixllama_chain_step {
     const char *  other;         // binary operand (or the source of a folded REPEAT)
     int64_t       one[4];        // its ne
     int64_t       onb[4];        // its nb (bytes)
+    int32_t       kind;          // how it is read: FC_READ_*
 };
+
+// an operand's address from the output's index: in general by its ne and nb (four modulos); a contiguous operand of the
+// output's shape at the output's own index; a one-element operand at its only element
+enum strixllama_chain_read : int32_t { FC_READ_GENERAL = 0, FC_READ_LINEAR, FC_READ_SCALAR };
 
 struct strixllama_chain_params {
     const char * in;
@@ -27,6 +32,8 @@ struct strixllama_chain_params {
     int64_t      out_ne[4];
     int64_t      n;
     int32_t      n_steps;
+    int32_t      in_kind;        // FC_READ_* for in
+    int32_t      need_idx;       // some read is FC_READ_GENERAL: the output's four indices are needed
     strixllama_chain_step steps[STRIX_CHAIN_MAX];
 };
 
@@ -52,19 +59,35 @@ static __device__ __forceinline__ float fc_read(const char * base, const int64_t
     return *(const float *) (base + off);
 }
 
+static __device__ __forceinline__ float fc_read_k(const int32_t kind, const char * base, const int64_t * ne, const int64_t * nb,
+                                                  const int64_t idx, const int64_t i0, const int64_t i1, const int64_t i2, const int64_t i3) {
+    if (kind == FC_READ_LINEAR) {
+        return ((const float *) base)[idx];
+    }
+    if (kind == FC_READ_SCALAR) {
+        return *(const float *) base;
+    }
+    return fc_read(base, ne, nb, i0, i1, i2, i3);
+}
+
 static __global__ void strixllama_chain_kernel(const strixllama_chain_params p) {
     const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= p.n) {
         return;
     }
-    int64_t t = idx;
-    const int64_t i0 = t % p.out_ne[0]; t /= p.out_ne[0];
-    const int64_t i1 = t % p.out_ne[1]; t /= p.out_ne[1];
-    const int64_t i2 = t % p.out_ne[2]; t /= p.out_ne[2];
-    const int64_t i3 = t;
+    int64_t i0 = 0, i1 = 0, i2 = 0, i3 = 0;
+    if (p.need_idx) {
+        int64_t t = idx;
+        i0 = t % p.out_ne[0]; t /= p.out_ne[0];
+        i1 = t % p.out_ne[1]; t /= p.out_ne[1];
+        i2 = t % p.out_ne[2]; t /= p.out_ne[2];
+        i3 = t;
+    }
 
-    float x = fc_read(p.in, p.in_ne, p.in_nb, i0, i1, i2, i3);
-#pragma unroll
+    float x = fc_read_k(p.in_kind, p.in, p.in_ne, p.in_nb, idx, i0, i1, i2, i3);
+    // not unrolled: eight copies of the step's switch made the kernel's code - fetched afresh by every launch of a
+    // latency-bound decode chain - several times larger than the work
+#pragma unroll 1
     for (int k = 0; k < STRIX_CHAIN_MAX; ++k) {
         if (k >= p.n_steps) {
             break;
@@ -75,7 +98,7 @@ static __global__ void strixllama_chain_kernel(const strixllama_chain_params p) 
             case FC_CLAMP: x = x < s.p0 ? s.p0 : (x > s.p1 ? s.p1 : x); break;
             case FC_UNARY: x = fc_unary(s.unary, x); break;
             default: {
-                const float y = fc_read(s.other, s.one, s.onb, i0, i1, i2, i3);
+                const float y = fc_read_k(s.kind, s.other, s.one, s.onb, idx, i0, i1, i2, i3);
                 const float a = s.chain_is_src1 ? y : x;
                 const float b = s.chain_is_src1 ? x : y;
                 switch (s.op) {
@@ -326,6 +349,31 @@ int ggml_cuda_strixllama_chain_try(ggml_backend_cuda_context & ctx, const ggml_c
     for (int d = 0; d < 4; ++d) { p.out_ne[d] = out->ne[d]; }
     p.n = ggml_nelements(out);
     p.n_steps = n_steps;
+
+    // how each operand is read (STRIX_CHAIN_GENERAL_READS=1: always by ne and nb, as before)
+    static const bool general_reads = getenv("STRIX_CHAIN_GENERAL_READS") && atoi(getenv("STRIX_CHAIN_GENERAL_READS")) != 0;
+    auto kind_of = [&](const int64_t * ne, const int64_t * nb) -> int32_t {
+        if (general_reads) {
+            return FC_READ_GENERAL;
+        }
+        if (ne[0] * ne[1] * ne[2] * ne[3] == 1) {
+            return FC_READ_SCALAR;
+        }
+        bool same = true;
+        int64_t expect = sizeof(float);
+        for (int d = 0; d < 4; ++d) {
+            same = same && ne[d] == out->ne[d] && (ne[d] == 1 || nb[d] == expect);
+            expect *= ne[d];
+        }
+        return same ? FC_READ_LINEAR : FC_READ_GENERAL;
+    };
+    p.in_kind = kind_of(p.in_ne, p.in_nb);
+    p.need_idx = p.in_kind == FC_READ_GENERAL;
+    for (int k = 0; k < n_steps; ++k) {
+        strixllama_chain_step & st = p.steps[k];
+        st.kind = st.op >= FC_ADD ? kind_of(st.one, st.onb) : FC_READ_GENERAL;
+        p.need_idx = p.need_idx || (st.op >= FC_ADD && st.kind == FC_READ_GENERAL);
+    }
 
     // bisection aid: STRIX_CHAIN_ONLY=FIRSTOP-LASTOP fuses only chains with that signature
     if (const char * only = getenv("STRIX_CHAIN_ONLY")) {

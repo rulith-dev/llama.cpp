@@ -718,6 +718,11 @@ struct llama_model {
     std::unordered_map<const ggml_tensor *, ggml_tensor *> decode_twins;
     void build_decode_twins();
 
+    // strixllama: BF16 twins of the F32 weights whose values are all bfloat16 (build_bf16_twins), used by batches of at
+    // most 8 tokens (llama_bf16_twin)
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> bf16_twins;
+    void build_bf16_twins();
+
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 
@@ -790,6 +795,8 @@ protected:
 // strixllama: the decode twin of a trunk weight (null if none) and the batch bound under which it is used
 ggml_tensor * llama_decode_twin(const ggml_tensor * w);
 int64_t       llama_decode_twin_max_tokens();
+// strixllama: the BF16 twin of an F32 weight (null if none); used for batches of at most 8 tokens
+ggml_tensor * llama_bf16_twin(const ggml_tensor * w);
 
 llama_model * llama_model_create(llm_arch arch, const llama_model_params & params);
 llama_model * llama_model_create(llama_model_loader & ml, const llama_model_params & params);

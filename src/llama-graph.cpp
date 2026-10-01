@@ -1601,6 +1601,12 @@ ggml_tensor * llm_graph_context::build_lora_mm(
             w_mm = twin;
         }
     }
+    // strixllama: the BF16 twin of a bfloat16-valued F32 weight, for batches the vector kernel takes (build_bf16_twins)
+    if (n_tokens <= 8) {
+        if (ggml_tensor * twin = llama_bf16_twin(w)) {
+            w_mm = twin;
+        }
+    }
     ggml_tensor * res = ggml_mul_mat(ctx0, w_mm, cur);
 
     if (w_s) {

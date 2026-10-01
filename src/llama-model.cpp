@@ -1204,6 +1204,14 @@ ggml_tensor * llama_decode_twin(const ggml_tensor * w) {
     return it == g_decode_twins.end() ? nullptr : it->second;
 }
 
+static std::unordered_map<const ggml_tensor *, ggml_tensor *> g_bf16_twins;
+
+ggml_tensor * llama_bf16_twin(const ggml_tensor * w) {
+    std::lock_guard<std::mutex> lock(g_decode_twin_mutex);
+    const auto it = g_bf16_twins.find(w);
+    return it == g_bf16_twins.end() ? nullptr : it->second;
+}
+
 int64_t llama_decode_twin_max_tokens() {
     static const int64_t v = []() {
         const char * e = getenv("LLAMA_TRUNK_DECODE_MAX_T");
@@ -1304,6 +1312,90 @@ void llama_model::build_decode_twins() {
             (ggml_time_us() - t0) / 1e6, (long long) llama_decode_twin_max_tokens());
 }
 
+// strixllama: BF16 twins of the F32 weights whose every value is a bfloat16 - the MoE routers, the shared experts' gates,
+// the delta-net alpha / beta and the hyper-connection injects of Qwen3.8-Flash-Next, 0.31 GB a token as F32. A decode
+// batch (at most 8 tokens) multiplies them with mul_mat_vec_f, whose bf16 loop is its f32 loop and bf16 widens to f32
+// exactly: the same products at half the bytes (router [2560 -> 512] 29 -> 18 us). Prefill keeps the originals and
+// their kernels. Twins carry GGML_BF16_TWIN_MAGIC so the backend keeps them on the vector kernel. STRIX_BF16_TWINS=0: none.
+void llama_model::build_bf16_twins() {
+    const char * e = getenv("STRIX_BF16_TWINS");
+    if (e != nullptr && atoi(e) == 0) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    static const char * const families[] = { "ffn_gate_inp", "ssm_alpha", "ssm_beta", "_inject" };
+
+    std::map<ggml_backend_buffer_type_t, std::vector<std::pair<std::string, ggml_tensor *>>> groups;
+    size_t n_inexact = 0;
+    for (const auto & [name, t] : tensors_by_name) {
+        if (t == nullptr || t->type != GGML_TYPE_F32 || t->buffer == nullptr || ggml_n_dims(t) > 2 || t->ne[0] % 2 != 0 ||
+                !ggml_is_contiguous(t) || ggml_backend_buft_is_host(ggml_backend_buffer_get_type(t->buffer))) {
+            continue;
+        }
+        bool family = false;
+        for (const char * f : families) {
+            family = family || name.find(f) != std::string::npos;
+        }
+        if (!family) {
+            continue;
+        }
+        std::vector<uint32_t> bits(ggml_nelements(t));
+        ggml_backend_tensor_get(t, bits.data(), 0, ggml_nbytes(t));
+        bool exact = true;
+        for (const uint32_t u : bits) {
+            exact = exact && (u & 0xffffu) == 0;
+        }
+        if (!exact) {
+            ++n_inexact;
+            continue;
+        }
+        groups[ggml_backend_buffer_get_type(t->buffer)].emplace_back(name, t);
+    }
+
+    size_t n_twins = 0, bytes = 0;
+    for (auto & [buft, list] : groups) {
+        ggml_init_params ip = { ggml_tensor_overhead() * (list.size() + 1), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        if (ctx == nullptr) {
+            throw std::runtime_error("failed to create bf16 twin context");
+        }
+        pimpl->twin_ctxs.emplace_back(ctx);
+        std::vector<std::pair<ggml_tensor *, ggml_tensor *>> pairs;
+        for (auto & [name, t] : list) {
+            ggml_tensor * twin = ggml_new_tensor(ctx, GGML_TYPE_BF16, ggml_n_dims(t), t->ne);
+            ggml_format_name(twin, "%s.bf16", name.c_str());
+            ((int32_t *) twin->op_params)[0] = GGML_BF16_TWIN_MAGIC;
+            pairs.emplace_back(t, twin);
+        }
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        if (buf == nullptr) {
+            throw std::runtime_error(format("failed to allocate bf16 twin buffer on %s", ggml_backend_buft_name(buft)));
+        }
+        pimpl->twin_bufs.emplace_back(buf);
+        bytes += ggml_backend_buffer_get_size(buf);
+        for (auto & [t, twin] : pairs) {
+            std::vector<uint32_t> bits(ggml_nelements(t));
+            ggml_backend_tensor_get(t, bits.data(), 0, ggml_nbytes(t));
+            std::vector<uint16_t> half(bits.size());
+            for (size_t k = 0; k < bits.size(); ++k) {
+                half[k] = (uint16_t) (bits[k] >> 16);
+            }
+            ggml_backend_tensor_set(twin, half.data(), 0, ggml_nbytes(twin));
+            bf16_twins[t] = twin;
+            ++n_twins;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_decode_twin_mutex);
+        for (const auto & [t, twin] : bf16_twins) {
+            g_bf16_twins[t] = twin;
+        }
+    }
+    // stderr: the server's log keeps none of the library's load messages
+    fprintf(stderr, "%s: %zu F32 weights got BF16 twins (%.2f GiB, %.1f s), %zu kept F32 (not all bfloat16); used for batches of <= 8 tokens\n",
+            __func__, n_twins, bytes / 1024.0 / 1024.0 / 1024.0, (ggml_time_us() - t0) / 1e6, n_inexact);
+}
+
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
@@ -1322,6 +1414,12 @@ llama_model::~llama_model() {
         std::lock_guard<std::mutex> lock(g_decode_twin_mutex);
         for (const auto & [t, twin] : decode_twins) {
             g_decode_twins.erase(t);
+        }
+    }
+    if (!bf16_twins.empty()) {
+        std::lock_guard<std::mutex> lock(g_decode_twin_mutex);
+        for (const auto & [t, twin] : bf16_twins) {
+            g_bf16_twins.erase(t);
         }
     }
 }
@@ -2003,6 +2101,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // strixllama: optional Q6_K decode copies of the Q8_0 trunk (LLAMA_TRUNK_DECODE_Q6K=1)
     build_decode_twins();
+    // strixllama: BF16 copies of the bfloat16-valued F32 weights for decode batches (STRIX_BF16_TWINS=0: none)
+    build_bf16_twins();
 
     return true;
 }

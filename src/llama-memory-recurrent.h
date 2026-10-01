@@ -84,16 +84,22 @@ public:
 
     // strixllama: deferred rollback for the gated delta net (ggml_gated_delta_net_lazy; STRIX_GDN_LAZY=0: off). A verify batch
     // leaves the state row of its cell as it found it and records per token what a replay needs; the next batch replays
-    // the records its rollback kept. Per recurrent layer a record buffer [rec_floats, 1 + n_rs_seq, 2 * size] (two sets
-    // per cell: the next batch reads one and writes the other), and per cell how many records its last batch left - 0
-    // means its rows hold the state as the plain net leaves them (slot rs_idx of the cell) - and which set holds them.
+    // the records its rollback kept. Per recurrent layer a record buffer [rec_floats, rec_cap, 2 * size] (two sets per
+    // cell), and per cell how many records are pending - 0 means its rows hold the state as the plain net leaves them
+    // (slot rs_idx of the cell) - which set holds them, and how many of them its last batch wrote (what a rollback may
+    // take back). While its set has room a short batch appends its records after the pending ones and leaves the row
+    // as it is (rec_append, STRIX_GDN_ACC=W: W records a set, default 8; also without MTP, where decode batches then
+    // record); else it writes the replayed state back and starts the other set. The row is written once per ~W tokens.
     uint32_t rec_floats = 0;
+    uint32_t rec_cap    = 0;  // records a set holds
+    bool     rec_append = false;
     int32_t  gdn_s  = 0;      // S_v = S_k
     int32_t  gdn_hv = 0;      // value heads
     int32_t  gdn_hk = 0;      // key heads
     std::vector<ggml_tensor *> rec_l;
     std::vector<uint32_t>      rec_n;
     std::vector<uint8_t>       rec_set;
+    std::vector<uint32_t>      rec_last;
 
     bool lazy_on() const { return rec_floats > 0; }
 

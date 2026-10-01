@@ -1198,6 +1198,9 @@ const ggml_cuda_device_info & ggml_cuda_info();
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 
+// strixllama DEV: the side (0 = A, 1 = B) of the in-run A/B (STRIX_AB, ggml-cuda.cu)
+int ggml_cuda_strix_ab();
+
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
 

@@ -1995,6 +1995,16 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+    // strixllama: the BF16 twin of an F32 weight takes the vector kernel up to 8 columns, as its original does - bf16
+    // widens to f32 exactly and mul_mat_vec_f's bf16 loop is its f32 loop, so the products are the same bits (bf16
+    // alone would take the WMMA kernel from 4 columns on RDNA, with other sums)
+    if (src0->type == GGML_TYPE_BF16 && src0->op == GGML_OP_NONE && ggml_get_op_params_i32(src0, 0) == GGML_BF16_TWIN_MAGIC &&
+            ne11 <= MMVF_MAX_BATCH_SIZE && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            ggml_cuda_should_use_mmvf(src0->type, ggml_cuda_info().devices[ctx.device].cc, src0->ne, src0->nb, 1)) {
+        ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
     // Therefore, in such cases use cuBLAS.
@@ -2335,6 +2345,390 @@ static int strix_repeat(const char * key) {
     const std::string k = std::string(key) + ":";
     const size_t at = spec.find(k);
     return at == std::string::npos ? 0 : atoi(spec.c_str() + at + k.size());
+}
+
+// strixllama DEV: STRIX_REPEAT_FILE=<path>, the in-graph cost of any op class by repetition, changeable while the server
+// runs. The file holds items OP[:SUB][@lo[-hi]][/K]=N, separated by commas, semicolons or newlines: OP a ggml op name or
+// *, SUB a unary or glu op name, lo-hi the node's ne[0], K its src[0]'s ne[0] (e.g. MUL_MAT@10240/320=2 is the
+// hyper-connections' up product). A matching node - a fused chain by its first node - is dispatched N more times, so a
+// step grows by N times the class's cost. Only nodes whose output overlaps none of their inputs repeat (each repeat
+// writes what the node wrote), never the ops that write beyond their output (cache and state writes); a chain repeats
+// only if all of its nodes qualify. The item `dump` lists every dispatched class of the next graphs with its count. The
+// file is read again when its content changes (checked at most five times a second), and the HIP graphs are captured
+// again then.
+struct strix_repeat_item {
+    std::string op, sub;
+    long long lo = std::numeric_limits<long long>::min(), hi = std::numeric_limits<long long>::max(), k = -1;
+    int n = 0;
+};
+static std::vector<strix_repeat_item> g_strix_rep;
+static int     g_strix_rep_gen  = 0;
+static int     g_strix_rep_dump = 0;    // graphs left to list
+static int64_t g_strix_rep_checked_us = 0;
+static std::map<std::string, std::pair<int, int>> g_strix_rep_counts;   // the dump: dispatches and repeatable ones a class
+
+// the dump of the graph that just ran, at the start of the next one
+static void strix_repeat_dump_flush(int n_nodes_next) {
+    if (g_strix_rep_dump <= 0 || g_strix_rep_counts.empty()) {
+        return;
+    }
+    int total = 0;
+    for (const auto & kv : g_strix_rep_counts) {
+        total += kv.second.first;
+    }
+    fprintf(stderr, "STRIX_REPEAT_FILE dump: a graph of %d dispatches in %zu classes (next graph: %d nodes)\n", total,
+            g_strix_rep_counts.size(), n_nodes_next);
+    for (const auto & kv : g_strix_rep_counts) {
+        fprintf(stderr, "STRIX_REPEAT_FILE dump:   %-64s %6d  repeatable %6d\n", kv.first.c_str(), kv.second.first,
+                kv.second.second);
+    }
+    g_strix_rep_counts.clear();
+    --g_strix_rep_dump;
+}
+
+static void strix_repeat_file_reload() {
+    static const char * path = getenv("STRIX_REPEAT_FILE");
+    if (!path) {
+        return;
+    }
+    const int64_t now = ggml_time_us();
+    if (now - g_strix_rep_checked_us < 200000) {
+        return;
+    }
+    g_strix_rep_checked_us = now;
+    std::string text;
+    if (FILE * f = fopen(path, "rb")) {
+        char buf[4096];
+        size_t got;
+        while ((got = fread(buf, 1, sizeof(buf), f)) > 0) {
+            text.append(buf, got);
+        }
+        fclose(f);
+    } else {
+        return;
+    }
+    static std::string last = "\x01";
+    if (text == last) {
+        return;
+    }
+    last = text;
+    std::vector<strix_repeat_item> items;
+    bool dump = false;
+    std::string cur;
+    auto flush = [&]() {
+        if (cur.empty() || cur[0] == '#') {
+            return;
+        }
+        if (cur == "dump") {
+            dump = true;
+            return;
+        }
+        const size_t eq = cur.find('=');
+        if (eq == std::string::npos) {
+            return;
+        }
+        strix_repeat_item it;
+        it.n = atoi(cur.c_str() + eq + 1);
+        std::string lhs = cur.substr(0, eq);
+        const size_t sl = lhs.find('/');
+        if (sl != std::string::npos) {
+            it.k = atoll(lhs.c_str() + sl + 1);
+            lhs = lhs.substr(0, sl);
+        }
+        const size_t at = lhs.find('@');
+        if (at != std::string::npos) {
+            it.lo = atoll(lhs.c_str() + at + 1);
+            const size_t dash = lhs.find('-', at + 1);
+            it.hi = dash != std::string::npos ? atoll(lhs.c_str() + dash + 1) : it.lo;
+            lhs = lhs.substr(0, at);
+        }
+        const size_t colon = lhs.find(':');
+        if (colon != std::string::npos) {
+            it.sub = lhs.substr(colon + 1);
+            lhs = lhs.substr(0, colon);
+        }
+        it.op = lhs;
+        if (it.n > 0) {
+            items.push_back(it);
+        }
+    };
+    for (char c : text + ",") {
+        if (c == ',' || c == ';' || c == '\n' || c == '\r') {
+            flush();
+            cur.clear();
+        } else if (c != ' ' && c != '\t') {
+            cur.push_back(c);
+        }
+    }
+    g_strix_rep = items;
+    g_strix_rep_dump = dump ? 4 : 0;
+    ++g_strix_rep_gen;
+    fprintf(stderr, "STRIX_REPEAT_FILE: generation %d, %zu items%s\n", g_strix_rep_gen, items.size(), dump ? ", dump" : "");
+}
+
+static const char * strix_repeat_sub(const ggml_tensor * node) {
+    return node->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(node)) :
+           node->op == GGML_OP_GLU   ? ggml_glu_op_name(ggml_get_glu_op(node)) : "";
+}
+
+static int strix_repeat_file_count(const ggml_tensor * node) {
+    for (const strix_repeat_item & it : g_strix_rep) {
+        if (it.op != "*" && it.op != ggml_op_name(node->op)) {
+            continue;
+        }
+        if (!it.sub.empty() && it.sub != strix_repeat_sub(node)) {
+            continue;
+        }
+        if (node->ne[0] < it.lo || node->ne[0] > it.hi) {
+            continue;
+        }
+        if (it.k >= 0 && (!node->src[0] || node->src[0]->ne[0] != it.k)) {
+            continue;
+        }
+        return it.n;
+    }
+    return 0;
+}
+
+static bool strix_repeat_overlaps(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 && b0 && a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
+static bool strix_repeat_is_view(const ggml_tensor * t) {
+    return ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_VIEW ||
+           t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
+}
+
+// t is one of nodes [i, i + skip], or a view of one
+static bool strix_repeat_in_chain(const ggml_cgraph * cgraph, int i, int skip, const ggml_tensor * t) {
+    for (; t; t = t->view_src) {
+        for (int j = i; j <= i + skip; ++j) {
+            if (cgraph->nodes[j] == t) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// nodes [i, i + skip] write only their outputs, and none of those overlaps an input from outside them
+static bool strix_repeat_chain_safe(const ggml_cgraph * cgraph, int i, int skip) {
+    for (int j = i; j <= i + skip; ++j) {
+        const ggml_tensor * w = cgraph->nodes[j];
+        if (strix_repeat_is_view(w)) {
+            continue;
+        }
+        switch (w->op) {
+            case GGML_OP_SET_ROWS: case GGML_OP_CPY: case GGML_OP_DUP: case GGML_OP_SET: case GGML_OP_ACC:
+            case GGML_OP_GATED_DELTA_NET: case GGML_OP_SSM_CONV: case GGML_OP_SSM_SCAN:
+            case GGML_OP_CUSTOM: case GGML_OP_MAP_CUSTOM1: case GGML_OP_MAP_CUSTOM2: case GGML_OP_MAP_CUSTOM3:
+                return false;
+            default:
+                break;
+        }
+        for (int jj = i; jj <= i + skip; ++jj) {
+            const ggml_tensor * r = cgraph->nodes[jj];
+            for (int k = 0; k < GGML_MAX_SRC && r->src[k]; ++k) {
+                if (!strix_repeat_in_chain(cgraph, i, skip, r->src[k]) && strix_repeat_overlaps(w, r->src[k])) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// a node that writes its output and nothing else, and reads none of it
+static bool strix_repeat_safe(const ggml_tensor * node) {
+    switch (node->op) {
+        case GGML_OP_SET_ROWS: case GGML_OP_CPY: case GGML_OP_DUP: case GGML_OP_SET: case GGML_OP_ACC:
+        case GGML_OP_GATED_DELTA_NET: case GGML_OP_SSM_CONV: case GGML_OP_SSM_SCAN:
+        case GGML_OP_CUSTOM: case GGML_OP_MAP_CUSTOM1: case GGML_OP_MAP_CUSTOM2: case GGML_OP_MAP_CUSTOM3:
+            return false;
+        default:
+            break;
+    }
+    for (int s = 0; s < GGML_MAX_SRC && node->src[s]; ++s) {
+        if (strix_repeat_overlaps(node, node->src[s])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// how many more times nodes [i, i + skip] run (a fused chain when skip > 0)
+static int strix_repeat_times(const ggml_cgraph * cgraph, int i, int skip) {
+    const ggml_tensor * first = cgraph->nodes[i];
+    if (g_strix_rep_dump > 0) {
+        char key[160];
+        snprintf(key, sizeof(key), "%s%s%s@%lld/%lld%s", ggml_op_name(first->op), *strix_repeat_sub(first) ? ":" : "",
+                 strix_repeat_sub(first), (long long) first->ne[0], first->src[0] ? (long long) first->src[0]->ne[0] : -1LL,
+                 skip > 0 ? " (fused)" : "");
+        const bool safe = strix_repeat_chain_safe(cgraph, i, skip);
+        auto & c = g_strix_rep_counts[key];
+        ++c.first;
+        c.second += safe ? 1 : 0;
+    }
+    if (g_strix_rep.empty()) {
+        return 0;
+    }
+    const int n = strix_repeat_file_count(first);
+    if (n <= 0) {
+        return 0;
+    }
+    return strix_repeat_chain_safe(cgraph, i, skip) ? n : 0;
+}
+
+// strixllama DEV: STRIX_GPU_TIMELINE=N, where a decode step's GPU time goes, by op class. The graph evaluation writes the
+// GPU's wall clock (100 MHz) twice before the first dispatch and once after every dispatch - a one-thread kernel,
+// captured into the HIP graph like the rest - and every Nth compute of a graph whose first node has fewer than 64 rows
+// is read back. A dispatch's time is its timestamp less the one before, less the timestamp kernel's own cost (the two
+// at the start: ~0.7 us); a fused chain counts as its first node's class. Every 8 readings print a table: per class the
+// dispatches a graph and the us a graph, and the graph's span (first to last timestamp) and the sum.
+static int strix_tl_every() {
+    static const int n = getenv("STRIX_GPU_TIMELINE") ? atoi(getenv("STRIX_GPU_TIMELINE")) : 0;
+    return n;
+}
+
+static __global__ void strix_tl_ts(uint64_t * dst) {
+    *dst = wall_clock64();
+}
+
+struct strix_tl_capture {
+    std::vector<std::string> keys;   // the class of each timestamped dispatch
+    int64_t rows = 0;                // the first node's rows
+};
+static std::unordered_map<const void *, strix_tl_capture> g_strix_tl;
+static uint64_t *       g_strix_tl_buf  = nullptr;
+static const int        STRIX_TL_MAX    = 1 << 15;
+static strix_tl_capture * g_strix_tl_cur = nullptr;   // the capture being written by the evaluation
+
+// strixllama DEV: STRIX_AB=<n>, an in-run A/B: every n decode graphs (first node < 64 rows) the side flips between A
+// and B and every HIP graph is captured anew (as a STRIX_REPEAT_FILE change does). Switches that read
+// ggml_cuda_strix_ab() follow it; the GPU timeline keeps the sides apart. Drift then falls on both sides alike.
+static int g_strix_ab = 0;
+static int g_strix_ab_since = 0;   // decode graphs since the last flip: the first two (captured anew) are not timed
+int ggml_cuda_strix_ab() {
+    return g_strix_ab;
+}
+
+static void strix_ab_step(const ggml_cgraph * cgraph);
+
+struct strix_tl_acc {
+    std::map<std::string, std::pair<double, double>> by_class;   // dispatches, us
+    double span_us = 0.0, sum_us = 0.0, overhead_us = 0.0;
+    int graphs = 0, readings = 0;
+};
+static std::map<std::pair<size_t, int64_t>, strix_tl_acc> g_strix_tl_accs;   // by graph: dispatches, first node's rows (+ 1e9 on side B)
+
+static std::string strix_tl_class(const ggml_cgraph * cgraph, int i, int skip) {
+    const ggml_tensor * first = cgraph->nodes[i];
+    const char * sub = first->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(first)) :
+                       first->op == GGML_OP_GLU   ? ggml_glu_op_name(ggml_get_glu_op(first)) : "";
+    char key[400];
+    snprintf(key, sizeof(key), "%s%s%s@%lld/%lld%s", ggml_op_name(first->op), *sub ? ":" : "", sub,
+             (long long) first->ne[0], first->src[0] ? (long long) first->src[0]->ne[0] : -1LL, skip > 0 ? " (fused)" : "");
+    if (skip > 0 && getenv("STRIX_GPU_TIMELINE_CHAINS")) {
+        std::string ops = " =";
+        for (int j = i; j <= i + skip; ++j) {
+            const ggml_tensor * t = cgraph->nodes[j];
+            if (strix_repeat_is_view(t)) {
+                continue;
+            }
+            ops += " ";
+            ops += t->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(t)) :
+                   t->op == GGML_OP_GLU   ? ggml_glu_op_name(ggml_get_glu_op(t)) : ggml_op_name(t->op);
+        }
+        const size_t n = strlen(key);
+        snprintf(key + n, sizeof(key) - n, "%s", ops.c_str());
+    }
+    if ((first->op == GGML_OP_MUL_MAT || first->op == GGML_OP_MUL_MAT_ID) && first->src[1]) {
+        const ggml_tensor * b = first->src[1];
+        const size_t n = strlen(key);
+        snprintf(key + n, sizeof(key) - n, " x[%lld,%lld,%lld]%s", (long long) b->ne[1], (long long) b->ne[2], (long long) b->ne[3],
+                 ggml_is_contiguous(b) ? "" : " nc");
+    }
+    return key;
+}
+
+static void strix_tl_start(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, const void * graph_key) {
+    g_strix_tl_cur = nullptr;
+    if (strix_tl_every() <= 0 || !g_strix_tl_buf) {
+        return;
+    }
+    strix_tl_capture & c = g_strix_tl[graph_key];
+    c.keys.clear();
+    c.rows = cgraph->n_nodes ? ggml_nrows(cgraph->nodes[0]) : 0;
+    g_strix_tl_cur = &c;
+    strix_tl_ts<<<1, 1, 0, ctx->stream()>>>(g_strix_tl_buf + 0);
+    strix_tl_ts<<<1, 1, 0, ctx->stream()>>>(g_strix_tl_buf + 1);
+}
+
+static void strix_tl_mark(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int i, int skip) {
+    if (!g_strix_tl_cur || (int) g_strix_tl_cur->keys.size() + 2 >= STRIX_TL_MAX) {
+        return;
+    }
+    g_strix_tl_cur->keys.push_back(strix_tl_class(cgraph, i, skip));
+    strix_tl_ts<<<1, 1, 0, ctx->stream()>>>(g_strix_tl_buf + 1 + g_strix_tl_cur->keys.size());
+}
+
+static void strix_tl_after(ggml_backend_cuda_context * ctx, const void * graph_key) {
+    g_strix_tl_cur = nullptr;
+    const int every = strix_tl_every();
+    if (every <= 0 || !g_strix_tl_buf) {
+        return;
+    }
+    auto it = g_strix_tl.find(graph_key);
+    if (it == g_strix_tl.end() || it->second.rows >= 64 || it->second.keys.empty()) {
+        return;
+    }
+    static int computes = 0;
+    if (++computes % every != 0) {
+        return;
+    }
+    if (getenv("STRIX_AB") && g_strix_ab_since < 2) {
+        return;
+    }
+    const strix_tl_capture & c = it->second;
+    std::vector<uint64_t> ts(c.keys.size() + 2);
+    CUDA_CHECK(cudaStreamSynchronize(ctx->stream()));
+    CUDA_CHECK(cudaMemcpy(ts.data(), g_strix_tl_buf, ts.size() * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+    const double us = 0.01;   // 100 MHz
+    const double overhead = (ts[1] - ts[0]) * us;
+    strix_tl_acc & a = g_strix_tl_accs[std::make_pair(c.keys.size(), c.rows + (g_strix_ab ? 1000000000LL : 0))];
+    a.overhead_us += overhead;
+    a.span_us += (ts.back() - ts[0]) * us;
+    for (size_t k = 0; k < c.keys.size(); ++k) {
+        const double d = (double) (int64_t) (ts[k + 2] - ts[k + 1]) * us - overhead;
+        auto & e = a.by_class[c.keys[k]];
+        e.first += 1.0;
+        e.second += d;
+        a.sum_us += d;
+    }
+    ++a.graphs;
+    // STRIX_GPU_TIMELINE_ORDER=n: the first n dispatches of the second reading, in order
+    static const int order_n = getenv("STRIX_GPU_TIMELINE_ORDER") ? atoi(getenv("STRIX_GPU_TIMELINE_ORDER")) : 0;
+    if (order_n > 0 && a.readings == 1) {
+        for (size_t k = 0; k < c.keys.size() && (int) k < order_n; ++k) {
+            fprintf(stderr, "GPU_ORDER %5zu %9.2f us  %s\n", k, (double) (int64_t) (ts[k + 2] - ts[k + 1]) * us - overhead, c.keys[k].c_str());
+        }
+    }
+    if (++a.readings % 8 != 0) {
+        return;
+    }
+    std::vector<std::pair<std::string, std::pair<double, double>>> rows(a.by_class.begin(), a.by_class.end());
+    std::sort(rows.begin(), rows.end(), [](const auto & x, const auto & y) { return x.second.second > y.second.second; });
+    const double g = a.graphs;
+    fprintf(stderr, "GPU_TIMELINE: [%lld rows%s] %d graphs, a graph: span %.0f us, dispatches %.0f, their sum %.0f us, timestamp cost %.2f us each\n",
+            (long long) c.rows, getenv("STRIX_AB") ? (g_strix_ab ? ", B" : ", A") : "", a.graphs, a.span_us / g,
+            (double) c.keys.size(), a.sum_us / g, a.overhead_us / g);
+    for (const auto & r : rows) {
+        fprintf(stderr, "GPU_TIMELINE:   %-100s %6.0f x %8.1f us  %6.2f us each  %5.1f%%\n", r.first.c_str(), r.second.first / g,
+                r.second.second / g, r.second.second / r.second.first, 100.0 * r.second.second / a.sum_us);
+    }
+    a = strix_tl_acc();
 }
 
 bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
@@ -5554,6 +5948,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
+            strix_tl_start(cuda_ctx, cgraph, graph_key);
 
             if (stream_ctx.concurrent_events.size() > 0) {
                 should_launch_concurrent_events = true;
@@ -5734,9 +6129,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                const ggml_cuda_idx_dec_match strix_pending_before = g_idx_dec_pending;
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    for (int r = strix_repeat_times(cgraph, i, nodes_to_skip); r > 0; --r) {
+                        const ggml_cuda_idx_dec_match strix_pending_after = g_idx_dec_pending;
+                        g_idx_dec_pending = strix_pending_before;
+                        GGML_ASSERT(ggml_cuda_try_fuse(cuda_ctx, cgraph, i) == nodes_to_skip);
+                        g_idx_dec_pending = strix_pending_after;
+                    }
+                    strix_tl_mark(cuda_ctx, cgraph, i, nodes_to_skip);
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -5765,6 +6168,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif  // NDEBUG
 
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                for (int r = ok ? strix_repeat_times(cgraph, i, 0) : 0; r > 0; --r) {
+                    ggml_cuda_compute_forward(*cuda_ctx, node);
+                }
+                if (ok) {
+                    strix_tl_mark(cuda_ctx, cgraph, i, 0);
+                }
                 if (ok && g_idx_dec_pending.check && i == g_idx_dec_pending.end) {
                     ggml_cuda_idx_dec_check(*cuda_ctx, g_idx_dec_pending);
                     g_idx_dec_pending = {};
@@ -5895,6 +6304,21 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+static void strix_ab_step(const ggml_cgraph * cgraph) {
+    static const int every = getenv("STRIX_AB") ? atoi(getenv("STRIX_AB")) : 0;
+    if (every <= 0 || cgraph->n_nodes < 64 || ggml_nrows(cgraph->nodes[0]) >= 64) {
+        return;
+    }
+    static int computes = 0;
+    if (++computes % every == 0) {
+        g_strix_ab ^= 1;
+        ++g_strix_rep_gen;      // every graph captured anew
+        g_strix_ab_since = 0;
+    } else {
+        ++g_strix_ab_since;
+    }
+}
+
 // graph timing / mark-lifetime instrumentation (LLAMA_GRAPH_TIMING=1)
 static int64_t      g_gt_prev_return   = 0;
 static bool         g_gt_after_compute = true;
@@ -5918,6 +6342,21 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    strix_repeat_dump_flush(cgraph->n_nodes);
+    strix_repeat_file_reload();
+    strix_ab_step(cgraph);
+    if (strix_tl_every() > 0 && !g_strix_tl_buf) {
+        CUDA_CHECK(cudaMalloc(&g_strix_tl_buf, STRIX_TL_MAX * sizeof(uint64_t)));
+    }
+    {
+        static std::unordered_map<const void *, int> strix_rep_seen;
+        int & seen = strix_rep_seen[(const void *) graph];
+        if (seen != g_strix_rep_gen) {
+            seen = g_strix_rep_gen;
+            graph->node_props.clear();
+            graph->uid = 0;
+        }
+    }
     // [GRAPH_DIAG] one-shot report for the big prefill graphs: why HIP graphs do or do not engage
     const bool graph_diag = getenv("LLAMA_GRAPH_DIAG") && atoi(getenv("LLAMA_GRAPH_DIAG")) != 0 && cgraph->n_nodes > 1000;
     if (graph->is_enabled()) {
@@ -5970,6 +6409,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    strix_tl_after(cuda_ctx, graph_key);
 
     if (graph_timing_enabled()) {
         const int64_t gt_t1 = ggml_time_us();
@@ -7536,6 +7976,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    // strixllama DEV: the side of the in-run A/B (STRIX_AB), for switches outside the backend
+    if (strcmp(name, "ggml_backend_cuda_strix_ab") == 0) {
+        return (void *)ggml_cuda_strix_ab;
     }
     return nullptr;
 }

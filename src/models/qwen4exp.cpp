@@ -2470,6 +2470,18 @@ void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_token * t
 #endif
 }
 
+// strixllama: wake the drive the PLE rows are read from ahead of a small batch's gather (llama_lazy_reader::wake);
+// llama_context calls it for every model
+void qwen4exp_ple_wake(const llama_model & model_base) {
+    if (model_base.arch != LLM_ARCH_QWEN4EXP) {
+        return;
+    }
+    const auto & pmodel = static_cast<const llama_model_qwen4exp &>(model_base);
+    if (pmodel.ple_reader) {
+        pmodel.ple_reader->wake();
+    }
+}
+
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
 
