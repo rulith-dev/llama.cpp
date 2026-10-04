@@ -18,6 +18,7 @@ struct ggml_cuda_hc_combine_norm_args {
     uint16_t *          res_out_bf16 = nullptr;
     const float *       inject_w     = nullptr;   // strixllama: the next hc_inject's weights [hc * n_embd, hc], fused (hc == 4)
     float *             inject_part  = nullptr;   // its per-stream partial dot products [T][hc][4]
+    float *             row_scale    = nullptr;   // strixllama: each row's rsqrt(mean(x^2) + eps) [T * hc] (STRIX_HC_XRES)
 };
 
 // the largest ubatch the fused inject takes (its partial buffer is sized for it)
@@ -29,3 +30,6 @@ bool ggml_cuda_hc_inject_fusable(const ggml_cuda_hc_combine_norm_args & args);
 float * ggml_cuda_hc_inject_part(ggml_backend_cuda_context & ctx);
 void ggml_cuda_hc_inject_reduce(ggml_backend_cuda_context & ctx, const float * part, ggml_tensor * dst);
 void ggml_cuda_hc_release();
+// strixllama: the combine kernel the per-row scale needs (LLAMA_HC_CN_SHAPE=1), and a buffer for the scales
+bool ggml_cuda_hc_cn_b256(const ggml_cuda_hc_combine_norm_args & args);
+float * ggml_cuda_hc_row_scale_buf(ggml_backend_cuda_context & ctx);

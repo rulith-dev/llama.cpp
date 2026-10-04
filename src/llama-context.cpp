@@ -3950,6 +3950,13 @@ int32_t llama_n_threads_batch(llama_context * ctx) {
     return ctx->n_threads_batch();
 }
 
+void llama_strix_pregather_now(llama_context * ctx, const llama_token * tokens, int32_t n_tokens, int32_t n_context) {
+    extern void qwen4exp_ple_pregather_now(const llama_model & model, const llama_token * tokens, int32_t n_tokens, int32_t n_skip);
+    if (ctx && tokens && n_tokens > n_context && n_context >= 0) {
+        qwen4exp_ple_pregather_now(ctx->get_model(), tokens, n_tokens, n_context);
+    }
+}
+
 void llama_strix_prefetch(llama_context * ctx, const llama_token * tokens, int32_t n_tokens, int32_t n_context) {
     extern void qwen4exp_ple_prefetch(const llama_model & model, const llama_token * tokens, int32_t n_tokens, int32_t n_skip, bool pregather);
     g_strix_prefetch_external = true;

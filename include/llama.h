@@ -1010,6 +1010,8 @@ extern "C" {
     // gather becomes a copy; from then on llama_decode stops prefetching the batch it is handed. No-op for other
     // models.
     LLAMA_API void llama_strix_prefetch(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens, int32_t n_context);
+    // strixllama: the same rows for the batch about to run, read now on a thread of their own (a prompt's first batch)
+    LLAMA_API void llama_strix_pregather_now(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens, int32_t n_context);
 
     // strixllama: a sequence's attention rows by position, so a server can move a conversation to disk and back a
     // stretch of positions at a time instead of as one state. A position's row is every attention-type cache's

@@ -1065,6 +1065,10 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
+    // strixllama: run once by the next build_moe_ffn between the experts' down projection and their weighting (graph
+    // order only: what a model puts into the graph there comes before the weighted sum)
+    mutable std::function<void()> moe_before_weighting;
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 

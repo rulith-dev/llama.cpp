@@ -2335,6 +2335,39 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
+    const bool has_shexp = model.layers[il].ffn_up_shexp != nullptr;
+    ggml_tensor * ffn_shexp   = nullptr;
+    ggml_tensor * shared_gate = nullptr;
+    auto build_shexp = [&]() {
+        ffn_shexp =
+            build_ffn(cur,
+                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
+                NULL,
+                LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(ffn_shexp, "ffn_shexp", il);
+
+        // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token)
+        shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
+        cb(shared_gate, "shared_expert_gate", il);
+
+        shared_gate = ggml_sigmoid(ctx0, shared_gate);
+        cb(shared_gate, "shared_expert_gate_sigmoid", il);
+
+        ggml_build_forward_expand(gf, ffn_shexp);
+        ggml_build_forward_expand(gf, shared_gate);
+    };
+    // strixllama: for a prompt-sized batch the shared expert enters the graph between the routed experts' down projection
+    // and their weighted sum, so that its gating and the final add come right after the sum, which then runs them in
+    // the same kernel (ggml-cuda, STRIX_SHEXP_TAIL). Graph order only: every value is the same. Before the routed
+    // experts it would end the routed input's life early and let their fused gate/up kernel's output take its buffer,
+    // which that kernel cannot share. STRIX_SHEXP_MOVE=0: the old order
+    static const bool shexp_move = !getenv("STRIX_SHEXP_MOVE") || atoi(getenv("STRIX_SHEXP_MOVE")) != 0;
+    if (has_shexp && shexp_move && n_tokens >= 512) {
+        moe_before_weighting = build_shexp;
+    }
+
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -2352,23 +2385,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             model.layers[il].ffn_down_exps_s);
     cb(moe_out, "ffn_moe_out", il);
 
+    moe_before_weighting = nullptr;   // a path of build_moe_ffn without the hook point
+
     // shared experts, as in the Qwen3Next reference
-    if (model.layers[il].ffn_up_shexp != nullptr) {
-        ggml_tensor * ffn_shexp =
-            build_ffn(cur,
-                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
-                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
-                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
-                NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
-        cb(ffn_shexp, "ffn_shexp", il);
-
-        // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token)
-        ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
-        cb(shared_gate, "shared_expert_gate", il);
-
-        shared_gate = ggml_sigmoid(ctx0, shared_gate);
-        cb(shared_gate, "shared_expert_gate_sigmoid", il);
+    if (has_shexp) {
+        if (!ffn_shexp) {
+            build_shexp();
+        }
 
         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
         cb(ffn_shexp, "ffn_shexp_gated", il);
@@ -2419,52 +2442,73 @@ public:
 // strixllama: `n_skip` leading tokens are context only (the n-gram lookups of the first real token reach back into
 // them); with `pregather` the rows are gathered and dequantized for the gather of exactly that batch to take, rather
 // than only warmed in the file cache
+// the table rows the gather of these tokens reads, for the tokens after the first n_skip (context only)
+static std::vector<int32_t> qwen4exp_ple_rows(const llama_hparams & hp, const std::vector<llama_token> & toks, int64_t n_skip) {
+    const int64_t n_gram = hp.ple_ngram_size, n_heads = hp.ple_n_heads, per_gram = hp.ple_heads_per_ngram;
+    const int64_t eos = hp.ple_eos_token_id;
+    const int64_t n = (int64_t) toks.size();
+    std::vector<int32_t> idx((size_t) n_heads * (n - n_skip));
+    std::vector<int64_t> ctx(n_gram);
+    for (int64_t i = n_skip; i < n; ++i) {
+        ctx[0] = toks[i];
+        bool cut = false;
+        for (int64_t sft = 1; sft < n_gram; ++sft) {
+            const int64_t j = i - sft;                       // contiguous single-sequence prefill
+            const llama_token t = (cut || j < 0) ? LLAMA_TOKEN_NULL : toks[j];
+            cut = cut || t < 0 || t == eos;
+            ctx[sft] = cut ? eos : t;
+        }
+        for (int64_t g = 2; g <= n_gram; ++g) {
+            uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
+            for (int64_t j = 1; j < g; ++j) { mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j]; }
+            const int64_t base = (g - 2) * per_gram;
+            for (int64_t q = 0; q < per_gram; ++q) {
+                const int64_t h_i = base + q;
+                idx[(size_t) (i - n_skip) * n_heads + h_i] = (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
+            }
+        }
+    }
+    return idx;
+}
+
+// strixllama: the rows of the batch about to run, read at once on a thread of their own (llama_strix_pregather_now):
+// a prompt's first batch, which no earlier batch announced, otherwise reads them only after its graph is built
+void qwen4exp_ple_pregather_now(const llama_model & model_base, const llama_token * tokens, int32_t n_tokens, int32_t n_skip) {
+    if (!tokens || n_tokens - n_skip < 64 || n_skip < 0 || model_base.arch != LLM_ARCH_QWEN4EXP) { return; }
+    const auto & pmodel = static_cast<const llama_model_qwen4exp &>(model_base);
+    static const bool off = (getenv("LLAMA_PLE_PREFETCH") && atoi(getenv("LLAMA_PLE_PREFETCH")) == 0) ||
+                            (getenv("STRIX_PLE_NOW") && atoi(getenv("STRIX_PLE_NOW")) == 0);
+    if (!pmodel.ple_reader || off || pmodel.hparams.ple_n_heads <= 0 || pmodel.hparams.ple_ngram_size < 2) { return; }
+    pmodel.ple_reader->pregather_now(qwen4exp_ple_rows(pmodel.hparams, std::vector<llama_token>(tokens, tokens + n_tokens), n_skip));
+}
+
 void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_token * tokens, int32_t n_tokens,
                            int32_t n_skip, bool pregather) {
     // strixllama: llama_decode calls this for every model; the cast below is only valid for this one
-    if (!tokens || n_tokens - n_skip < 4096 || model_base.arch != LLM_ARCH_QWEN4EXP) { return; }
+    // strixllama: a pregather serves chunks of any length (the server announces only real ones); a page-cache prefetch
+    // pays off only for big batches
+    if (!tokens || n_tokens - n_skip < (pregather ? 64 : 4096) || model_base.arch != LLM_ARCH_QWEN4EXP) { return; }
     const auto & pmodel = static_cast<const llama_model_qwen4exp &>(model_base);
     if (!pmodel.ple_reader) { return; }
     static const bool off = getenv("LLAMA_PLE_PREFETCH") && atoi(getenv("LLAMA_PLE_PREFETCH")) == 0;
     if (off) { return; }
     const auto & hp = pmodel.hparams;
-    const int64_t n_gram = hp.ple_ngram_size, n_heads = hp.ple_n_heads, per_gram = hp.ple_heads_per_ngram;
-    const int64_t eos = hp.ple_eos_token_id, n_prev = n_gram - 1;
-    if (n_heads <= 0 || n_gram < 2) { return; }
+    if (hp.ple_n_heads <= 0 || hp.ple_ngram_size < 2) { return; }
     std::vector<llama_token> toks(tokens, tokens + n_tokens);
-    auto prefetch = [reader = pmodel.ple_reader, toks = std::move(toks), n_gram, n_heads, per_gram, eos, n_prev, hp, n_skip, pregather]() {
-        const int64_t n = (int64_t) toks.size();
-        std::vector<int32_t> idx((size_t) n_heads * n);
-        std::vector<int64_t> ctx(n_gram);
-        for (int64_t i = 0; i < n; ++i) {
-            ctx[0] = toks[i];
-            bool cut = false;
-            for (int64_t sft = 1; sft < n_gram; ++sft) {
-                const int64_t j = i - sft;                       // contiguous single-sequence prefill
-                const llama_token t = (cut || j < 0) ? LLAMA_TOKEN_NULL : toks[j];
-                cut = cut || t < 0 || t == eos;
-                ctx[sft] = cut ? eos : t;
-            }
-            for (int64_t g = 2; g <= n_gram; ++g) {
-                uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
-                for (int64_t j = 1; j < g; ++j) { mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j]; }
-                const int64_t base = (g - 2) * per_gram;
-                for (int64_t q = 0; q < per_gram; ++q) {
-                    const int64_t h_i = base + q;
-                    idx[(size_t) i * n_heads + h_i] = (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
-                }
-            }
-        }
-        const int32_t * first = idx.data() + (size_t) n_skip * n_heads;
-        const int64_t   count = (int64_t) idx.size() - (int64_t) n_skip * n_heads;
+    auto prefetch = [reader = pmodel.ple_reader, toks = std::move(toks), hp, n_skip, pregather]() {
+        const std::vector<int32_t> idx = qwen4exp_ple_rows(hp, toks, n_skip);
         if (pregather) {
-            reader->pregather(first, count);
+            reader->pregather(idx.data(), (int64_t) idx.size());
         } else {
-            reader->prefetch(first, count);
+            reader->prefetch(idx.data(), (int64_t) idx.size());
         }
     };
 #ifdef _WIN32
-    pmodel.ple_reader->launch_prefetch(std::move(prefetch));
+    if (pregather) {
+        pmodel.ple_reader->defer_prefetch(std::move(prefetch));
+    } else {
+        pmodel.ple_reader->launch_prefetch(std::move(prefetch));
+    }
 #else
     std::thread(std::move(prefetch)).detach();
 #endif
@@ -2548,6 +2592,9 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             staging.resize(idx.size() * pmodel.ple_reader->head_dim * sizeof(float));
             pmodel.ple_reader->gather(idx.data(), (int64_t) idx.size(), (float *) staging.data());
         }
+#ifdef _WIN32
+        pmodel.ple_reader->launch_deferred();   // the next batch's pregather, now that the drive is free
+#endif
         ggml_backend_tensor_set(data, staging.data(), 0, staging.size());
     } else {
         ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));

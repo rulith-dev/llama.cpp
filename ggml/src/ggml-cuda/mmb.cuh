@@ -27,6 +27,10 @@ bool ggml_cuda_mmb_down16();
 bool ggml_cuda_mmb_res16();
 bool ggml_cuda_mmb_blk16();
 bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst, int hc, float scale, float bias);
+// strixllama: whether ggml_cuda_hc_gate_mix will run for these tensors (the streams' copies aside), and whether it reads
+// the F32 streams (*f32) - which it can instead form from a combine's residual output (ggml_cuda_hc_xres_set)
+bool ggml_cuda_hc_gate_mix_ok(const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, const ggml_tensor * dst, int hc, bool * f32);
+void ggml_cuda_hc_xres_set(const void * xn_data, const float * res, const float * row_scale, const float * gamma);
 bool ggml_cuda_mmb_supported_glu(const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu);
 void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu);
 void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w);

@@ -110,7 +110,7 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b2
         float * out_res, float * out_xn, uint16_t * out_xn_bf16, const bool store_xn_f32, const int64_t xn_ld,
         const uint16_t * res_in_bf16, uint16_t * res_out_bf16, const uint16_t * blk_in_bf16,
         const int n_embd, const float s1, const float b1, const float s2, const float b2, const float eps,
-        const float * __restrict__ inj_w, float * __restrict__ inj_part) {
+        const float * __restrict__ inj_w, float * __restrict__ inj_part, float * __restrict__ row_scale) {
     __shared__ float s_sum[32];
     const int c = blockIdx.x, t = blockIdx.y, hc = gridDim.x, tid = threadIdx.x;
     const float x1 = s1 * inject[(int64_t) t * hc + c] + b1;
@@ -154,6 +154,9 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b2
     tmp = block_reduce<block_reduce_method::SUM, HC_CN_BLOCK2>(tmp, s_sum);
     const float mean  = tmp / n_embd;
     const float scale = rsqrtf(mean + eps);
+    if (row_scale && tid == 0) {
+        row_scale[row] = scale;
+    }
     const float * g  = gamma  + (int64_t) c * n_embd;
     float *       xn = out_xn + row * n_embd;
     uint16_t *    xh = out_xn_bf16 ? out_xn_bf16 + (int64_t) t * xn_ld + (int64_t) c * n_embd : nullptr;
@@ -257,10 +260,11 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
             (const float *) a.block_out->data, (const float *) a.gamma->data,
             (float *) a.out_res->data, (float *) a.out_xn->data, a.out_xn_bf16, a.store_xn_f32, a.xn_bf16_ld ? a.xn_bf16_ld : hc * n_embd,
             a.res_in_bf16, a.res_out_bf16, a.blk_in_bf16,
-            (int) n_embd, a.s1, a.b1, a.s2, a.b2, a.eps, a.inject_w, a.inject_part);
+            (int) n_embd, a.s1, a.b1, a.s2, a.b2, a.eps, a.inject_w, a.inject_part, a.row_scale);
         static unsigned h2 = 0; if (h2++ < 2) fprintf(stderr, "HC_CN shape=256x4 n_embd=%lld tokens=%lld\n", (long long) n_embd, (long long) n_tokens);
         return;
     }
+    GGML_ASSERT(!a.row_scale && "the per-row scale is the 256-thread kernel's");
     const ggml_cuda_kernel_launch_params launch_params(dim3((int) hc, (int) n_tokens, 1), HC_CN_BLOCK, 0, ctx.stream());
     ggml_cuda_kernel_launch(hc_combine_norm_f32, launch_params,
         (const float *) a.inject->data, (const float *) a.residual->data,
@@ -279,6 +283,20 @@ bool ggml_cuda_hc_inject_fusable(const ggml_cuda_hc_combine_norm_args & a) {
 
 // one buffer for the partials of the pending inject: allocated once at its largest, so its address never changes under
 // a captured graph; released with the backend (ggml_cuda_hc_release)
+bool ggml_cuda_hc_cn_b256(const ggml_cuda_hc_combine_norm_args & a) {
+    static const int shape = getenv("LLAMA_HC_CN_SHAPE") ? atoi(getenv("LLAMA_HC_CN_SHAPE")) : 0;
+    return shape == 1 && a.out_res->ne[0] % 2 == 0 && a.out_res->ne[3] == 1 && a.out_res->ne[1] <= 4 &&
+        a.out_res->ne[2] * a.out_res->ne[1] <= (int64_t) HC_INJ_MAX_T * 4;
+}
+
+static ggml_cuda_pool_alloc<float> * g_hc_row_scale = nullptr;
+float * ggml_cuda_hc_row_scale_buf(ggml_backend_cuda_context & ctx) {
+    if (!g_hc_row_scale) {
+        g_hc_row_scale = new ggml_cuda_pool_alloc<float>(ctx.pool(), (size_t) HC_INJ_MAX_T * 4);
+    }
+    return g_hc_row_scale->get();
+}
+
 static ggml_cuda_pool_alloc<float> * g_hc_inject_part = nullptr;
 float * ggml_cuda_hc_inject_part(ggml_backend_cuda_context & ctx) {
     if (!g_hc_inject_part) {
@@ -290,6 +308,8 @@ float * ggml_cuda_hc_inject_part(ggml_backend_cuda_context & ctx) {
 void ggml_cuda_hc_release() {
     delete g_hc_inject_part;
     g_hc_inject_part = nullptr;
+    delete g_hc_row_scale;
+    g_hc_row_scale = nullptr;
 }
 
 void ggml_cuda_hc_inject_reduce(ggml_backend_cuda_context & ctx, const float * part, ggml_tensor * dst) {

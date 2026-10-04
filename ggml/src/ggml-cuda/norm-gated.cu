@@ -13,10 +13,13 @@ static __device__ __forceinline__ float xor_tree(float v) {
     for (int off = 16; off > 0; off >>= 1) { v += __shfl_xor(v, off); }
     return v;
 }
-template <bool GATE, bool HAS_W = true>
+// POST (strixllama): the SCALE after a plain norm - the gated delta net's L2 norm of q and k is rms_norm then scale by
+// 1/sqrt(n) - applied as scale_f32 writes it (`scale * x + bias`), so the norm's output is not written and read back
+template <bool GATE, bool HAS_W = true, bool POST = false>
 static __global__ void __launch_bounds__(256) rms_rows_f32(const float * x, const float * w, const float * z, float * dst,
         const int ncols, const int64_t nrows, const int64_t nchannels, const int64_t total_rows,
-        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps) {
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps,
+        const float post_scale = 1.0f, const float post_bias = 0.0f) {
     const int lane = threadIdx.x & 31;
     const int64_t g = (int64_t) blockIdx.x * 8 + (threadIdx.x >> 5);
     if (g >= total_rows) return;
@@ -42,6 +45,7 @@ static __global__ void __launch_bounds__(256) rms_rows_f32(const float * x, cons
         if (col < ncols) {
             float t;
             if constexpr (HAS_W) { t = scale * x[col] * w[col]; } else { t = scale * x[col]; }
+            if constexpr (POST) { t = post_scale * t + post_bias; }
             if (GATE) { const float s = 1.0f / (1.0f + expf(-z[col])); dst[col] = t * s; } else { dst[col] = t; }
         }
     }
@@ -119,8 +123,35 @@ bool ggml_cuda_rms_rows_plain(const float * x, float * dst, int ncols, int64_t n
     const dim3 grid((unsigned) ((total + 7) / 8)), block(256);
     const ggml_cuda_kernel_launch_params lp(grid, block, 0, stream);
     ggml_cuda_kernel_launch(rms_rows_f32<false, false>, lp, x, (const float *) nullptr, (const float *) nullptr, dst,
-        ncols, nrows, nchannels, total, stride_row, stride_channel, stride_sample, eps);
+        ncols, nrows, nchannels, total, stride_row, stride_channel, stride_sample, eps, 1.0f, 0.0f);
     return true;
+}
+
+// strixllama: RMS_NORM of narrow rows followed by SCALE, its only reader (STRIX_NORM_SCALE=0: off)
+int ggml_cuda_norm_scale_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_norm_scale_match & m) {
+    static const bool on = !getenv("STRIX_NORM_SCALE") || atoi(getenv("STRIX_NORM_SCALE")) != 0;
+    if (!on || !norm_rows_enabled() || i + 1 >= cgraph->n_nodes) return 0;
+    const ggml_tensor * rms = cgraph->nodes[i]; ggml_tensor * sc = cgraph->nodes[i+1];
+    if (rms->op != GGML_OP_RMS_NORM || sc->op != GGML_OP_SCALE || sc->src[0] != rms || !ggml_node_has_n_uses(cgraph, i, 1)) return 0;
+    const ggml_tensor * x = rms->src[0];
+    if (x->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 || sc->type != GGML_TYPE_F32 || x->nb[0] != 4) return 0;
+    if (x->ne[0] > 256 || x->ne[0] % 32 != 0 || x->ne[1] * x->ne[2] * x->ne[3] < 4096) return 0;
+    if (!ggml_is_contiguous(rms) || !ggml_is_contiguous(sc) || !ggml_are_same_shape(rms, sc)) return 0;
+    float eps; memcpy(&eps, rms->op_params, sizeof(float)); if (eps < 0.0f) return 0;
+    float s, b; memcpy(&s, (const float *) sc->op_params + 0, sizeof(float)); memcpy(&b, (const float *) sc->op_params + 1, sizeof(float));
+    m.x = x; m.dst = sc; m.eps = eps; m.scale = s; m.bias = b;
+    return 1;
+}
+
+void ggml_cuda_op_norm_scale(ggml_backend_cuda_context & ctx, const ggml_cuda_norm_scale_match & m) {
+    const ggml_tensor * x = m.x;
+    static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "NORM_ROWS+SCALE fused: ncols=%d rows=%lld\n", (int) x->ne[0], (long long) (x->ne[1]*x->ne[2]*x->ne[3]));
+    const int64_t total = x->ne[1] * x->ne[2] * x->ne[3];
+    const dim3 grid((unsigned) ((total + 7) / 8)), block(256);
+    const ggml_cuda_kernel_launch_params lp(grid, block, 0, ctx.stream());
+    ggml_cuda_kernel_launch(rms_rows_f32<false, false, true>, lp, (const float *) x->data, (const float *) nullptr, (const float *) nullptr,
+        (float *) m.dst->data, (int) x->ne[0], x->ne[1], x->ne[2], total, (int64_t) (x->nb[1] / 4), (int64_t) (x->nb[2] / 4),
+        (int64_t) (x->nb[3] / 4), m.eps, m.scale, m.bias);
 }
 
 void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_norm_gated_match & m) {
@@ -130,7 +161,7 @@ void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_no
     const dim3 grid((unsigned) ((total + 7) / 8)), block(256);
     const ggml_cuda_kernel_launch_params lp(grid, block, 0, ctx.stream());
     if (m.z) ggml_cuda_kernel_launch(rms_rows_f32<true>, lp, (const float *) x->data, (const float *) m.w->data, (const float *) m.z->data, (float *) m.dst->data,
-        (int) x->ne[0], x->ne[1], x->ne[2], total, (int64_t) (x->nb[1] / 4), (int64_t) (x->nb[2] / 4), (int64_t) (x->nb[3] / 4), m.eps);
+        (int) x->ne[0], x->ne[1], x->ne[2], total, (int64_t) (x->nb[1] / 4), (int64_t) (x->nb[2] / 4), (int64_t) (x->nb[3] / 4), m.eps, 1.0f, 0.0f);
     else     ggml_cuda_kernel_launch(rms_rows_f32<false>, lp, (const float *) x->data, (const float *) m.w->data, (const float *) nullptr, (float *) m.dst->data,
-        (int) x->ne[0], x->ne[1], x->ne[2], total, (int64_t) (x->nb[1] / 4), (int64_t) (x->nb[2] / 4), (int64_t) (x->nb[3] / 4), m.eps);
+        (int) x->ne[0], x->ne[1], x->ne[2], total, (int64_t) (x->nb[1] / 4), (int64_t) (x->nb[2] / 4), (int64_t) (x->nb[3] / 4), m.eps, 1.0f, 0.0f);
 }

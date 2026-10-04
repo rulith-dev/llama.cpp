@@ -43,10 +43,12 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
-// the 5-argument form lives in this backend's own moe-weighted-reduction.cu (shared-expert merge folded in)
+// the 5-argument form lives in this backend's own moe-weighted-reduction.cu (shared-expert merge folded in; the gated
+// shared expert's tail as well)
 void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx, const ggml_tensor * experts,
                                          const ggml_tensor * expert_scale, const ggml_tensor * weights,
-                                         ggml_tensor * dst, const ggml_tensor * merge);
+                                         ggml_tensor * dst, const ggml_tensor * merge, const ggml_tensor * shexp,
+                                         const ggml_tensor * sgate);
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -2681,7 +2683,8 @@ static void strix_tl_after(ggml_backend_cuda_context * ctx, const void * graph_k
         return;
     }
     auto it = g_strix_tl.find(graph_key);
-    if (it == g_strix_tl.end() || it->second.rows >= 64 || it->second.keys.empty()) {
+    static const int64_t tl_rows = getenv("STRIX_GPU_TIMELINE_ROWS") ? atoll(getenv("STRIX_GPU_TIMELINE_ROWS")) : 64;   // DEV: prompt graphs too
+    if (it == g_strix_tl.end() || it->second.rows >= tl_rows || it->second.keys.empty()) {
         return;
     }
     static int computes = 0;
@@ -4407,6 +4410,65 @@ static bool ggml_cuda_hc_combine_norm_alias_ok(const ggml_cuda_hc_combine_norm_a
 
 #include "hc-match.inc"
 
+// strixllama (STRIX_HC_XRES): whether the combine's F32 normalised streams have a reader left. The HC down GEMM reads the
+// BF16 copy, the inject is folded into the combine (inject_plan), and the gate GEMM's fused mix, which with Q8_0 weights
+// reads the F32 streams, can form them again from the combine's F32 residual output, the per-row scale it then stores and
+// gamma - the same two products in the same order, so the same bits. With no other reader the combine stops writing
+// them: 40 KB a token per combine, two combines a layer
+static void ggml_cuda_hc_xres_plan(const ggml_cgraph * graph, const int last, ggml_cuda_hc_combine_norm_args & args,
+        ggml_backend_cuda_context & ctx) {
+    static const bool on = !getenv("STRIX_HC_XRES") || atoi(getenv("STRIX_HC_XRES")) != 0;
+    ggml_cuda_hc_xres_set(nullptr, nullptr, nullptr, nullptr);
+    const ggml_tensor * xn = args.out_xn;
+    const int64_t hc = args.out_res->ne[1], T = args.out_res->ne[2];
+    if (!on || !args.store_xn_f32 || !args.out_xn_bf16 || args.res_out_bf16 || hc != 4 || T < 512 ||
+            args.out_res->type != GGML_TYPE_F32 || args.gamma->type != GGML_TYPE_F32 || !ggml_is_contiguous(args.out_res) ||
+            !ggml_is_contiguous(args.gamma) || xn->type != GGML_TYPE_F32 || !ggml_cuda_hc_cn_b256(args)) {
+        return;
+    }
+    bool formed = false;
+    int nread = 0;
+    for (int n = last + 1; n < graph->n_nodes; ++n) {
+        const ggml_tensor * t = graph->nodes[n];
+        bool reads = false;
+        for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
+            if (t->src[s] == xn || t->src[s]->view_src == xn) { reads = true; }
+        }
+        if (!reads) {
+            continue;
+        }
+        ++nread;
+        if (g_hc_inject.node == t) {
+            continue;                       // the inject, folded into the combine
+        }
+        if (t->op == GGML_OP_MUL_MAT && t->src[1] == xn && ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) {
+            continue;                       // the HC down GEMM: the BF16 copy
+        }
+        if (t->op == GGML_OP_MUL && n >= 2) {
+            ggml_cuda_hc_mix_args ma;
+            const ggml_tensor * g = graph->nodes[n - 2];
+            bool f32 = false;
+            if (ggml_cuda_hc_mix_closed(graph, n - 1, ma) > 0 && ma.xn == xn && ma.gate == g && g->op == GGML_OP_MUL_MAT &&
+                    g->src[0]->ne[0] == 320 && g->src[0]->ne[1] == 10240 && ggml_node_has_n_uses(graph, n - 2, 1) &&
+                    ggml_cuda_mmb_supported_mm(g->src[0], g->src[1], g) &&
+                    ggml_cuda_hc_gate_mix_ok(g->src[0], g->src[1], xn, ma.dst, ma.hc, &f32)) {
+                formed = formed || f32;
+                continue;                   // the gate GEMM's fused mix
+            }
+        }
+        return;                             // another reader: the F32 streams stay
+    }
+    if (nread == 0) {
+        return;
+    }
+    args.store_xn_f32 = false;
+    if (formed) {
+        args.row_scale = ggml_cuda_hc_row_scale_buf(ctx);
+        ggml_cuda_hc_xres_set(xn->data, (const float *) args.out_res->data, args.row_scale, (const float *) args.gamma->data);
+    }
+    static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "HC_CN no F32 streams (%s): T=%lld\n", formed ? "the mix forms them" : "no F32 reader", (long long) T);
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -5004,6 +5066,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
         sk = ggml_cuda_norm_rows_match_at(cgraph, i, nm);
         if (sk > 0) { ggml_cuda_op_norm_gated(*cuda_ctx, nm); return sk; }
+        ggml_cuda_norm_scale_match sm;
+        if (ggml_cuda_norm_scale_match_at(cgraph, i, sm) > 0) { ggml_cuda_op_norm_scale(*cuda_ctx, sm); return 1; }
     }
     if (node->op == GGML_OP_CONCAT || node->op == GGML_OP_SSM_CONV) {
         ggml_cuda_gdn_conv_match gm;
@@ -5113,6 +5177,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
             { static unsigned dbg = 0; if (getenv("LLAMA_HC16_DEBUG") && ggml_nrows(args.out_xn) >= 4096 && dbg++ < 8) fprintf(stderr, "HC_CN dispatch xn=%s bf16=%d store_f32=%d\n", args.out_xn->name, args.out_xn_bf16 != nullptr, (int) args.store_xn_f32); }
             ggml_cuda_hc_inject_plan(cgraph, i + skip, args, *cuda_ctx);
+            ggml_cuda_hc_xres_plan(cgraph, i + skip, args, *cuda_ctx);
             ggml_cuda_op_hc_combine_norm(*cuda_ctx, args);
             return skip;
         }
@@ -5134,6 +5199,33 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
+            // strixllama: the shared expert's tail right after the weighted sum - MUL(shexp, sigmoid gate [1, T]), ADD(sum,
+            // that) - in the same kernel (qwen4exp builds the shared expert first for prompt-sized batches so that the
+            // two follow the sum): the sum and the gated shared expert are no longer written out and read back, bitwise
+            // the same (moe_shexp_tail). STRIX_SHEXP_TAIL=0: off
+            static const bool shexp_tail = !getenv("STRIX_SHEXP_TAIL") || atoi(getenv("STRIX_SHEXP_TAIL")) != 0;
+            const int im = i + match.node_count, ia = im + 1;
+            if (shexp_tail && ia < cgraph->n_nodes && !ggml_cuda_mmb_is_bf16_only(match.dst)) {
+                const ggml_tensor * mul = cgraph->nodes[im];
+                ggml_tensor *       add = cgraph->nodes[ia];
+                const ggml_tensor * sx  = mul->op == GGML_OP_MUL ? mul->src[0] : nullptr;
+                const ggml_tensor * sg  = mul->op == GGML_OP_MUL ? mul->src[1] : nullptr;
+                const bool shape_ok = sx && sg && add->op == GGML_OP_ADD &&
+                    ((add->src[0] == match.dst && add->src[1] == mul) || (add->src[1] == match.dst && add->src[0] == mul)) &&
+                    mul->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 && sx->type == GGML_TYPE_F32 && sg->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(sx) && ggml_is_contiguous(sg) && ggml_is_contiguous(add) && ggml_is_contiguous(mul) &&
+                    ggml_are_same_shape(sx, match.dst) && ggml_are_same_shape(add, match.dst) && ggml_are_same_shape(mul, match.dst) &&
+                    sg->ne[0] == 1 && sg->ne[1] == match.dst->ne[1] && sg->ne[2] == 1 && sg->ne[3] == 1 &&
+                    match.dst->ne[0] % 4 == 0;
+                if (shape_ok && ggml_node_has_n_uses(cgraph, im - 1, 1) && ggml_node_has_n_uses(cgraph, im, 1)) {
+                    const int count = match.node_count + 2;
+                    if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, count, &ia, 1)) {
+                        ggml_cuda_op_moe_weighted_reduction(*cuda_ctx, match.experts, match.expert_scale, match.weights, add,
+                                                            nullptr, sx, sg);
+                        return count - 1;
+                    }
+                }
+            }
             int count = match.node_count;
             const ggml_tensor * merge = nullptr;
             {   // shared-expert merge: ADD(reduction, ffn_shexp_gated) right after, with the reduction used only there

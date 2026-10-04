@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -66,13 +68,15 @@ struct llama_lazy_reader {
         }
     }
 
+    // strixllama: runs after the prefetch before it, on its own thread, and never makes the caller wait for that one
     template <typename F>
     void launch_prefetch(F && work) const {
         std::lock_guard<std::mutex> lock(prefetch_mutex);
-        if (prefetch_thread.joinable()) {
-            prefetch_thread.join();
-        }
-        prefetch_thread = std::thread([fn = std::forward<F>(work)]() {
+        std::thread prev = std::move(prefetch_thread);
+        prefetch_thread = std::thread([prev = std::move(prev), fn = std::forward<F>(work)]() mutable {
+            if (prev.joinable()) {
+                prev.join();
+            }
             try {
                 fn();
             } catch (const std::exception & e) {
@@ -83,8 +87,28 @@ struct llama_lazy_reader {
         });
     }
 
+    // strixllama: a pregather announced for the next batch waits until the batch about to run has its own rows
+    // (launch_deferred, from the gather's input): started at once it shared the drive with that batch's gather, which
+    // the GPU waits for. A newer announcement replaces one still waiting.
+    void defer_prefetch(std::function<void()> work) const {
+        std::lock_guard<std::mutex> lock(prefetch_mutex);
+        deferred = std::move(work);
+    }
+
+    void launch_deferred() const {
+        std::function<void()> work;
+        {
+            std::lock_guard<std::mutex> lock(prefetch_mutex);
+            work.swap(deferred);
+        }
+        if (work) {
+            launch_prefetch(std::move(work));
+        }
+    }
+
     mutable std::mutex prefetch_mutex;
     mutable std::thread prefetch_thread;
+    mutable std::function<void()> deferred;
 
     // strixllama: keep several overlapped reads in flight per worker instead of one synchronous
     // read_at per row. Depth 1 measured badly on both gather shapes (scripts/hip-bench.ps1 -Trace):
@@ -333,6 +357,9 @@ struct llama_lazy_reader {
     }
 
     ~llama_lazy_reader() {
+        if (now_thread.joinable()) {
+            now_thread.join();
+        }
 #ifdef _WIN32
         if (prefetch_thread.joinable()) {
             prefetch_thread.join();
@@ -385,6 +412,8 @@ struct llama_lazy_reader {
         }
 
         std::sort(pairs.begin(), pairs.end()); // equal rows adjacent, file order
+        const auto strixllama_t1 = std::chrono::steady_clock::now();
+        auto strixllama_t2 = strixllama_t1, strixllama_t3 = strixllama_t1;
 
         int64_t n_hit = 0;
         if (!cache_on()) {
@@ -426,9 +455,11 @@ struct llama_lazy_reader {
                     memcpy(dst + (size_t) pairs[k].second * head_dim, first, (size_t) head_dim * sizeof(float));
                 }
             }
+            strixllama_t2 = std::chrono::steady_clock::now();
             if (!miss.empty()) {
                 std::vector<uint8_t> raw(miss.size() * row_size);
                 read_pairs(miss, dst, raw.data());
+                strixllama_t3 = std::chrono::steady_clock::now();
                 std::lock_guard<std::mutex> lock(cache_mutex);
                 for (size_t k = 0; k < miss.size(); ++k) {
                     if (k == 0 || miss[k].first != miss[k - 1].first) {
@@ -445,8 +476,11 @@ struct llama_lazy_reader {
             for (int64_t i = 1; i < n; ++i) {
                 if (pairs[i].first != pairs[i - 1].first) { ++uniq; }
             }
-            fprintf(stderr, "PLE_GATHER rows=%lld uniq=%lld cached=%lld row_bytes=%zu ms=%.1f\n",
-                    (long long) n, (long long) uniq, (long long) n_hit, row_size, ms);
+            auto ms_of = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count(); };
+            fprintf(stderr, "PLE_GATHER rows=%lld uniq=%lld cached=%lld row_bytes=%zu ms=%.1f (sort %.1f hits %.1f read %.1f)\n",
+                    (long long) n, (long long) uniq, (long long) n_hit, row_size, ms, ms_of(strixllama_t0, strixllama_t1),
+                    ms_of(strixllama_t1, strixllama_t2), ms_of(strixllama_t2, strixllama_t3));
         }
     }
 
@@ -546,29 +580,117 @@ struct llama_lazy_reader {
     struct pregathered {
         std::vector<int32_t> rows;
         std::vector<uint8_t> data;      // rows.size() * head_dim floats
+        uint64_t id    = 0;             // strixllama: a pregather announced before it ran (pregather_now) has one ...
+        bool     ready = true;          // ... and is not ready while it runs: a take of its rows waits for it
     };
     mutable std::mutex pre_mutex;
+    mutable std::condition_variable pre_cv;
+    mutable uint64_t pre_next_id = 1;
     mutable std::vector<pregathered> pre;
 
-    void pregather(const int32_t * rows, int64_t n) const {
-        pregathered p;
-        p.rows.assign(rows, rows + n);
-        p.data.resize((size_t) n * head_dim * sizeof(float));
-        gather(rows, n, (float *) p.data.data());
-        std::lock_guard<std::mutex> lock(pre_mutex);
-        pre.push_back(std::move(p));
-        if (pre.size() > 2) {
-            pre.erase(pre.begin());
+    // keep the newest few: a running pregather is never dropped, its taker waits for it
+    void pre_trim() const {
+        while (pre.size() > 3) {
+            auto it = std::find_if(pre.begin(), pre.end(), [](const pregathered & p) { return p.ready; });
+            if (it == pre.end()) {
+                break;
+            }
+            pre.erase(it);
         }
     }
+
+    void pregather(const int32_t * rows, int64_t n, uint64_t id = 0) const {
+        std::vector<uint8_t> data((size_t) n * head_dim * sizeof(float));
+        bool ok = true;
+        try {
+            gather(rows, n, (float *) data.data());
+        } catch (...) {
+            ok = false;   // an announced entry is still released below: its taker reads the rows itself
+            if (!id) {
+                throw;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(pre_mutex);
+            auto it = id ? std::find_if(pre.begin(), pre.end(), [id](const pregathered & p) { return p.id == id; }) : pre.end();
+            if (it != pre.end()) {
+                if (ok) {
+                    it->data.swap(data);
+                } else {
+                    pre.erase(it);
+                }
+            } else if (!id) {
+                pregathered p;
+                p.rows.assign(rows, rows + n);
+                p.data.swap(data);
+                pre.push_back(std::move(p));
+            }
+            for (auto & p : pre) {
+                if (p.id == id) {
+                    p.ready = true;
+                }
+            }
+            pre_trim();
+        }
+        pre_cv.notify_all();
+    }
+
+    // strixllama: a pregather of the batch about to run - its first chunk, which no earlier batch announced - started at
+    // once on a thread of its own, so its reads overlap the batch's preparation and graph build; announced first, so the
+    // batch's gather waits for it rather than reading the rows again
+    void pregather_now(std::vector<int32_t> rows) const {
+        uint64_t id;
+        {
+            std::lock_guard<std::mutex> lock(pre_mutex);
+            for (const auto & p : pre) {     // already announced or gathered
+                if (p.rows.size() >= rows.size() && std::equal(rows.begin(), rows.end(), p.rows.begin())) {
+                    return;
+                }
+            }
+            id = pre_next_id++;
+            pregathered p;
+            p.rows  = rows;
+            p.id    = id;
+            p.ready = false;
+            pre.push_back(std::move(p));
+        }
+        std::lock_guard<std::mutex> lock(now_mutex);
+        std::thread prev = std::move(now_thread);
+        now_thread = std::thread([this, prev = std::move(prev), rows = std::move(rows), id]() mutable {
+            if (prev.joinable()) {
+                prev.join();
+            }
+            try {
+                pregather(rows.data(), (int64_t) rows.size(), id);
+            } catch (...) {
+                LLAMA_LOG_WARN("lazy pregather skipped after an exception\n");
+            }
+        });
+    }
+    mutable std::mutex  now_mutex;
+    mutable std::thread now_thread;
 
     // the gathered rows for `rows`, when a pregather covered them: the batch a caller announced can come out shorter
     // (it stops at a checkpoint or a message boundary), so a pregather that starts with these rows serves too
     bool take_pregathered(const int32_t * rows, int64_t n, std::vector<uint8_t> & out) const {
-        std::lock_guard<std::mutex> lock(pre_mutex);
+        std::unique_lock<std::mutex> lock(pre_mutex);
+        // a match still being gathered: wait for it (it is released whether or not its reads succeed)
+        auto wait_ready = [&](uint64_t id) {
+            pre_cv.wait(lock, [&]() {
+                auto it = std::find_if(pre.begin(), pre.end(), [id](const pregathered & p) { return p.id == id; });
+                return it == pre.end() || it->ready;
+            });
+            return std::find_if(pre.begin(), pre.end(), [id](const pregathered & p) { return p.id == id; });
+        };
         for (auto it = pre.begin(); it != pre.end(); ++it) {
             if ((int64_t) it->rows.size() < n || memcmp(it->rows.data(), rows, (size_t) n * sizeof(int32_t)) != 0) {
                 continue;
+            }
+            if (!it->ready) {
+                it = wait_ready(it->id);
+                if (it == pre.end()) {
+                    return false;
+                }
             }
             const size_t bytes = (size_t) n * head_dim * sizeof(float);
             if (it->data.size() == bytes) {
@@ -580,7 +702,44 @@ struct llama_lazy_reader {
             pre.erase(it);
             return true;
         }
-        return false;
+        // strixllama: a prompt chunk that shares its pass with other conversations sits inside the batch, after their
+        // tokens (or its pregather ran short of it): take the longest run of pregathered rows found in the batch and
+        // read the rows around it. A row's data does not depend on where it sits, so any match is exact.
+        int64_t best = -1, best_o = 0, best_len = 0;
+        for (size_t k = 0; k < pre.size(); ++k) {
+            const auto & e = pre[k];
+            if (e.rows.empty()) { continue; }
+            for (int64_t o = 0; o < n && best_len < n - o; ++o) {
+                if (rows[o] != e.rows[0]) { continue; }
+                const int64_t lim = std::min<int64_t>((int64_t) e.rows.size(), n - o);
+                int64_t len = 1;
+                while (len < lim && rows[o + len] == e.rows[len]) { ++len; }
+                if (len > best_len) { best = (int64_t) k; best_o = o; best_len = len; }
+            }
+        }
+        // a short coincidental match must not use up the pregather of a later batch
+        if (best < 0 || (best_len < 1024 && best_len < (int64_t) pre[best].rows.size())) {
+            return false;
+        }
+        if (!pre[best].ready) {
+            const auto it = wait_ready(pre[best].id);
+            if (it == pre.end()) {
+                return false;
+            }
+            best = it - pre.begin();
+        }
+        const size_t rb = head_dim * sizeof(float);
+        out.resize((size_t) n * rb);
+        memcpy(out.data() + (size_t) best_o * rb, pre[best].data.data(), (size_t) best_len * rb);
+        pre.erase(pre.begin() + best);
+        lock.unlock();
+        if (best_o > 0) {
+            gather(rows, best_o, (float *) out.data());
+        }
+        if (best_o + best_len < n) {
+            gather(rows + best_o + best_len, n - best_o - best_len, (float *) (out.data() + (size_t) (best_o + best_len) * rb));
+        }
+        return true;
     }
 
     // populate the page cache for the rows a later gather() will read; never writes any output, so a wrong

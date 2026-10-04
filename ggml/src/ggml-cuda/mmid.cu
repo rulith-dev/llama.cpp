@@ -285,6 +285,14 @@ static __global__ void mm_ids_route_scatter(
     else src_map[target]=(route/MM_IDS_ROUTE_USED)*token_stride+(route%MM_IDS_ROUTE_USED)%channels;
 }
 
+// strixllama: the sorted route from 64 tokens on (STRIX_IDS_ROUTE_MIN; it took over above 4096 only). Below that the
+// helper runs a single wave per expert over every token's ids: at 1984 tokens 0.62 ms of each routed GEMM's 4.8 ms
+// (down) and 0.68 of the gate/up's, the sorted route a few tens of microseconds. Rows keep their order within an expert.
+static int mm_ids_route_min_tokens() {
+    static const int v = getenv("STRIX_IDS_ROUTE_MIN") ? atoi(getenv("STRIX_IDS_ROUTE_MIN")) : 64;
+    return v;
+}
+
 bool ggml_cuda_launch_mm_ids_bounded(
         ggml_backend_cuda_context & ctx, const int32_t * ids, int32_t * src_map,
         int32_t * dst_map, int32_t * bounds, int experts, int tokens, int used,
@@ -292,7 +300,7 @@ bool ggml_cuda_launch_mm_ids_bounded(
     const int device=ggml_cuda_get_device();
     if (!GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc) ||
             experts!=MM_IDS_ROUTE_EXPERTS || used!=MM_IDS_ROUTE_USED ||
-            tokens<=4096 || tokens>32768 || (channels!=1 && channels!=used) ||
+            tokens<=mm_ids_route_min_tokens() || tokens>32768 || (channels!=1 && channels!=used) ||
             ids_stride<used || token_stride<channels) return false;
     const int routes=tokens*used;
     const int chunks=(routes+MM_IDS_ROUTE_TILE-1)/MM_IDS_ROUTE_TILE;

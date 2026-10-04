@@ -2403,6 +2403,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (!weight_before_ffn) {
+        if (moe_before_weighting) {
+            ggml_build_forward_expand(gf, experts);
+            std::function<void()> hook;
+            hook.swap(moe_before_weighting);
+            hook();
+        }
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
     }

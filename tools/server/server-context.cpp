@@ -383,6 +383,9 @@ struct server_slot {
     std::mt19937 spec_draft_rng;
     std::mt19937 spec_verify_rng;
 
+    // strixllama: where the prompt chunk starts whose per-layer-embedding rows the last step announced (-1: none)
+    int64_t ple_announced = -1;
+
     // strixllama: the length of the last prompt the slot processed, less a last token the next request re-renders (a
     // thinking prompt's, see think_tail); 0: none since it was cleared or loaded. The answer after it is the
     // conversation's main line only once the next request continues it (n_mainline)
@@ -844,6 +847,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        ple_announced  = -1;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -4587,6 +4591,8 @@ private:
                 n_batch_prompt = std::min<int32_t>(n_batch, batch.size() + budget);
             }
         }
+        // strixllama: the prompt tokens a step takes, which the next step's per-layer-embedding pregather expects
+        const int32_t n_prompt_step = std::max<int32_t>(1, n_batch_prompt - batch.size());
 
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
@@ -5263,12 +5269,37 @@ private:
 
                     // strixllama: while this batch is on the GPU, gather what the next one needs from disk - the
                     // model's per-layer-embedding rows, ~0.2-0.7 s a batch otherwise spent before its compute. The
-                    // n-gram lookups reach back two tokens, so those come along as context.
+                    // n-gram lookups reach back two tokens, so those come along as context. The next chunk is as long
+                    // as this step's: n_batch alone, the prefill budget while others generate (it then follows their
+                    // tokens in the batch, which the reader allows for). Chunks under 4096 tokens used to gather for
+                    // themselves - every 2048-token chunk beside generating conversations, the last chunk of a prompt.
+                    // This chunk's own rows, when the step before did not announce them (a prompt's first chunk): read
+                    // now, on a thread of their own, so the reads overlap the rest of the step's preparation and the
+                    // graph build; the batch's gather waits for them
+                    {
+                        const int64_t cur_end = slot.prompt.n_tokens();
+                        const int64_t cur_beg = cur_end - (int64_t) (batch.size() - n_tokens_prev);
+                        if (cur_end - cur_beg >= 64 && cur_beg != slot.ple_announced) {
+                            const int64_t beg = std::max<int64_t>(0, cur_beg - 2);
+                            std::vector<llama_token> toks;
+                            toks.reserve(cur_end - beg);
+                            bool media = false;
+                            for (int64_t i = beg; i < cur_end && !media; ++i) {
+                                const llama_token t = input_tokens[i];
+                                media = t == LLAMA_TOKEN_NULL;
+                                toks.push_back(t);
+                            }
+                            if (!media) {
+                                llama_strix_pregather_now(ctx_tgt, toks.data(), (int32_t) toks.size(), (int32_t) (cur_beg - beg));
+                            }
+                        }
+                        slot.ple_announced = -1;
+                    }
                     if (slot.prompt.n_tokens() < slot.task->n_tokens()) {
                         const int64_t nxt = slot.prompt.n_tokens();
-                        const int64_t end = std::min<int64_t>(slot.task->n_tokens(), nxt + n_batch);
+                        const int64_t end = std::min<int64_t>(slot.task->n_tokens(), nxt + n_prompt_step);
                         const int64_t beg = std::max<int64_t>(0, nxt - 2);
-                        if (end - nxt >= 4096) {
+                        if (end - nxt >= 64) {
                             std::vector<llama_token> toks;
                             toks.reserve(end - beg);
                             bool media = false;
@@ -5281,6 +5312,7 @@ private:
                             }
                             if (!media) {                   // a batch with an image in it gathers for itself
                                 llama_strix_prefetch(ctx_tgt, toks.data(), (int32_t) toks.size(), (int32_t) (nxt - beg));
+                                slot.ple_announced = nxt;
                             }
                         }
                     }
