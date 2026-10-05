@@ -4427,7 +4427,7 @@ static void ggml_cuda_hc_xres_plan(const ggml_cgraph * graph, const int last, gg
         return;
     }
     bool formed = false;
-    int nread = 0;
+    int nread = 0, last_read = last;
     for (int n = last + 1; n < graph->n_nodes; ++n) {
         const ggml_tensor * t = graph->nodes[n];
         bool reads = false;
@@ -4438,6 +4438,7 @@ static void ggml_cuda_hc_xres_plan(const ggml_cgraph * graph, const int last, gg
             continue;
         }
         ++nread;
+        last_read = n;
         if (g_hc_inject.node == t) {
             continue;                       // the inject, folded into the combine
         }
@@ -4460,6 +4461,23 @@ static void ggml_cuda_hc_xres_plan(const ggml_cgraph * graph, const int last, gg
     }
     if (nread == 0) {
         return;
+    }
+    if (formed) {
+        // The mix then reads the combine's residual output, which the graph does not list among its inputs: it must
+        // stay allocated until the mix has run - read again later (the next combine) or kept as an output. The last
+        // layer's residual has neither, and the head's own down projection could be allocated over it: issue #7,
+        // llama-perplexity at -ub 512 / 2048 read the first 64 rows of it overwritten by that GEMM's output
+        const ggml_tensor * r = args.out_res->view_src ? args.out_res->view_src : args.out_res;
+        bool alive = (r->flags & GGML_TENSOR_FLAG_OUTPUT) != 0;
+        for (int n = last_read + 1; n < graph->n_nodes && !alive; ++n) {
+            const ggml_tensor * t = graph->nodes[n];
+            for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
+                if (t->src[s] == r || t->src[s]->view_src == r) { alive = true; break; }
+            }
+        }
+        if (!alive) {
+            return;                         // the F32 streams stay
+        }
     }
     args.store_xn_f32 = false;
     if (formed) {

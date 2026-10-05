@@ -5210,13 +5210,18 @@ static bool init_recorded_ids(ggml_tensor * t, int n_mats) {
         return false;
     }
     static size_t turn = 0;
-    const std::vector<int> & v = *cand[turn++ % cand.size()];
+    // strixllama MOE_GLU_KQ: STRIX_MOE_IDS_LINE pins which matching line every call replays. The turn
+    // counter walks the list, so a run whose iteration count differs averages a different set of layers
+    // and the case's time moves with the set (iq3_s at 8156 tokens read 20.2 and 25.2 ms this way).
+    static const int pin = getenv("STRIX_MOE_IDS_LINE") ? atoi(getenv("STRIX_MOE_IDS_LINE")) : -1;
+    const size_t idx = pin >= 0 ? (size_t) pin % cand.size() : turn++;
+    const std::vector<int> & v = *cand[idx];
     const int n_used = (int) (v[0] / n);
     std::vector<int32_t> pool;
     for (int e = 0; e < n_mats; e++) {
         pool.insert(pool.end(), v[2 + e], e);
     }
-    std::default_random_engine rng(1234 + (unsigned) turn);
+    std::default_random_engine rng(1234 + (unsigned) idx);
     std::shuffle(pool.begin(), pool.end(), rng);
     std::vector<int32_t> data(t->ne[0]);
     for (int64_t r = 0; r < n; r++) {
@@ -11321,8 +11326,70 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
 // Test cases for performance evaluation: should be representative of real-world use cases
+// strixllama MOE_GLU_KQ: the delta net's gated output norm as qwen4exp builds it (build_norm_gated:
+// RMS_NORM, MUL(w), SIGMOID(z), MUL), which is the pattern ggml_cuda_norm_gated_match_at fuses into one
+// rms_rows_f32 launch with the gate on. -o NORM_GATED selects it. The bare RMS_NORM cases are a
+// different instantiation (<false,false> against <true>) and read fewer bytes, so this is the one that
+// compares with the model's node.
+struct test_norm_gated : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const bool producer;   // build z with a MUL_MAT ahead of it, as build_norm_gated's z_2d is
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "NORM_GATED"; }
+    bool run_whole_graph() override { return true; }
+    std::string vars() override { return VARS_TO_STR3(ne, eps, producer); }
+
+    test_norm_gated(std::array<int64_t, 4> ne = {128, 48, 2048, 1}, float eps = 1e-6f, bool producer = false)
+        : ne(ne), eps(eps), producer(producer) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_tensor * z;
+        ggml_set_param(x); ggml_set_name(x, "x");
+        ggml_set_param(w); ggml_set_name(w, "w");
+        if (producer) {
+            ggml_tensor * wz = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 2560, ne[0]*ne[1]);
+            ggml_tensor * xs = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2560, ne[2]);
+            ggml_set_param(wz); ggml_set_name(wz, "wz");
+            ggml_set_param(xs); ggml_set_name(xs, "xs");
+            z = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, wz, xs), ne[0], ne[1], ne[2], ne[3]);
+        } else {
+            z = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            ggml_set_param(z); ggml_set_name(z, "z");
+        }
+        ggml_tensor * normalized = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
+        ggml_tensor * out = ggml_mul(ctx, normalized, ggml_sigmoid(ctx, z));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // strixllama MOE_GLU_KQ: the narrow-row norms of a prompt's pass, one case a shape. The delta net
+    // norms q and k as 16 groups x T rows of 128, and its output norm as 48 of 128 (inner_size 6144).
+    // A bare RMS_NORM of F32 takes ggml_cuda_rms_rows_plain (norm-gated.cu), one warp a row.
+    // STRIX_NORM_PERF=2048 or a token list.
+    if (const char * norm = getenv("STRIX_NORM_PERF")) {
+        std::vector<int> ns = {2048};
+        if (strchr(norm, ',') || atoi(norm) > 1) {
+            ns.clear();
+            for (const char * c = norm; *c; ) { ns.push_back(atoi(c)); c = strchr(c, ','); if (!c) break; ++c; }
+        }
+        for (int n : ns) {
+            for (const std::array<int64_t, 4> sh : {std::array<int64_t, 4>{128, 48, n, 1},
+                                                    std::array<int64_t, 4>{128, 16, n, 1},
+                                                    std::array<int64_t, 4>{256, 24, n, 1}}) {
+                test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, sh));
+                test_cases.emplace_back(new test_norm_gated(sh));
+                test_cases.emplace_back(new test_norm_gated(sh, 1e-6f, true));
+            }
+        }
+        return test_cases;
+    }
 
     // strixllama: this model's expert matmuls (Qwen3.8-Flash-Next UD-IQ4_XS: 512 experts, 10 used,
     // n_embd 2560, n_ff_exp 640; gate/up IQ3_S, down IQ4_NL) at decode-sized batches, plus the same
@@ -11383,15 +11450,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             ns.clear();
             for (const char * c = glu; *c; ) { ns.push_back(atoi(c)); c = strchr(c, ','); if (!c) break; ++c; }
         }
+        // strixllama MOE_GLU_KQ: UD-Q4_K_XL's expert types too - Q4_K gate/up (the fused GLU, glu3 WQ 12) and
+        // Q5_1 down (the routed plain kernel, WTYPE 4). STRIX_MOE_GLU_TYPES=all still means every type; a list
+        // names them: iq3_s iq4_nl iq4_xs q4_k q5_1 q8_0. dflt is the type each loop includes with no list set.
         const char * types = getenv("STRIX_MOE_GLU_TYPES");   // "iq3_s" by default; "all" adds the others
         const bool all = types && strcmp(types, "all") == 0;
+        auto wanted = [&](ggml_type t, const char * dflt) {
+            const char * key = t == GGML_TYPE_Q4_K ? "q4_k" : ggml_type_name(t);
+            if (all) return true;
+            if (!types || !*types) return strcmp(ggml_type_name(t), dflt) == 0;
+            return strstr(types, key) != nullptr;
+        };
         for (int n : ns) {
-            for (ggml_type t : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
-                if (t != GGML_TYPE_IQ3_S && !all) continue;
+            for (ggml_type t : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K}) {
+                if (!wanted(t, "iq3_s")) continue;
                 test_cases.emplace_back(new test_moe_glu(t, 512, 10, 640, n, 2560));
             }
-            for (ggml_type t : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0}) {
-                if (t != GGML_TYPE_IQ4_NL && !all) continue;
+            for (ggml_type t : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+                if (!wanted(t, "iq4_nl")) continue;
                 test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));   // down
             }
         }

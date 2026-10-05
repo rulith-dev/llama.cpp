@@ -145,7 +145,9 @@ int ggml_cuda_norm_scale_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_n
 
 void ggml_cuda_op_norm_scale(ggml_backend_cuda_context & ctx, const ggml_cuda_norm_scale_match & m) {
     const ggml_tensor * x = m.x;
-    static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "NORM_ROWS+SCALE fused: ncols=%d rows=%lld\n", (int) x->ne[0], (long long) (x->ne[1]*x->ne[2]*x->ne[3]));
+    // strixllama MOE_GLU_KQ: the strides too - a view's nb[1]/nb[2] decide this kernel's coalescing and
+    // neither matcher checks them (only x->nb[0])
+    static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "NORM_ROWS+SCALE fused: ncols=%d rows=%lld strides=%lld/%lld nb0=%lld\n", (int) x->ne[0], (long long) (x->ne[1]*x->ne[2]*x->ne[3]), (long long) (x->nb[1]/4), (long long) (x->nb[2]/4), (long long) (x->nb[0]/4));
     const int64_t total = x->ne[1] * x->ne[2] * x->ne[3];
     const dim3 grid((unsigned) ((total + 7) / 8)), block(256);
     const ggml_cuda_kernel_launch_params lp(grid, block, 0, ctx.stream());
@@ -156,7 +158,7 @@ void ggml_cuda_op_norm_scale(ggml_backend_cuda_context & ctx, const ggml_cuda_no
 
 void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_norm_gated_match & m) {
     const ggml_tensor * x = m.x;
-    static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "NORM_ROWS%s fused: ncols=%d rows=%lld\n", m.z ? "+GATE" : "", (int) x->ne[0], (long long) (x->ne[1]*x->ne[2]*x->ne[3]));
+    static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "NORM_ROWS%s fused: ncols=%d rows=%lld strides=%lld/%lld nb0=%lld xbuf=%s wbuf=%s\n", m.z ? "+GATE" : "", (int) x->ne[0], (long long) (x->ne[1]*x->ne[2]*x->ne[3]), (long long) (x->nb[1]/4), (long long) (x->nb[2]/4), (long long) (x->nb[0]/4), ggml_backend_buffer_name(x->buffer), m.w ? ggml_backend_buffer_name(m.w->buffer) : "-");
     const int64_t total = x->ne[1] * x->ne[2] * x->ne[3];
     const dim3 grid((unsigned) ((total + 7) / 8)), block(256);
     const ggml_cuda_kernel_launch_params lp(grid, block, 0, ctx.stream());
