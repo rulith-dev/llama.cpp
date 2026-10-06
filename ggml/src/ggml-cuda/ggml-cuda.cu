@@ -6,6 +6,9 @@
 #include "norm-gated.cuh"
 #include "expand.cuh"
 #include <array>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 #include "hc-cn.cuh"
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
@@ -3175,12 +3178,53 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// strixllama: a stream's wait by polling host memory instead of hipStreamSynchronize (STRIX_POLL_SYNC; 0: the runtime's
+// sync; ab: by the side of the in-run A/B). On Windows the runtime reports a 2000-node graph done ~0.65 ms after its last
+// kernel has finished, and the last batch of a launch is not submitted until the host synchronizes or queries
+// (ROCm/TheRock#8786). So the stream's end writes a sequence number into fine-grained host memory, an event is recorded
+// and queried once (which submits what the launch left batched), and the host polls the number. Past 100 ms (a prefill
+// ubatch) the runtime's sync takes over: a spinning core buys nothing there, and that sync also reports a fault the poll
+// cannot see. A stream nothing has gone into since it was last seen done is not waited for at all: the scheduler
+// synchronizes before every input it copies, and a poll's round trip each time (or the runtime's sync, still behind on
+// a stream the poll saw done) cost more than the poll saves. So every way work enters a stream marks it (strix_poll_dirty):
+// the graph, the async copies, an event wait.
+static int strix_poll_sync_mode() {
+    static const int m = [] {
+        const char * e = getenv("STRIX_POLL_SYNC");
+        return !e ? 1 : strcmp(e, "ab") == 0 ? 2 : atoi(e) != 0 ? 1 : 0;
+    }();
+    return m;
+}
+
+struct strix_poll_state {
+    unsigned long long * host  = nullptr;  // fine-grained host memory: the GPU's write needs no flush to be seen
+    unsigned long long * dev   = nullptr;
+    unsigned long long   seq   = 0;
+    cudaEvent_t          ev    = nullptr;
+    bool                 ok    = true;
+    bool                 dirty = true;     // work went in since the stream was last seen done
+};
+
+static strix_poll_state * strix_poll_get(cudaStream_t stream) {
+    static std::mutex mtx;
+    static std::unordered_map<cudaStream_t, strix_poll_state> states;
+    std::lock_guard<std::mutex> lock(mtx);
+    return &states[stream];
+}
+
+static void strix_poll_dirty(cudaStream_t stream) {
+    if (strix_poll_sync_mode() != 0) {
+        strix_poll_get(stream)->dirty = true;
+    }
+}
+
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    strix_poll_dirty(cuda_ctx->stream());
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -3190,6 +3234,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    strix_poll_dirty(cuda_ctx->stream());
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
@@ -3200,6 +3245,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    strix_poll_dirty(cuda_ctx->stream());
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -3211,6 +3257,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    strix_poll_dirty(cuda_ctx->stream());
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
@@ -3230,6 +3277,8 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     // device -> device copy
     ggml_backend_cuda_context * cuda_ctx_src = (ggml_backend_cuda_context *) backend_src->context;
     ggml_backend_cuda_context * cuda_ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
+    strix_poll_dirty(cuda_ctx_src->stream());
+    strix_poll_dirty(cuda_ctx_dst->stream());
 
     ggml_backend_cuda_buffer_context * buf_ctx_src = (ggml_backend_cuda_buffer_context *) buf_src->context;
     ggml_backend_cuda_buffer_context * buf_ctx_dst = (ggml_backend_cuda_buffer_context *) buf_dst->context;
@@ -3274,9 +3323,67 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     return true;
 }
 
+#if defined(GGML_USE_HIP)
+static __global__ void strix_poll_mark(unsigned long long * flag, unsigned long long seq) {
+    __threadfence_system();
+    *(volatile unsigned long long *) flag = seq;
+}
+
+// true when the stream's work is done; false: wait with the runtime's sync instead
+static bool strix_poll_wait(cudaStream_t stream, strix_poll_state * st) {
+    if (!st->ok) {
+        return false;
+    }
+    if (st->host == nullptr) {
+        st->ok = hipHostMalloc((void **) &st->host, 64, hipHostMallocCoherent | hipHostMallocMapped) == hipSuccess &&
+                 hipHostGetDevicePointer((void **) &st->dev, st->host, 0) == hipSuccess &&
+                 hipEventCreateWithFlags(&st->ev, hipEventDisableTiming) == hipSuccess;
+        (void) hipGetLastError();
+        if (!st->ok) {
+            GGML_LOG_WARN("%s: no fine-grained host memory to poll, the runtime's sync waits instead\n", __func__);
+            return false;
+        }
+        *(volatile unsigned long long *) st->host = 0;
+    }
+    const unsigned long long seq = ++st->seq;
+    strix_poll_mark<<<1, 1, 0, stream>>>(st->dev, seq);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(hipEventRecord(st->ev, stream));
+    (void) hipEventQuery(st->ev);
+    (void) hipGetLastError();                   // hipErrorNotReady, which a later check must not take for a failure
+    const volatile unsigned long long * h = st->host;
+    const int64_t t0 = ggml_time_us();
+    for (uint32_t i = 1; *h < seq; ++i) {
+#if defined(__x86_64__) || defined(_M_X64)
+        _mm_pause();
+#endif
+        if ((i & 4095) == 0 && ggml_time_us() - t0 > 100000) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif // defined(GGML_USE_HIP)
+
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    const int mode = strix_poll_sync_mode();
+    if (mode != 0) {
+        strix_poll_state * st = strix_poll_get(cuda_ctx->stream());
+        if (!st->dirty) {
+            return;                             // nothing went in since the stream was last seen done
+        }
+#if defined(GGML_USE_HIP)
+        if ((mode == 1 || ggml_cuda_strix_ab()) && strix_poll_wait(cuda_ctx->stream(), st)) {
+            st->dirty = false;
+            return;
+        }
+#endif
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        st->dirty = false;
+        return;
+    }
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 
     GGML_UNUSED(backend);
@@ -6446,6 +6553,31 @@ static void strix_ab_step(const ggml_cgraph * cgraph) {
     if (every <= 0 || cgraph->n_nodes < 64 || ggml_nrows(cgraph->nodes[0]) >= 64) {
         return;
     }
+    // the wall time from one decode graph's compute to the next, by side (a whole step for one conversation without
+    // MTP: host work, launch, GPU, wait); steps right after a flip (graphs captured anew) and gaps over 1 s (idle
+    // between requests) are left out. Medians every 256 steps a side
+    {
+        static int64_t prev = 0;
+        static int prev_side = -1;
+        static std::vector<double> per_side[2];
+        const int64_t now = ggml_time_us();
+        if (prev && prev_side == g_strix_ab && g_strix_ab_since >= 2 && now - prev < 1000000) {
+            per_side[g_strix_ab].push_back((now - prev) / 1000.0);
+            if (per_side[0].size() >= 256 && per_side[1].size() >= 256) {
+                double med[2];
+                for (int s = 0; s < 2; ++s) {
+                    std::sort(per_side[s].begin(), per_side[s].end());
+                    med[s] = per_side[s][per_side[s].size() / 2];
+                }
+                fprintf(stderr, "STRIX_AB step: A %.3f ms, B %.3f ms (B - A %+.3f ms, medians of %zu / %zu decode graphs)\n",
+                        med[0], med[1], med[1] - med[0], per_side[0].size(), per_side[1].size());
+                per_side[0].clear();
+                per_side[1].clear();
+            }
+        }
+        prev = now;
+        prev_side = g_strix_ab;
+    }
     static int computes = 0;
     if (++computes % every == 0) {
         g_strix_ab ^= 1;
@@ -6468,6 +6600,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    strix_poll_dirty(cuda_ctx->stream());
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -6571,6 +6704,7 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     if (ggml_backend_is_cuda(backend)) {
+        strix_poll_dirty(cuda_ctx->stream());
         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t)event->context, 0));
     } else {
 #if 0
