@@ -1316,6 +1316,32 @@ static void * ggml_cuda_host_malloc(size_t size) {
     return ptr;
 }
 
+// strixllama: an integrated GPU computes on tensors in its host buffers in place (supports_buft), so quantized weights
+// there need what a device buffer gives them: rows padded to MATRIX_ROW_PADDING, the padding zeroed. MMQ reads each
+// matrix's last row that far; without it, with experts in system memory (-ot ...=ROCm_Host), the 640-wide down experts
+// read the next tensor's bytes as block scales and every batch MMQ took (17 tokens up) came out NaN
+static size_t ggml_backend_cuda_host_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    size_t size = ggml_nbytes(tensor);
+    if (ggml_is_quantized(tensor->type) && tensor->ne[0] % MATRIX_ROW_PADDING != 0) {
+        size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - tensor->ne[0] % MATRIX_ROW_PADDING);
+    }
+    return size;
+
+    GGML_UNUSED(buft);
+}
+
+static enum ggml_status ggml_backend_cuda_host_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    if (tensor->view_src == nullptr && ggml_is_quantized(tensor->type) &&
+            ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        const size_t original_size = ggml_nbytes(tensor);
+        const size_t padded_size   = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
+        if (padded_size > original_size) {
+            memset((char *) tensor->data + original_size, 0, padded_size - original_size);
+        }
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
 static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     void * ptr = ggml_cuda_host_malloc(size);
 
@@ -1327,6 +1353,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
     buffer->buft = buft;
     buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer;
+    buffer->iface.init_tensor = ggml_backend_cuda_host_buffer_init_tensor;
 
     return buffer;
 }
@@ -1338,7 +1365,7 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
             /* .alloc_buffer     = */ ggml_backend_cuda_host_buffer_type_alloc_buffer,
             /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
             /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
-            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+            /* .get_alloc_size   = */ ggml_backend_cuda_host_buffer_type_get_alloc_size,
             /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
         },
         /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), 0),

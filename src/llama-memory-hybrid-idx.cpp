@@ -435,6 +435,45 @@ static bool hybrid_idx_ubatch_pos_dup(const llama_ubatch & ubatch) {
     return false;
 }
 
+// strixllama: the cells the dense inputs of this batch span. Under regions the graph views only the run of cells that
+// holds the batch's own conversations (llama_kv_cache::get_kv_window), so that run plus the new tokens - not the pool up
+// to its last used cell - is what the bound below has to cover. Sizing it by the pool made one conversation's ubatch
+// split, and with it its greedy output, depend on what the other slots held and had held.
+static uint64_t hybrid_idx_dense_n_kv(const llama_kv_cache & kv, const llama_batch & batch) {
+    const auto & cells = kv.get_cells(0);
+    const uint64_t pool = (uint64_t) cells.used_max_p1() + batch.n_tokens;
+
+    static const bool window = [] {
+        const char * e = getenv("LLAMA_KV_WINDOW");
+        return !e || atoi(e) != 0;
+    }();
+    if (!window || !kv.get_regions()) {
+        return pool;
+    }
+
+    std::bitset<LLAMA_MAX_SEQ> seen;
+    int64_t lo = INT64_MAX;
+    int64_t hi = -1;
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        for (int32_t k = 0; k < batch.n_seq_id[i]; ++k) {
+            const llama_seq_id s = batch.seq_id[i][k];
+            if (s < 0 || s >= LLAMA_MAX_SEQ || seen.test(s)) {
+                continue;
+            }
+            seen.set(s);
+            const int64_t c0 = cells.seq_cell_min(s);
+            if (c0 >= 0) {
+                lo = std::min(lo, c0);
+                hi = std::max(hi, cells.seq_cell_max(s) + 1);
+            }
+        }
+    }
+
+    // the window is padded to 256 cells (get_kv_window)
+    const uint64_t own = (hi > lo ? (uint64_t) (hi - lo) : 0) + batch.n_tokens + 256;
+    return std::min(pool, own);
+}
+
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // strixllama: once a conversation holds an image (or a position gap, kb_dup), its ubatches take the dense
     // sparse-attention inputs - a KQ mask and a per-block bias over n_kv x n_tokens, ~6.6 bytes a pair staged in
@@ -450,7 +489,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
             const char * e = getenv("STRIX_DENSE_UBATCH_BUDGET");
             return e ? (uint64_t) strtoull(e, nullptr, 10) : (uint64_t) 1 << 27;
         }();
-        const uint64_t n_kv = (uint64_t) get_mem_attn()->get_cells(0).used_max_p1() + balloc.get_n_tokens();
+        const uint64_t n_kv = hybrid_idx_dense_n_kv(*get_mem_attn(), balloc.get_batch());
         if (budget > 0 && n_kv > 0) {
             const uint32_t cap = (uint32_t) std::max<uint64_t>(256, budget / n_kv / 256 * 256);
             if (cap < n_ubatch) {
