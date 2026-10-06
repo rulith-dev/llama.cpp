@@ -1705,6 +1705,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             splits[i] = free;
         }
+        // every device full by its own count (an iGPU counts pinned host buffers against its memory): the
+        // split points would be 0/0 and every layer would index past the device list, so split evenly
+        if (std::all_of(splits.begin(), splits.end(), [](float x) { return x == 0.0f; })) {
+            std::fill(splits.begin(), splits.end(), 1.0f);
+        }
     } else {
         std::copy(tensor_split, tensor_split + n_devices(), splits.begin());
     }

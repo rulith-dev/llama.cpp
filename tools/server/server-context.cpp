@@ -2233,8 +2233,9 @@ private:
     }
 
     // strixllama: a prompt whose prefix a busy slot is computing right now - sub-agents started together with one
-    // system prompt - waits until that slot is past its anchor there (the first or the last user message of its prompt,
-    // which always get a checkpoint), then copies it (copy_prefix) instead of computing it a second time alongside. The
+    // system prompt - waits until that slot is past its anchor there (the last user message of its prompt, which always
+    // gets a checkpoint, and with STRIX_CKPT_ANCHORS the first), then copies it (copy_prefix) instead of computing it a
+    // second time alongside. The
     // same GPU does the work either way: the waiting prompt starts no later, and the one it waits for finishes sooner.
     // STRIX_PREFIX_WAIT=0 turns it off.
     bool wait_for_prefix(server_task & task) {
@@ -2260,7 +2261,7 @@ private:
             const int64_t lcp = (int64_t) s.task->tokens.get_common_prefix(task.tokens);
             const auto & spans = s.task->params.message_spans;
             int64_t anchor = -1;
-            for (const int64_t p : { (int64_t) spans.first_user_message_pos(), (int64_t) spans.last_user_message_pos() }) {
+            for (const int64_t p : { ckpt_anchors() ? (int64_t) spans.first_user_message_pos() : -1, (int64_t) spans.last_user_message_pos() }) {
                 if (p > 0 && p <= lcp && p < (int64_t) task.tokens.size() && p > anchor) {
                     anchor = p;
                 }
@@ -3368,6 +3369,17 @@ private:
         return std::max<int64_t>(params_base.checkpoint_min_step, (n_prompt - pos) / 4);
     }
 
+    // strixllama: a prompt is cut only where a real turn begins - its last user message, when no checkpoint stands there
+    // yet (an edit of the message forks there). What comes before is one piece of context: its turn starts used to be
+    // anchors with a batch cut at each (the first user message, then the spaced ones), ~11 short ubatches on a 156K
+    // conversation read fresh, 3% of its prefill. Checkpoints there now come where a batch ends anyway, spaced as the
+    // anchors were, for an edit further back or a conversation forking inside the prefix. STRIX_CKPT_ANCHORS=1 brings
+    // the cuts back (0.3.2-0.4.7)
+    static bool ckpt_anchors() {
+        static const bool on = getenv("STRIX_CKPT_ANCHORS") && atoi(getenv("STRIX_CKPT_ANCHORS")) != 0;
+        return on;
+    }
+
     // strixllama: checkpoints at an answer's edges instead of prompt batches cut short near their end (STRIX_CKPT_EDGES=0:
     // the cuts at the end offsets and at the last user message, as up to 0.3.1). A regenerate, a client that drops the
     // reasoning or re-renders a tool call, an answer cut by Stop: the next prompt forks at or inside the last answer,
@@ -3493,6 +3505,13 @@ private:
         // every other task's checkpoint within min-step of the previous one, which left the first and this task's
         // only, and a second conversation with the same 10K system prompt went back to the first checkpoint
         auto & ckpts = slot.prompt.checkpoints;
+        // strixllama: nor does the one where this task's last user message starts, which an edit of the message forks
+        // from: next to the prompt's end, whose checkpoint is taken as the first token is sampled, it was the cheapest
+        // to lose by that measure and went first on any prompt long enough to fill the list (here and for the budget)
+        const int64_t n_last_user = slot.task->params.message_spans.last_user_message_pos();
+        auto last_user_ckpt = [&](const common_prompt_checkpoint & c) {
+            return n_last_user >= 0 && c.n_tokens <= n_last_user && c.n_tokens >= n_last_user - 16;
+        };
         while (!ckpts.empty() && ckpts.size() >= (size_t) params_base.n_ctx_checkpoints) {
             ckpts.sort([](const common_prompt_checkpoint & a, const common_prompt_checkpoint & b) {
                 return a.n_tokens < b.n_tokens;
@@ -3507,6 +3526,9 @@ private:
                 double v_min = 0.0;
                 for (size_t i = 1; i < at.size(); ++i) {
                     if (pass == 0 && at[i]->id_task == id_task) {
+                        continue;
+                    }
+                    if (last_user_ckpt(*at[i])) {
                         continue;
                     }
                     const int64_t n_i  = at[i]->n_tokens;
@@ -3566,7 +3588,8 @@ private:
                 for (int pass = 0; pass < 2 && victim == at.size(); ++pass) {
                     double v_min = 0.0;
                     for (size_t i = 1; i < at.size(); ++i) {
-                        if (at[i]->data_tgt.empty() || (pass == 0 && most == &slot && at[i]->id_task == id_task)) {
+                        if (at[i]->data_tgt.empty() || (pass == 0 && most == &slot && at[i]->id_task == id_task) ||
+                                (most == &slot && last_user_ckpt(*at[i]))) {
                             continue;
                         }
                         const int64_t n_i  = at[i]->n_tokens;
@@ -5172,10 +5195,11 @@ private:
 
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
-                    // strixllama: anchors, the points a later prompt forks from. The first user message is where the
-                    // system prompt ends, which every conversation that starts with it comes back to; the other turn
-                    // starts get a checkpoint when far enough from the last one, the spacing shrinking towards the
-                    // end of the prompt, where edits and regenerations land (see anchor_spacing)
+                    // strixllama: anchors (STRIX_CKPT_ANCHORS, see ckpt_anchors), the points a later prompt forks from.
+                    // The first user message is where the system prompt ends, which every conversation that starts with
+                    // it comes back to; the other turn starts get a checkpoint when far enough from the last one, the
+                    // spacing shrinking towards the end of the prompt, where edits and regenerations land (see
+                    // anchor_spacing)
                     const auto first_user_pos = spans.first_user_message_pos();
                     const int64_t n_prompt_all = slot.task->n_tokens();
                     // strixllama: the last user message starts right after the checkpoint where the answer before it
@@ -5191,9 +5215,9 @@ private:
                     const int64_t batch_start = slot.prompt.n_tokens();
                     int64_t ckpt_ref = slot.prompt.checkpoints.empty() ? -1 : slot.prompt.checkpoints.back().n_tokens;
                     if (do_checkpoint && batch_start > 0) {
-                        const bool start_anchor = spans.is_turn_start(batch_start) && (batch_start == first_user_pos ||
-                                (batch_start == last_user_pos && !last_user_covered) || ckpt_ref < 0 ||
-                                batch_start >= ckpt_ref + anchor_spacing(batch_start, n_prompt_all));
+                        const bool start_anchor = spans.is_turn_start(batch_start) && ((batch_start == last_user_pos && !last_user_covered) ||
+                                (ckpt_anchors() && (batch_start == first_user_pos || ckpt_ref < 0 ||
+                                batch_start >= ckpt_ref + anchor_spacing(batch_start, n_prompt_all))));
                         const bool start_offset = (!ckpt_edges() && (batch_start == n_prompt_all - std::min<int64_t>(n_batch, 4) ||
                                 (ubatch_offset && batch_start == n_prompt_all - std::min<int64_t>(n_batch, 4 + n_ubatch)))) ||
                                 (think_end && batch_start == n_prompt_all - 1);
@@ -5228,13 +5252,13 @@ private:
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
 
-                        // break at the anchors: the first and the last user message, and the other turn starts
-                        // far enough from the last checkpoint
+                        // break at the last user message (see ckpt_anchors); with the anchors, also at the first one
+                        // and at the other turn starts far enough from the last checkpoint
                         if (do_checkpoint && spans.is_turn_start(slot.prompt.n_tokens())) {
                             const int64_t pos = slot.prompt.n_tokens();
 
-                            if ((pos == last_user_pos && !last_user_covered) || pos == first_user_pos || ckpt_ref < 0 ||
-                                    pos >= ckpt_ref + anchor_spacing(pos, n_prompt_all)) {
+                            if ((pos == last_user_pos && !last_user_covered) || (ckpt_anchors() && (pos == first_user_pos ||
+                                    ckpt_ref < 0 || pos >= ckpt_ref + anchor_spacing(pos, n_prompt_all)))) {
                                 break;
                             }
                         }
@@ -5326,11 +5350,13 @@ private:
 
                     const bool is_user_start = spans.is_turn_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
-                    // strixllama: the batch starts at an anchor (see first_user_pos above), or at one of the offsets
-                    // before the end the loop cut it at
-                    const bool is_anchor = is_user_start && (n_tokens_start == first_user_pos || (is_last_user_message && !last_user_covered) ||
-                            slot.prompt.checkpoints.empty() ||
-                            n_tokens_start >= slot.prompt.checkpoints.back().n_tokens + anchor_spacing(n_tokens_start, n_prompt_all));
+                    // strixllama: the batch starts at the last user message the loop cut it at, or where the batch
+                    // before it ended, spaced from the last checkpoint as the anchors were (see ckpt_anchors; with them,
+                    // at an anchor), or at one of the offsets before the end
+                    const bool spaced = slot.prompt.checkpoints.empty() ||
+                            n_tokens_start >= slot.prompt.checkpoints.back().n_tokens + anchor_spacing(n_tokens_start, n_prompt_all);
+                    const bool is_anchor = (is_user_start && is_last_user_message && !last_user_covered) || (ckpt_anchors() ?
+                            is_user_start && (n_tokens_start == first_user_pos || spaced) : n_tokens_start > 0 && spaced);
                     const bool is_end_offset = (!ckpt_edges() && (n_tokens_start == n_prompt_all - std::min<int64_t>(n_batch, 4) ||
                             (ubatch_offset && n_tokens_start == n_prompt_all - std::min<int64_t>(n_batch, 4 + n_ubatch)))) ||
                             (think_end && n_tokens_start == n_prompt_all - 1);
@@ -5351,7 +5377,7 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        if (!is_user_start && !near_prompt_end && !is_anchor) {
                             do_checkpoint = false;
                         }
                     }
