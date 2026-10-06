@@ -231,6 +231,8 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_head      = nullptr;
     struct ggml_tensor * shared_head_head_s    = nullptr;
     struct ggml_tensor * shared_head_head_in_s = nullptr;
+    struct ggml_tensor * lr_proj               = nullptr; // strixllama: the draft's low-rank pre-score of the head
+    struct ggml_tensor * lr_scores             = nullptr;
     struct ggml_tensor * shared_head_norm      = nullptr;
 
     struct ggml_tensor * hc_head_norm          = nullptr;

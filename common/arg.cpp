@@ -259,6 +259,11 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
+        // strixllama: also a device's host buffer type (ROCm_Host). An integrated GPU computes on tensors in it in
+        // place, so weights can be put in system memory outside the VRAM carve
+        if (auto * host = ggml_backend_dev_host_buffer_type(dev)) {
+            buft_list[ggml_backend_buft_name(host)] = host;
+        }
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {

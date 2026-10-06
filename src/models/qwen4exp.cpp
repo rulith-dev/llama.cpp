@@ -4,6 +4,11 @@
 #include <thread>
 #include <cstdlib>
 #include "models.h"
+
+#include <cmath>
+
+// strixllama: rank of the draft head's low-rank pre-score (nextn.lr_proj / lr_scores)
+static constexpr int64_t QWEN4EXP_MTP_LR_RANK = 512;
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
@@ -316,6 +321,9 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
         layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
+        // strixllama: optional low-rank pre-score of the LM head for the draft (tools/make_draft_head.py --lowrank)
+        layer.nextn.lr_proj   = create_tensor(tn(LLM_TENSOR_NEXTN_LR_PROJ,   "weight", il), { n_embd, QWEN4EXP_MTP_LR_RANK }, flags | TENSOR_NOT_REQUIRED);
+        layer.nextn.lr_scores = create_tensor(tn(LLM_TENSOR_NEXTN_LR_SCORES, "weight", il), { QWEN4EXP_MTP_LR_RANK, n_vocab }, flags | TENSOR_NOT_REQUIRED);
     }
 }
 
@@ -881,7 +889,26 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         GGML_ASSERT(head_w && "QWEN4EXP MTP: the target model has no LM head to borrow");
     }
 
-    cur = build_lora_mm(head_w, cur, head_s);
+    // strixllama: the draft needs only the head's top tokens. With nextn.lr_proj / lr_scores in the draft file a
+    // rank-512 pre-score over the vocabulary (Q8_0, 135 MB against the 338 MB IQ4_XS head) picks STRIX_MTP_LR_K
+    // candidates, and only their rows of the head are multiplied exactly; every other token gets -inf. The draft
+    // samples from the candidates and the target verifies as before, so outputs stay the target's
+    static const int lr_k = getenv("STRIX_MTP_LR_K") ? atoi(getenv("STRIX_MTP_LR_K")) : 512;
+    const int64_t nt = cur->ne[1];
+    if (layer.nextn.lr_proj && layer.nextn.lr_scores && lr_k > 0 && head_s == nullptr && nt > 0) {
+        ggml_tensor * q   = ggml_mul_mat(ctx0, layer.nextn.lr_proj, cur);                        // [rank, nt]
+        ggml_tensor * sc  = ggml_mul_mat(ctx0, layer.nextn.lr_scores, q);                        // [n_vocab, nt]
+        cb(sc, "mtp_lr_scores", -1);
+        ggml_tensor * idx = ggml_top_k(ctx0, sc, lr_k);                                          // [K, nt]
+        ggml_tensor * rows = ggml_get_rows(ctx0, head_w, ggml_reshape_1d(ctx0, idx, lr_k * nt)); // [n_embd, K*nt]
+        rows = ggml_reshape_3d(ctx0, rows, n_embd, lr_k, nt);
+        ggml_tensor * ex  = ggml_mul_mat(ctx0, rows, ggml_reshape_3d(ctx0, cur, n_embd, 1, nt)); // [K, 1, nt]
+        ggml_tensor * full = ggml_fill(ctx0, sc, -INFINITY);
+        cur = ggml_set_rows(ctx0, ggml_reshape_3d(ctx0, full, 1, sc->ne[0], nt), ggml_reshape_3d(ctx0, ex, 1, lr_k, nt), idx);
+        cur = ggml_reshape_2d(ctx0, cur, sc->ne[0], nt);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
