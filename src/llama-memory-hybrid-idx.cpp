@@ -474,6 +474,32 @@ static uint64_t hybrid_idx_dense_n_kv(const llama_kv_cache & kv, const llama_bat
     return std::min(pool, own);
 }
 
+// strixllama (issue #13): a text ubatch of one conversation that holds images keeps the compact sparse-attention
+// inputs when every image cell of the conversation lies before the ubatch's first position: such a cell is visible to
+// every query by its position alone (the M-RoPE rule only orders cells that share the query's position), and
+// set_input_qsa ranks the cells and fills the compact metadata in that rank space, as it does for the MTP draft after
+// an image. It used to take the dense inputs for the rest of the conversation - a mask and a bias over n_kv x n_tokens
+// built on the host, its ubatch held to 2^27 cell-token pairs - and prefill after one image fell from ~1,500 to
+// ~200 t/s at 170K. STRIX_IMAGE_TEXT_COMPACT=0: the dense inputs again.
+static bool hybrid_idx_image_text_compact() {
+    static const bool on = [] {
+        const char * e = getenv("STRIX_IMAGE_TEXT_COMPACT");
+        return !e || atoi(e) != 0;
+    }();
+    return on;
+}
+
+// whether a cell of `seq` holds an image token (its 2-D position differs from its 1-D one) at or after `pmin`
+static bool hybrid_idx_image_from(const llama_kv_cells & cells, llama_seq_id seq, llama_pos pmin, uint32_t off, uint32_t n) {
+    for (uint32_t j = off; j < off + n && j < cells.size(); ++j) {
+        if (!cells.is_empty(j) && cells.seq_has(j, seq) && cells.pos_get(j) >= pmin &&
+                cells.ext_get(j).is_2d_gt(cells.pos_get(j), cells.pos_get(j))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // strixllama: once a conversation holds an image (or a position gap, kb_dup), its ubatches take the dense
     // sparse-attention inputs - a KQ mask and a per-block bias over n_kv x n_tokens, ~6.6 bytes a pair staged in
@@ -484,7 +510,26 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
     // costs it little: the same 27 images prefilled at the same rate, the append at 245 t/s instead of 261 at 2^28,
     // and the machine kept 11 GiB of RAM instead of 3. Text before any image keeps the full ubatch.
     // STRIX_DENSE_UBATCH_BUDGET sets the bound in cell-token pairs (0 = no bound).
-    if (kb_dup) {
+    // strixllama (issue #13): only batches that take the dense inputs are bound - an image (embeddings without tokens),
+    // several conversations, or text that an image cell does not wholly precede. One conversation's text after its
+    // images takes the compact inputs (qsa_scalar_visibility), and so does the MTP draft head (tokens with embeddings),
+    // whose catch-up after an image was held to the bound for nothing.
+    bool dense_batch = kb_dup;
+    if (dense_batch && hybrid_idx_image_text_compact()) {
+        const llama_batch & b = balloc.get_batch();
+        bool one_text_seq = b.token != nullptr && b.n_tokens > 0 && b.pos && b.n_seq_id && b.seq_id &&
+                b.n_seq_id[0] == 1 && b.seq_id[0][0] >= 0 && b.seq_id[0][0] < LLAMA_MAX_SEQ;
+        llama_pos pmin = one_text_seq ? b.pos[0] : 0;
+        for (int32_t i = 0; one_text_seq && i < b.n_tokens; ++i) {
+            one_text_seq = b.n_seq_id[i] == 1 && b.seq_id[i][0] == b.seq_id[0][0];
+            pmin = std::min(pmin, b.pos[i]);
+        }
+        if (one_text_seq) {
+            const auto & cells = get_mem_idx()->get_cells(b.seq_id[0][0]);
+            dense_batch = hybrid_idx_image_from(cells, b.seq_id[0][0], pmin, 0, cells.size());
+        }
+    }
+    if (dense_batch) {
         static const uint64_t budget = [] {
             const char * e = getenv("STRIX_DENSE_UBATCH_BUDGET");
             return e ? (uint64_t) strtoull(e, nullptr, 10) : (uint64_t) 1 << 27;
@@ -2117,8 +2162,15 @@ bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch &
             runs=!seqs.test(s) || cells.seq_run(s,c0,c1,p0);
         }
         const uint32_t off=get_idx()->get_kv_off();   // strixllama: the window's first cell
+        // strixllama (issue #13): an image cell before every query of this text ubatch is visible to all of them by its
+        // position alone, and set_input_qsa ranks the cells for the compact metadata; only one at or after the
+        // ubatch's first position needs the dense inputs (see hybrid_idx_image_text_compact)
+        const bool text_compact=hybrid_idx_image_text_compact();
+        llama_pos pmin=ubatch.pos[0];
+        for (uint32_t i=1;text_compact && i<ubatch.n_tokens;++i) { pmin=std::min(pmin,ubatch.pos[i]); }
         for (uint32_t j=off;!runs && j<off+get_idx()->get_n_kv();++j) {
-            if (!cells.is_empty(j) && (cells.seq_get_all(j) & seqs).any() && cells.ext_get(j).is_2d_gt(cells.pos_get(j),cells.pos_get(j))) { return false; }
+            if (!cells.is_empty(j) && (cells.seq_get_all(j) & seqs).any() && cells.ext_get(j).is_2d_gt(cells.pos_get(j),cells.pos_get(j)) &&
+                    (!text_compact || cells.pos_get(j)>=pmin)) { return false; }
         }
     }
     return true;
