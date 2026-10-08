@@ -112,6 +112,10 @@ LLAMA_API bool llama_mtp_share_ready(struct llama_context * ctx, llama_seq_id se
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 
+// strixllama: a writable row of the same width in front of the nextn rows: with it filled, (lead, rows) are the rows shifted
+// by one position, as an MTP catch-up needs them. Valid until the next decode, like the rows
+LLAMA_API float * llama_get_embeddings_nextn_lead(struct llama_context * ctx);
+
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 

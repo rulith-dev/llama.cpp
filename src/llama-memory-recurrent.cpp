@@ -14,6 +14,7 @@
 #include "llama-io.h"
 #include "llama-batch.h"
 #include "llama-model.h"
+#include "llama-context.h"
 
 #include <algorithm>
 #include <cassert>
@@ -590,8 +591,9 @@ void llama_memory_recurrent::rec_flatten(uint32_t cell) {
     }
     std::vector<float>   st;
     std::vector<uint8_t> row;
+    const bool on_device = rec_replay_device(cell, rec_pending(cell));   // the kernel's replay, else the host's
     for (int32_t il = 0; il < (int32_t) s_l.size(); ++il) {
-        if (s_l[il] != nullptr && rec_l[il] != nullptr) {
+        if (s_l[il] != nullptr && rec_l[il] != nullptr && !on_device) {
             rec_materialize(cell, il, st);
             ggml_backend_tensor_set(s_l[il], st.data(), (size_t) cell * st.size() * sizeof(float), st.size() * sizeof(float));
         }
@@ -611,6 +613,71 @@ void llama_memory_recurrent::rec_flatten(uint32_t cell) {
             rs_idx[seq] = 0;
         }
     }
+}
+
+// the backend holding the state tensors (one device for all layers) and its replay entry, or null
+typedef void (*strix_gdn_replay_fn)(ggml_backend_t, int, ggml_tensor **, ggml_tensor **, int32_t, int32_t, int32_t, int, int, int);
+
+static strix_gdn_replay_fn rec_replay_entry(llama_context * lctx, const std::vector<ggml_tensor *> & s_l, ggml_backend_t & backend) {
+    backend = nullptr;
+    if (lctx == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_sched_t sched = lctx->get_sched();
+    for (ggml_tensor * t : s_l) {
+        if (t == nullptr || t->buffer == nullptr) {
+            continue;
+        }
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+        ggml_backend_t     b   = nullptr;
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+            ggml_backend_t cand = ggml_backend_sched_get_backend(sched, i);
+            if (ggml_backend_get_device(cand) == dev) {
+                b = cand;
+                break;
+            }
+        }
+        if (b == nullptr || (backend != nullptr && b != backend)) {
+            backend = nullptr;
+            return nullptr;
+        }
+        backend = b;
+    }
+    if (backend == nullptr) {
+        return nullptr;
+    }
+    return (strix_gdn_replay_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)),
+                                                                   "ggml_backend_cuda_gdn_replay");
+}
+
+static bool rec_replay_device_off() {
+    static const bool off = getenv("STRIX_GDN_DEV_REPLAY") && atoi(getenv("STRIX_GDN_DEV_REPLAY")) == 0;
+    return off;
+}
+
+bool llama_memory_recurrent::rec_replay_device_ok() const {
+    ggml_backend_t backend = nullptr;
+    return !rec_replay_device_off() && lazy_on() && rec_replay_entry(lctx_sync, s_l, backend) != nullptr;
+}
+
+bool llama_memory_recurrent::rec_replay_device(uint32_t cell, uint32_t n_rep) const {
+    ggml_backend_t      backend = nullptr;
+    strix_gdn_replay_fn fn      = rec_replay_device_off() ? nullptr : rec_replay_entry(lctx_sync, s_l, backend);
+    if (fn == nullptr) {
+        return false;
+    }
+    std::vector<ggml_tensor *> st, rc;
+    for (size_t il = 0; il < s_l.size(); ++il) {
+        if (s_l[il] != nullptr && rec_l[il] != nullptr) {
+            st.push_back(s_l[il]);
+            rc.push_back(rec_l[il]);
+        }
+    }
+    if (!st.empty()) {
+        fn(backend, (int) st.size(), st.data(), rc.data(), (int32_t) cell, (int32_t) n_rep,
+           (int32_t) ((2 * cell + rec_set[cell]) * rec_cap), gdn_s, gdn_hv, gdn_hk);
+    }
+    return true;
 }
 
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
@@ -682,7 +749,7 @@ llama_memory_context_ptr llama_memory_recurrent::init_full() {
 }
 
 llama_memory_context_ptr llama_memory_recurrent::init_update(llama_context * lctx, bool optimize) {
-    GGML_UNUSED(lctx);
+    lctx_sync = lctx;   // strixllama: see rec_replay_device
     GGML_UNUSED(optimize);
 
     return std::make_unique<llama_memory_recurrent_context>(LLAMA_MEMORY_STATUS_NO_UPDATE);
@@ -1120,6 +1187,19 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
 
     io.write(&s_trans, sizeof(s_trans));
     io.write(&n_layer, sizeof(n_layer));
+
+    // strixllama: cells with records are flattened on the device first (one kernel a layer, bitwise the host replay
+    // below, which took ~100 ms a checkpoint at a turn's start), so what follows writes plain rows - and their conv
+    // rows from slot 0. The logical state is unchanged, hence the cast
+    if (lazy_on() && rec_replay_device_ok()) {
+        for (const auto & range : cell_ranges) {
+            for (uint32_t row = range.first; row < range.second; ++row) {
+                if (rec_n[row % size] > 0) {
+                    const_cast<llama_memory_recurrent *>(this)->rec_flatten(row % size);
+                }
+            }
+        }
+    }
 
     // Iterate and write all the R tensors first, each row is a cell
     // Get whole range at a time

@@ -992,6 +992,13 @@ float * llama_context::get_embeddings_nextn() {
     return embd_nextn.data;
 }
 
+float * llama_context::get_embeddings_nextn_lead() {
+    output_reorder();
+
+    // the spare row output_reserve keeps in front of the nextn rows (which are in batch order, as for get_embeddings_nextn)
+    return embd_nextn.data ? embd_nextn.data - model.hparams.n_embd_out() : nullptr;
+}
+
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     output_reorder();
 
@@ -2184,10 +2191,14 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         output_ids.resize(n_batch);
     }
 
+    // strixllama: one spare row in front of the nextn rows (llama_get_embeddings_nextn_lead): an MTP draft's catch-up
+    // puts the row it carries there and reads the batch's rows in place, shifted by one, instead of copying them all
+    const size_t nextn_lead = has_embd_nextn ? (size_t) n_embd_out : 0;
+
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
-        (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
-        (                                                                         backend_token_count) * sizeof(llama_token);
+        (logits.size + embd.size + nextn_lead + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
+        (                                                                                      backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -2235,6 +2246,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     embd = has_embd ? buffer_view<float>{(float *) (base + offset), embd.size} : buffer_view<float>{nullptr, 0};
     offset += embd.size * sizeof(float);
 
+    offset += nextn_lead * sizeof(float);
     embd_nextn = has_embd_nextn ? buffer_view<float>{(float *) (base + offset), embd_nextn.size} : buffer_view<float>{nullptr, 0};
     offset += embd_nextn.size * sizeof(float);
 
@@ -4099,6 +4111,12 @@ float * llama_get_embeddings_nextn(llama_context * ctx) {
     ctx->synchronize();
 
     return ctx->get_embeddings_nextn();
+}
+
+float * llama_get_embeddings_nextn_lead(llama_context * ctx) {
+    ctx->synchronize();
+
+    return ctx->get_embeddings_nextn_lead();
 }
 
 float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {

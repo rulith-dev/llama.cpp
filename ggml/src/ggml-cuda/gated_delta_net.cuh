@@ -16,3 +16,10 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
 void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                               ggml_cuda_gated_delta_net_fused_cache cache);
+
+// strixllama: the replay alone, outside a graph, for the cells a checkpoint or a seq_cp flattens (reached through
+// ggml_backend_reg_get_proc_address as "ggml_backend_cuda_gdn_replay"): row `row` of each layer's state gets its
+// n_rep pending records (from record index `first`) applied by the kernel the next batch would run, so the bits are
+// the kernel's. Synchronous
+void ggml_backend_cuda_gdn_replay(ggml_backend_t backend, int n_layer, ggml_tensor ** states, ggml_tensor ** recs,
+                                  int32_t row, int32_t n_rep, int32_t first, int S_v, int H_v, int H_k);

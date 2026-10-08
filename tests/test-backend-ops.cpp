@@ -5214,7 +5214,7 @@ static bool init_recorded_ids(ggml_tensor * t, int n_mats) {
     // counter walks the list, so a run whose iteration count differs averages a different set of layers
     // and the case's time moves with the set (iq3_s at 8156 tokens read 20.2 and 25.2 ms this way).
     static const int pin = getenv("STRIX_MOE_IDS_LINE") ? atoi(getenv("STRIX_MOE_IDS_LINE")) : -1;
-    const size_t idx = pin >= 0 ? (size_t) pin % cand.size() : turn++;
+    const size_t idx = (pin >= 0 ? (size_t) pin : turn++) % cand.size();   // strixllama: the turn wraps
     const std::vector<int> & v = *cand[idx];
     const int n_used = (int) (v[0] / n);
     std::vector<int32_t> pool;

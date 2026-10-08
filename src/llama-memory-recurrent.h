@@ -111,8 +111,16 @@ public:
     void rec_materialize(uint32_t cell, int32_t il, std::vector<float> & out) const;
 
     // the cell's state moved to its slot-0 rows (all recurrent tensors), its records and its sequences' rollback
-    // dropped: the plain net's view of it is right from then on. For cells two sequences share (seq_cp)
+    // dropped: the plain net's view of it is right from then on. For cells two sequences share (seq_cp), and for
+    // the cells a checkpoint writes
     void rec_flatten(uint32_t cell);
+
+    // the replay of a cell's n_rep pending records on the device, by the kernel the next batch would run (bitwise
+    // the host replay): its rows then hold the plain net's state. Needs the context's backends (init_update) and
+    // a backend with the entry; false otherwise, and the host replays. STRIX_GDN_DEV_REPLAY=0: off
+    bool rec_replay_device(uint32_t cell, uint32_t n_rep) const;
+    bool rec_replay_device_ok() const;
+    llama_context * lctx_sync = nullptr;
 
     // computed before each graph build
     uint32_t n = 0;

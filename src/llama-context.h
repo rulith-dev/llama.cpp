@@ -86,6 +86,7 @@ struct llama_context {
     float * get_embeddings_seq(llama_seq_id seq_id);
 
     float * get_embeddings_nextn();
+    float * get_embeddings_nextn_lead();
     float * get_embeddings_nextn_ith(int32_t i);
 
     float * get_embeddings_layer_inp(uint32_t lid);

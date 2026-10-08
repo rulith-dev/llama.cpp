@@ -1525,6 +1525,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        // strixllama DEV: STRIX_MTP_PROC_TIMING=1, where a prompt batch's catch-up spends its time
+        static const bool proc_timing = getenv("STRIX_MTP_PROC_TIMING") && atoi(getenv("STRIX_MTP_PROC_TIMING")) != 0;
+        int64_t pt[6] = { ggml_time_us(), 0, 0, 0, 0, 0 };
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
             common_batch_clear(batch);
@@ -1532,20 +1536,38 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             for (int k = 0; k < n_tokens; ++k) {
                 common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
             }
+            pt[1] = ggml_time_us();
 
             // shift the tgt embeddings to the right by one position
             // assumes that the tokens in the batch are sequential for each sequence
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
+            // strixllama: a batch of one sequence reads the target's rows in place: the row it carries goes into the
+            // spare row in front of them (llama_get_embeddings_nextn_lead), and (lead, rows) is the shifted copy the
+            // memcpy made - 335 MB and 11-30 ms a prompt batch of 8192 tokens. Several sequences keep the copy: each one's
+            // first row would have to overwrite the row before it, which the next sequence still needs
+            float * embd = batch.embd;
             {
+                int n_seq_in = 0;
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    n_seq_in += i_batch_beg[seq_id] >= 0;
+                }
                 const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+                pt[2] = ggml_time_us();
+                static const bool inplace = !getenv("STRIX_MTP_INPLACE") || atoi(getenv("STRIX_MTP_INPLACE")) != 0;
+                float * lead = inplace && n_seq_in == 1 && !chain_heads ? llama_get_embeddings_nextn_lead(ctx_tgt) : nullptr;
+                if (lead != nullptr && lead + n_embd == h_tgt) {
+                    embd = lead;
+                } else {
+                    std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+                }
             }
+            pt[3] = ggml_time_us();
 
             // fill the pending embeddings from a previous run
             auto set_h = [&](int idx, const float * h_row) {
-                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
+                std::memcpy(embd + (size_t) idx * n_embd, h_row, row_bytes);
             };
 
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1556,9 +1578,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (pending_pos[seq_id] >= 0 && pending_pos[seq_id] == batch_in.pos[i_batch_beg[seq_id]] - 1) {
                     set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
                 } else {
-                    std::memset(batch.embd + (size_t) i_batch_beg[seq_id] * n_embd, 0, row_bytes);
+                    std::memset(embd + (size_t) i_batch_beg[seq_id] * n_embd, 0, row_bytes);
                 }
             }
+            llama_batch batch_dft = batch;
+            batch_dft.embd = embd;
 
             auto * mem_dft = llama_get_memory(ctx_dft);
 
@@ -1575,7 +1599,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_decode(ctx_dft, batch);
+                const int32_t rc = llama_decode(ctx_dft, batch_dft);
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
@@ -1591,25 +1615,37 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 return false;
             }
         }
+        pt[4] = ggml_time_us();
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
                 continue;
             }
 
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            // strixllama: a verify keeps every row for accept(), which carries the row of the last accepted token; a
+            // prompt chunk (more rows than any verify has) keeps its last: nothing accepts into it, and copying all of
+            // them cost 22-46 ms a batch of 8192
+            const int32_t n_rows_all = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            static const bool last_only = !getenv("STRIX_MTP_INPLACE") || atoi(getenv("STRIX_MTP_INPLACE")) != 0;
+            const int32_t i_first    = last_only && n_rows_all > 64 ? n_rows_all - 1 : 0;
+            const int32_t n_rows     = n_rows_all - i_first;
             verify_h_rows[seq_id] = n_rows;
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i_first + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
             pending_pos[seq_id] = batch_in.pos[i_batch_end[seq_id]];
-            verify_pos0[seq_id] = batch_in.pos[i_batch_beg[seq_id]];
+            verify_pos0[seq_id] = batch_in.pos[i_batch_beg[seq_id] + i_first];
+        }
+        pt[5] = ggml_time_us();
+        if (proc_timing && n_tokens >= 512) {
+            fprintf(stderr, "MTP_PROC n=%d batch_add=%.1f get_h=%.1f shift=%.1f dft_decode=%.1f verify_copy=%.1f ms\n", n_tokens,
+                    (pt[1] - pt[0]) / 1e3, (pt[2] - pt[1]) / 1e3, (pt[3] - pt[2]) / 1e3, (pt[4] - pt[3]) / 1e3, (pt[5] - pt[4]) / 1e3);
         }
 
         return true;

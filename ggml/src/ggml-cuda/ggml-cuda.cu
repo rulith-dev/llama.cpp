@@ -1951,7 +1951,8 @@ static bool ggml_cuda_small_k(ggml_backend_cuda_context & ctx, const ggml_tensor
     return true;
 }
 
-static bool ggml_cuda_skinny_f32(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+// strixllama: whether ggml_cuda_skinny_f32 takes this product (and, with narrow, whether it hands it to the narrow WMMA kernel)
+static bool ggml_cuda_skinny_f32_ok(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, bool * narrow) {
     static const bool on = !getenv("STRIX_SKINNY_F32") || atoi(getenv("STRIX_SKINNY_F32")) != 0;
     const int64_t K = src0->ne[0], M = src0->ne[1], T = src1->ne[1];
     if (!on || src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
@@ -1962,7 +1963,17 @@ static bool ggml_cuda_skinny_f32(ggml_backend_cuda_context & ctx, const ggml_ten
             ggml_cuda_info().devices[ctx.device].warp_size != 32) {
         return false;
     }
-    if (M > 8 || (M != 1 && M != 2 && M != 4 && M != 8)) {
+    if (narrow) { *narrow = M > 8 || (M != 1 && M != 2 && M != 4 && M != 8); }
+    return true;
+}
+
+static bool ggml_cuda_skinny_f32(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    bool narrow = false;
+    if (!ggml_cuda_skinny_f32_ok(ctx, src0, src1, dst, &narrow)) {
+        return false;
+    }
+    const int64_t K = src0->ne[0], M = src0->ne[1], T = src1->ne[1];
+    if (narrow) {
         return ggml_cuda_mmb_f32_narrow(ctx, src0, src1, dst);
     }
     const int64_t sw = src0->nb[1] / sizeof(float), sx = src1->nb[1] / sizeof(float), sd = dst->nb[1] / sizeof(float);
@@ -5213,6 +5224,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_norm_gated_match nm;
         int sk = ggml_cuda_norm_gated_match_at(cgraph, i, nm);
         if (sk > 0) {
+            // strixllama: the gate GEMM's only reader is this norm - run them as one kernel, z never written (mmb.cu)
+            if (nm.pre >= 0 && ggml_node_has_n_uses(cgraph, nm.pre, 1) && (nm.z == cgraph->nodes[nm.pre] || nm.z->view_src == cgraph->nodes[nm.pre]) &&
+                    ggml_cuda_mmb_gemm_gnorm(*cuda_ctx, cgraph->nodes[nm.pre], nm.x, nm.w, nm.eps, nm.dst)) {
+                return sk;
+            }
             if (nm.pre >= 0) { if (!ggml_cuda_compute_forward(*cuda_ctx, cgraph->nodes[nm.pre])) { GGML_ABORT("norm-gated: gate MUL_MAT dispatch failed"); } }
             ggml_cuda_op_norm_gated(*cuda_ctx, nm); return sk;
         }
@@ -5229,6 +5245,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
         if (node->op == GGML_OP_SSM_CONV && ggml_cuda_gdn_conv_match_at_conv(cgraph, i, gm)) {
             ggml_cuda_gdn_conv_direct(*cuda_ctx, gm);
+            return 1;
+        }
+    }
+
+    // strixllama: two narrow F32 products of the same activations next to each other (the GDN beta and alpha, which
+    // qwen4exp puts side by side) in one pass over them - only where each would have gone to the narrow kernel on its
+    // own, whose results these are bitwise. The second's output is not read or written between the two nodes
+    if (node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT &&
+            cgraph->nodes[i + 1]->src[1] == node->src[1] && node->src[0]->type == GGML_TYPE_F32 && cgraph->nodes[i + 1]->src[0]->type == GGML_TYPE_F32) {
+        ggml_tensor * nx = cgraph->nodes[i + 1];
+        bool n0 = false, n1 = false;
+        if (ggml_get_op_params_i32(node, 1) != GGML_HINT_SRC0_IS_HADAMARD && ggml_get_op_params_i32(nx, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+                g_hc_inject.node != node && g_hc_inject.node != nx &&
+                ggml_cuda_skinny_f32_ok(*cuda_ctx, node->src[0], node->src[1], node, &n0) && n0 &&
+                ggml_cuda_skinny_f32_ok(*cuda_ctx, nx->src[0], nx->src[1], nx, &n1) && n1 &&
+                ggml_cuda_mmb_f32_narrow_pair(*cuda_ctx, node->src[0], nx->src[0], node->src[1], node, nx)) {
             return 1;
         }
     }
@@ -6480,8 +6512,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     const size_t n_list = (size_t) atoi(getenv("STRIX_NODE_TIMING_LIST"));
                     for (size_t k = 0; k < rows.size() && k < n_list; ++k) {
                         const ggml_tensor * t = cgraph->nodes[rows[k].node];
-                        fprintf(stderr, "  LIST %4zu n%-5d %8.3f ms %-14s %-28s [%lld,%lld,%lld,%lld] %s\n", k, rows[k].node, rows[k].ms, ggml_op_name(t->op), t->name,
-                                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], ggml_type_name(t->type));
+                        const ggml_tensor * s0 = t->src[0];
+                        fprintf(stderr, "  LIST %4zu n%-5d %8.3f ms %-14s %-28s [%lld,%lld,%lld,%lld] %s src0 %s [%lld,%lld,%lld,%lld] %s\n", k, rows[k].node, rows[k].ms, ggml_op_name(t->op), t->name,
+                                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], ggml_type_name(t->type),
+                                s0 ? s0->name : "-", s0 ? (long long) s0->ne[0] : 0LL, s0 ? (long long) s0->ne[1] : 0LL, s0 ? (long long) s0->ne[2] : 0LL,
+                                s0 ? (long long) s0->ne[3] : 0LL, s0 ? ggml_type_name(s0->type) : "-");
                     }
                 }
                 std::sort(rows.begin(), rows.end(), [](const row & a, const row & b) { return a.ms > b.ms; });
@@ -6869,6 +6904,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             const ggml_tensor * t = cgraph->nodes[i];
             if (t->op == GGML_OP_MUL_MAT && (t->src[0]->type == GGML_TYPE_IQ4_NL || t->src[0]->type == GGML_TYPE_Q6_K) && ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) ggml_cuda_mmb_shadow_prepare(*cuda_ctx, t->src[0]);
+            if (t->op == GGML_OP_MUL_MAT && t->src[0]->type == GGML_TYPE_F32 && t->src[0]->ne[1] <= 64 && t->src[1]->ne[1] > 64) ggml_cuda_mmb_f16w_prepare(*cuda_ctx, t->src[0]);
         }
     }
     if (ggml_cuda_mmb_down16()) {
@@ -8251,6 +8287,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     // strixllama DEV: the side of the in-run A/B (STRIX_AB), for switches outside the backend
     if (strcmp(name, "ggml_backend_cuda_strix_ab") == 0) {
         return (void *)ggml_cuda_strix_ab;
+    }
+    // strixllama: the delta net's record replay for the memory's checkpoints and copies (gated_delta_net.cuh)
+    if (strcmp(name, "ggml_backend_cuda_gdn_replay") == 0) {
+        return (void *)ggml_backend_cuda_gdn_replay;
     }
     return nullptr;
 }

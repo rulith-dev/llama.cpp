@@ -7,6 +7,16 @@ void ggml_cuda_mul_mat_mmb   (ggml_backend_cuda_context & ctx, const ggml_tensor
 // strixllama: a narrow F32 weight (M <= 64) against any number of columns on WMMA (mmb_f32narrow_kernel); false when the
 // shapes do not fit
 bool ggml_cuda_mmb_f32_narrow(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+// strixllama: F16 copies of narrow F32 weights for the two-product mode (made before a graph runs, outside any capture),
+// and two narrow F32 weights against the same activations in one pass; false (nothing run) when it does not apply. Both
+// leave every output bitwise what ggml_cuda_mmb_f32_narrow computes
+void ggml_cuda_mmb_f16w_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w);
+// strixllama: the GEMM node gemm (z = w x) with the gated RMS norm out = norm(o) * g * sigmoid(z) that is its only reader
+// in one kernel, bitwise the two; false (nothing run) when it does not apply
+bool ggml_cuda_mmb_gemm_gnorm(ggml_backend_cuda_context & ctx, const ggml_tensor * gemm, const ggml_tensor * o, const ggml_tensor * g,
+        float eps, ggml_tensor * out);
+bool ggml_cuda_mmb_f32_narrow_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * w1, const ggml_tensor * w2, const ggml_tensor * x,
+        ggml_tensor * d1, ggml_tensor * d2);
 void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 void ggml_cuda_mmb_begin_graph();
 // producers that can emit a BF16 copy of an F32 output register it here; returns the BF16 buffer to fill (n elements)

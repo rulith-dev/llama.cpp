@@ -1064,6 +1064,35 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     ggml_cuda_op_gated_delta_net_impl(ctx, dst, nullptr);
 }
 
+#include "ggml-backend-impl.h"
+
+// strixllama: see gated_delta_net.cuh. The stream is drained first: the pool block the info goes to may still be read
+// by the last graph's kernels, and the host copy of the rows that follows runs on another stream
+void ggml_backend_cuda_gdn_replay(ggml_backend_t backend, int n_layer, ggml_tensor ** states, ggml_tensor ** recs,
+                                  int32_t row, int32_t n_rep, int32_t first, int S_v, int H_v, int H_k) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    cudaStream_t stream = ctx->stream();
+    const int warp_size = ggml_cuda_info().devices[ctx->device].warp_size;
+    GGML_ASSERT(S_v == 128 && (warp_size == 32 || warp_size == 64));
+    const bool two = warp_size == 32;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    ggml_cuda_pool_alloc<int32_t> info(ctx->pool(), 5);
+    const int32_t h_info[5] = { row, row, n_rep, first, first };
+    CUDA_CHECK(cudaMemcpy(info.get(), h_info, sizeof(h_info), cudaMemcpyHostToDevice));
+    const dim3 grid(H_v, 1, S_v / 4 / (two ? 2 : 1));
+    const dim3 block(warp_size, 4, 1);
+    const ggml_cuda_kernel_launch_params params(grid, block, 0, stream);
+    for (int il = 0; il < n_layer; ++il) {
+        ggml_cuda_kernel_launch(two ? gated_delta_net_lazy_cuda<128, true, 2> : gated_delta_net_lazy_cuda<128, true, 1>, params,
+            nullptr, nullptr, nullptr, nullptr, nullptr, (float *) states[il]->data, (float *) recs[il]->data,
+            (const int32_t *) info.get(), nullptr, (int64_t) H_v, (int64_t) H_k, (int64_t) 0, (int64_t) 0, (int64_t) 0,
+            (int64_t) 0, (int64_t) 0, (int64_t) 0, (int64_t) 0, (int64_t) 0, (int64_t) 0, (int64_t) 0,
+            init_fastdiv_values(1), 1.0f, (int64_t) recs[il]->ne[0], (int64_t) recs[il]->ne[1]);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
 void ggml_cuda_op_gated_delta_net_fused_cache(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache) {
     ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
