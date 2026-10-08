@@ -1,6 +1,9 @@
 #include "server-chat.h"
 #include "server-common.h"
 
+#include <algorithm>
+#include <map>
+#include <set>
 #include <sstream>
 
 json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
@@ -15,6 +18,143 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     json chatcmpl_body = response_body;
     chatcmpl_body.erase("input");
     std::vector<json> chatcmpl_messages;
+
+    // strixllama: the tools first, so calls in the input can use the names the model is shown (coding agents such as
+    // Codex send custom and namespace tools; they were dropped and every round trip of them failed). Tools come from
+    // "tools" and from additional_tools input items. Function tools pass through; a custom (freeform) tool becomes a
+    // function taking one string "input"; the tools inside a namespace become functions of their own, named as they
+    // are when the name is unique and NAMESPACE__NAME otherwise. Tools the server cannot run (web_search, file_search,
+    // ...) are left out and listed in strix_resp_unsupported (the X-Rulith-Unsupported-Tools response header).
+    // strix_resp_tools tells the response side how to turn a call back into what the client offered.
+    struct resp_tool {
+        std::string kind; // "function" or "custom"
+        std::string name;
+        std::string ns;
+        json        def;
+    };
+    std::vector<resp_tool>   resp_tools;
+    std::vector<std::string> unsupported_tools;
+    const bool has_tools = response_body.contains("tools");
+    std::function<void(const json &, const std::string &)> add_resp_tool = [&](const json & tool, const std::string & ns) {
+        if (!tool.is_object()) {
+            throw std::invalid_argument("'tools' must be an array of objects");
+        }
+        const std::string type = json_value(tool, "type", std::string());
+        if ((type == "function" || type == "custom") && tool.contains("name") && tool.at("name").is_string()) {
+            resp_tools.push_back({type, tool.at("name").get<std::string>(), ns, tool});
+        } else if (type == "namespace" && ns.empty() && tool.contains("tools") && tool.at("tools").is_array()) {
+            const std::string name = json_value(tool, "name", std::string());
+            for (const auto & child : tool.at("tools")) {
+                add_resp_tool(child, name);
+            }
+        } else {
+            const std::string what = type.empty() ? std::string("unknown") : type;
+            if (std::find(unsupported_tools.begin(), unsupported_tools.end(), what) == unsupported_tools.end()) {
+                unsupported_tools.push_back(what);
+            }
+        }
+    };
+    if (has_tools) {
+        if (!response_body.at("tools").is_array()) {
+            throw std::invalid_argument("'tools' must be an array of objects");
+        }
+        for (const auto & tool : response_body.at("tools")) {
+            add_resp_tool(tool, "");
+        }
+    }
+    bool has_additional_tools = false;
+    if (input_value.is_array()) {
+        for (const auto & item : input_value) {
+            if (item.is_object() && json_value(item, "type", std::string()) == "additional_tools" &&
+                    item.contains("tools") && item.at("tools").is_array()) {
+                has_additional_tools = true;
+                for (const auto & tool : item.at("tools")) {
+                    add_resp_tool(tool, "");
+                }
+            }
+        }
+    }
+    std::map<std::string, int> n_named;
+    for (const auto & t : resp_tools) {
+        n_named[t.name]++;
+    }
+    json chatcmpl_tools = json::array();
+    json resp_tool_map  = json::object();
+    std::map<std::string, std::string> model_name_of; // namespace + '\n' + name -> the name the model is shown
+    for (const auto & t : resp_tools) {
+        const std::string model_name = n_named[t.name] > 1 && !t.ns.empty() ? t.ns + "__" + t.name : t.name;
+        model_name_of[t.ns + "\n" + t.name] = model_name;
+        json fn;
+        if (t.kind == "function") {
+            fn = t.def;
+            fn.erase("type");
+            if (!fn.contains("strict")) {
+                fn["strict"] = true;
+            }
+        } else {
+            std::string input_desc = "The input for the tool as plain text, not JSON";
+            const json  format     = json_value(t.def, "format", json::object());
+            if (format.is_object() && json_value(format, "type", std::string()) == "grammar") {
+                input_desc += ". It must follow this " + json_value(format, "syntax", std::string("lark")) +
+                              " grammar:\n" + json_value(format, "definition", std::string());
+            }
+            fn = json {
+                {"name",        t.name},
+                {"description", json_value(t.def, "description", std::string())},
+                {"parameters",  json {
+                    {"type",       "object"},
+                    {"properties", json { {"input", json { {"type", "string"}, {"description", input_desc} }} }},
+                    {"required",   json::array({"input"})},
+                }},
+            };
+        }
+        fn["name"] = model_name;
+        chatcmpl_tools.push_back(json { {"type", "function"}, {"function", fn} });
+        if (t.kind == "custom" || !t.ns.empty() || model_name != t.name) {
+            json entry = { {"type", t.kind}, {"name", t.name} };
+            if (!t.ns.empty()) {
+                entry["namespace"] = t.ns;
+            }
+            resp_tool_map[model_name] = entry;
+        }
+    }
+    for (const auto & what : unsupported_tools) {
+        SRV_WRN("Responses tool type '%s' is not supported by this server; the model is not offered it\n", what.c_str());
+    }
+    // the name the model knows a called tool by (a call in the input carries the client's name and namespace)
+    auto model_tool_name = [&](const json & item) -> std::string {
+        const std::string name = json_value(item, "name", std::string());
+        const std::string ns   = json_value(item, "namespace", std::string());
+        auto it = model_name_of.find(ns + "\n" + name);
+        if (it != model_name_of.end()) {
+            return it->second;
+        }
+        return name;
+    };
+    // a tool output as chat content: a string as it is, input_text parts as text parts, anything else described
+    auto tool_output_content = [](const json & output) -> json {
+        if (output.is_string()) {
+            return output;
+        }
+        if (!output.is_array()) {
+            return output.dump();
+        }
+        json parts = json::array();
+        for (const auto & part : output) {
+            const std::string type = json_value(part, "type", std::string());
+            if ((type == "input_text" || type == "output_text" || type == "text") && part.contains("text") &&
+                    part.at("text").is_string()) {
+                parts.push_back(json { {"text", part.at("text")}, {"type", "text"} });
+            } else if (type == "input_image" || type == "input_file") {
+                SRV_WRN("a %s part of a tool output is not supported; the model is told it was left out\n", type.c_str());
+                parts.push_back(json { {"text", "[" + type + " left out]"}, {"type", "text"} });
+            } else {
+                parts.push_back(json { {"text", part.dump()}, {"type", "text"} });
+            }
+        }
+        return parts;
+    };
+    std::set<std::string> skipped_items;
 
     if (response_body.contains("instructions")) {
         chatcmpl_messages.push_back({
@@ -42,6 +182,21 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
 
         for (json item : input_value) {
             bool merge_prev = !chatcmpl_messages.empty() && chatcmpl_messages.back().value("role", "") == "assistant";
+
+            // strixllama: a custom tool call is a call of the function the custom tool became, its output that call's
+            // output; additional_tools items only carry tools (collected above)
+            if (exists_and_is_string(item, "type")) {
+                const std::string item_type = item.at("type").get<std::string>();
+                if (item_type == "additional_tools") {
+                    continue;
+                }
+                if (item_type == "custom_tool_call") {
+                    item["type"]      = "function_call";
+                    item["arguments"] = json { {"input", json_value(item, "input", std::string())} }.dump();
+                } else if (item_type == "custom_tool_call_output") {
+                    item["type"] = "function_call_output";
+                }
+            }
 
             if (exists_and_is_string(item, "content")) {
                 // #responses_create-input-input_item_list-input_message-content-text_input
@@ -160,17 +315,20 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                     item["content"] = chatcmpl_content;
                     chatcmpl_messages.push_back(item);
                 }
-            } else if (exists_and_is_string(item, "arguments") &&
+            } else if (item.contains("arguments") &&
                 exists_and_is_string(item, "call_id") &&
                 exists_and_is_string(item, "name") &&
                 exists_and_is_string(item, "type") &&
                 item.at("type") == "function_call"
             ) {
                 // #responses_create-input-input_item_list-item-function_tool_call
+                // strixllama: under the name the model was shown (namespace tools); arguments given as an object are
+                // serialized
+                const json & args = item.at("arguments");
                 json tool_call = {
                     {"function", json {
-                        {"arguments", item.at("arguments")},
-                        {"name",      item.at("name")},
+                        {"arguments", args.is_string() ? args : json(args.dump())},
+                        {"name",      model_tool_name(item)},
                     }},
                     {"id",   item.at("call_id")},
                     {"type", "function"},
@@ -189,56 +347,55 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                     });
                 }
             } else if (exists_and_is_string(item, "call_id") &&
-                (exists_and_is_string(item, "output") || exists_and_is_array(item, "output")) &&
+                item.contains("output") &&
                 exists_and_is_string(item, "type") &&
                 item.at("type") == "function_call_output"
             ) {
                 // #responses_create-input-input_item_list-item-function_tool_call_output
-                if (item.at("output").is_string()) {
-                    chatcmpl_messages.push_back(json {
-                        {"content",      item.at("output")},
-                        {"role",         "tool"},
-                        {"tool_call_id", item.at("call_id")},
-                    });
-                } else {
-                    json chatcmpl_outputs = item.at("output");
-                    for (json & chatcmpl_output : chatcmpl_outputs) {
-                        if (!chatcmpl_output.contains("type") || chatcmpl_output.at("type") != "input_text") {
-                            throw std::invalid_argument("Output of tool call should be 'Input text'");
-                        }
-                        chatcmpl_output["type"] = "text";
-                    }
-                    chatcmpl_messages.push_back(json {
-                        {"content",      chatcmpl_outputs},
-                        {"role",         "tool"},
-                        {"tool_call_id", item.at("call_id")},
-                    });
-                }
-            } else if (exists_and_is_array(item, "summary") &&
-                exists_and_is_string(item, "type") &&
+                // strixllama: text parts as text, other parts described instead of failing the request
+                chatcmpl_messages.push_back(json {
+                    {"content",      tool_output_content(item.at("output"))},
+                    {"role",         "tool"},
+                    {"tool_call_id", item.at("call_id")},
+                });
+            } else if (exists_and_is_string(item, "type") &&
                 item.at("type") == "reasoning") {
                 // #responses_create-input-input_item_list-item-reasoning
-
-                if (!exists_and_is_array(item, "content")) {
-                    throw std::invalid_argument("item['content'] is not an array");
+                // strixllama: the reasoning text, else its summary; a reasoning item with neither (only
+                // encrypted_content, as clients replay it) is left out instead of failing the request
+                std::string text;
+                if (exists_and_is_array(item, "content")) {
+                    for (const auto & part : item.at("content")) {
+                        if (exists_and_is_string(part, "text")) {
+                            text += (text.empty() ? "" : "\n\n") + part.at("text").get<std::string>();
+                        }
+                    }
                 }
-                if (item.at("content").empty()) {
-                    throw std::invalid_argument("item['content'] is empty");
+                if (text.empty() && exists_and_is_array(item, "summary")) {
+                    for (const auto & part : item.at("summary")) {
+                        if (exists_and_is_string(part, "text")) {
+                            text += (text.empty() ? "" : "\n\n") + part.at("text").get<std::string>();
+                        }
+                    }
                 }
-                if (!exists_and_is_string(item.at("content")[0], "text")) {
-                    throw std::invalid_argument("item['content']['text'] is not a string");
+                if (text.empty()) {
+                    continue;
                 }
 
                 if (merge_prev) {
                     auto & prev_msg = chatcmpl_messages.back();
-                    prev_msg["reasoning_content"] = item.at("content")[0].at("text");
+                    prev_msg["reasoning_content"] = text;
                 } else {
                     chatcmpl_messages.push_back(json {
                         {"role", "assistant"},
                         {"content", json::array()},
-                        {"reasoning_content", item.at("content")[0].at("text")},
+                        {"reasoning_content", text},
                     });
                 }
+            } else if (exists_and_is_string(item, "type") && item.at("type") != "message") {
+                // strixllama: items of hosted tools and other kinds this server has no use for (web_search_call,
+                // local_shell_call, compaction, item_reference, ...) are left out instead of failing the request
+                skipped_items.insert(item.at("type").get<std::string>());
             } else {
                 throw std::invalid_argument("Cannot determine type of 'item'");
             }
@@ -248,34 +405,35 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     }
 
     chatcmpl_body["messages"] = chatcmpl_messages;
+    for (const auto & what : skipped_items) {
+        SRV_WRN("Responses input items of type '%s' are not supported by this server; left out\n", what.c_str());
+    }
 
-    if (response_body.contains("tools")) {
-        if (!response_body.at("tools").is_array()) {
-            throw std::invalid_argument("'tools' must be an array of objects");
-        }
-        std::vector<json> chatcmpl_tools;
-        for (json resp_tool : response_body.at("tools")) {
-            json chatcmpl_tool;
-
-            const std::string type = json_value(resp_tool, "type", std::string());
-            if (type != "function") {
-                // Non-function Responses tools have no Chat Completions equivalent.
-                SRV_WRN("unsupported Responses tool type '%s' skipped\n", type.c_str());
-                continue;
-            }
-            resp_tool.erase("type");
-            chatcmpl_tool["type"] = "function";
-
-            if (!resp_tool.contains("strict")) {
-                resp_tool["strict"] = true;
-            }
-            chatcmpl_tool["function"] = resp_tool;
-            chatcmpl_tools.push_back(chatcmpl_tool);
-        }
+    if (has_tools || has_additional_tools) {
         chatcmpl_body.erase("tools");
         if (!chatcmpl_tools.empty()) {
             chatcmpl_body["tools"] = chatcmpl_tools;
         }
+        if (!resp_tool_map.empty()) {
+            chatcmpl_body["strix_resp_tools"] = resp_tool_map;
+        }
+        if (!unsupported_tools.empty()) {
+            chatcmpl_body["strix_resp_unsupported"] = unsupported_tools;
+        }
+    }
+
+    // strixllama: a tool_choice object names one tool (function, custom) or a set (allowed_tools): the closest the
+    // chat tool choice can say is "required" or the set's mode; a hosted tool choice is "auto"
+    if (response_body.contains("tool_choice") && response_body.at("tool_choice").is_object()) {
+        const json &      choice = response_body.at("tool_choice");
+        const std::string type   = json_value(choice, "type", std::string());
+        std::string       mapped = "auto";
+        if (type == "function" || type == "custom") {
+            mapped = "required";
+        } else if (type == "allowed_tools") {
+            mapped = json_value(choice, "mode", std::string("auto"));
+        }
+        chatcmpl_body["tool_choice"] = chatcmpl_tools.empty() ? std::string("auto") : mapped;
     }
 
     if (response_body.contains("max_output_tokens")) {

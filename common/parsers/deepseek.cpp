@@ -1,3 +1,4 @@
+#include "json-schema-to-grammar.h"
 #include "parsers.h"
 
 // The DeepSeek V4 reference implementation renders consecutive tool results into a single
@@ -149,7 +150,7 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
             foreach_function(inputs.tools, [&](const json & tool) {
                 const auto & function = tool.at("function");
                 std::string  name     = function.at("name");
-                auto         params   = function.contains("parameters") ? function.at("parameters") : json::object();
+                auto         params   = common_tool_parameters_flatten(function.contains("parameters") ? function.at("parameters") : json::object());
                 const auto & props    = params.contains("properties") ? params.at("properties") : json::object();
 
                 std::set<std::string> required;

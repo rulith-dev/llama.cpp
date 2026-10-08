@@ -1276,6 +1276,51 @@ json oaicompat_chat_params_parse(
         }
     }
 
+    // strixllama: a system or developer message after the conversation started (coding agents such as Codex send
+    // developer messages between turns) made templates that allow them only at the start raise "System message must be
+    // at the beginning." and the request fail with HTTP 500. With such a template it is passed on as a user message
+    // saying whose it is; the leading system and developer messages stay as they are.
+    if (opt.use_jinja && opt.tmpls) {
+        bool started = false;
+        bool late    = false;
+        for (const auto & msg : messages) {
+            const std::string role = json_value(msg, "role", std::string());
+            if (role != "system" && role != "developer") {
+                started = true;
+            } else if (started) {
+                late = true;
+                break;
+            }
+        }
+        if (late && (common_chat_templates_source(opt.tmpls.get()).find("must be at the beginning") != std::string::npos ||
+                     common_chat_templates_source(opt.tmpls.get(), "tool_use").find("must be at the beginning") != std::string::npos)) {
+            started = false;
+            for (auto & msg : messages) {
+                const std::string role = json_value(msg, "role", std::string());
+                if (role != "system" && role != "developer") {
+                    started = true;
+                    continue;
+                }
+                if (!started) {
+                    continue;
+                }
+                const std::string label = "[" + role + " message]\n";
+                msg["role"] = "user";
+                json & content = msg["content"];
+                if (content.is_string()) {
+                    content = label + content.get<std::string>();
+                } else if (content.is_array()) {
+                    json parts = json::array();
+                    parts.push_back(json { {"type", "text"}, {"text", label} });
+                    parts.insert(content);
+                    content = parts;
+                } else {
+                    content = label;
+                }
+            }
+        }
+    }
+
     auto caps = common_chat_templates_get_caps(opt.tmpls.get());
 
     common_chat_templates_inputs inputs;

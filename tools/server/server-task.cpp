@@ -547,6 +547,57 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
     return deltas;
 }
 
+// strixllama: the client's view of a tool call for the OpenAI Responses API (task_params::resp_tools). A call of a
+// custom tool, offered to the model as a function taking one string "input", is a custom_tool_call carrying that input;
+// a call of a tool from a namespace names the tool and its namespace; other calls are left as they are.
+static const json * resp_tool_entry(const std::shared_ptr<const json> & tools, const std::string & name) {
+    if (!tools || !tools->is_object() || !tools->contains(name)) {
+        return nullptr;
+    }
+    return &tools->at(name);
+}
+
+static bool resp_tool_is_custom(const std::shared_ptr<const json> & tools, const std::string & name) {
+    const json * e = resp_tool_entry(tools, name);
+    return e && json_value(*e, "type", std::string()) == "custom";
+}
+
+static std::string resp_custom_input(const std::string & arguments) {
+    const json args = json::parse_no_throw(arguments);
+    if (!args.is_discarded() && args.is_object() && args.contains("input")) {
+        return args.at("input").is_string() ? args.at("input").get<std::string>() : args.at("input").dump_safe();
+    }
+    return arguments;
+}
+
+static json resp_tool_call_item(const std::shared_ptr<const json> & tools, const common_chat_tool_call & tool_call) {
+    const json * e = resp_tool_entry(tools, tool_call.name);
+    json item;
+    if (e && json_value(*e, "type", std::string()) == "custom") {
+        item = json {
+            {"id",      "ctc_" + tool_call.id},
+            {"type",    "custom_tool_call"},
+            {"status",  "completed"},
+            {"call_id", "call_" + tool_call.id},
+            {"name",    json_value(*e, "name", tool_call.name)},
+            {"input",   resp_custom_input(tool_call.arguments)},
+        };
+    } else {
+        item = json {
+            {"id",        "fc_" + tool_call.id},
+            {"type",      "function_call"},
+            {"status",    "completed"},
+            {"arguments", tool_call.arguments},
+            {"call_id",   "call_" + tool_call.id},
+            {"name",      e ? json_value(*e, "name", tool_call.name) : tool_call.name},
+        };
+    }
+    if (e && e->contains("namespace")) {
+        item["namespace"] = e->at("namespace");
+    }
+    return item;
+}
+
 json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     common_chat_msg msg;
     if (!oaicompat_msg.empty()) {
@@ -588,14 +639,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     }
 
     for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
-        output.push_back(json {
-            {"id",        "fc_" + tool_call.id},
-            {"type",      "function_call"},
-            {"status",    "completed"},
-            {"arguments", tool_call.arguments},
-            {"call_id",   "call_" + tool_call.id},
-            {"name",      tool_call.name},
-        });
+        output.push_back(resp_tool_call_item(resp_tools, tool_call));
     }
 
     std::time_t t = std::time(0);
@@ -688,14 +732,37 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     }
 
     for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
-        const json output_item = {
-            {"id",        "fc_" + tool_call.id},
-            {"type",      "function_call"},
-            {"status",    "completed"},
-            {"arguments", tool_call.arguments},
-            {"call_id",   "call_" + tool_call.id},
-            {"name",      tool_call.name}
-        };
+        const json output_item = resp_tool_call_item(resp_tools, tool_call);
+        if (output_item.at("type") == "custom_tool_call") {
+            // strixllama: the partial results held a custom call's events back (its arguments are the JSON the model
+            // wrote around the input); the whole input goes out now
+            json added = output_item;
+            added["status"] = "in_progress";
+            added["input"]  = "";
+            server_sent_events.push_back(json {
+                {"event", "response.output_item.added"},
+                {"data", json {
+                    {"type", "response.output_item.added"},
+                    {"item", added}
+                }}
+            });
+            server_sent_events.push_back(json {
+                {"event", "response.custom_tool_call_input.delta"},
+                {"data", json {
+                    {"type",    "response.custom_tool_call_input.delta"},
+                    {"item_id", output_item.at("id")},
+                    {"delta",   output_item.at("input")}
+                }}
+            });
+            server_sent_events.push_back(json {
+                {"event", "response.custom_tool_call_input.done"},
+                {"data", json {
+                    {"type",    "response.custom_tool_call_input.done"},
+                    {"item_id", output_item.at("id")},
+                    {"input",   output_item.at("input")}
+                }}
+            });
+        }
         server_sent_events.push_back(json {
             {"event", "response.output_item.done"},
             {"data", json {
@@ -1023,6 +1090,8 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     oai_resp_reasoning_id  = state.oai_resp_reasoning_id;
     oai_resp_message_id    = state.oai_resp_message_id;
     oai_resp_fc_id         = state.oai_resp_fc_id;
+    oai_resp_fc_custom     = state.oai_resp_fc_custom;
+    resp_tools             = state.resp_tools;
 
     // track if the accumulated message has any reasoning content
     anthropic_has_reasoning = !state.chat_msg.reasoning_content.empty();
@@ -1040,7 +1109,8 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
             state.text_block_started = true;
         }
         if (!diff.tool_call_delta.name.empty()) {
-            state.oai_resp_fc_id = diff.tool_call_delta.id;
+            state.oai_resp_fc_id     = diff.tool_call_delta.id;
+            state.oai_resp_fc_custom = resp_tool_is_custom(state.resp_tools, diff.tool_call_delta.name);
         }
     }
 }
@@ -1293,24 +1363,36 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
         }
 
         if (!diff.tool_call_delta.name.empty()) {
-            events.push_back(json {
-                {"event", "response.output_item.added"},
-                {"data", json {
-                    {"type",  "response.output_item.added"},
-                    {"item", json {
-                        {"id",        "fc_" + diff.tool_call_delta.id},
-                        {"arguments", ""},
-                        {"call_id",   "call_" + diff.tool_call_delta.id},
-                        {"name",      diff.tool_call_delta.name},
-                        {"type",      "function_call"},
-                        {"status",    "in_progress"},
+            // strixllama: a custom tool's call goes out whole with the final result; a namespace tool's call names
+            // the tool and its namespace (task_params::resp_tools)
+            oai_resp_fc_custom = resp_tool_is_custom(resp_tools, diff.tool_call_delta.name);
+            if (!oai_resp_fc_custom) {
+                json item = json {
+                    {"id",        "fc_" + diff.tool_call_delta.id},
+                    {"arguments", ""},
+                    {"call_id",   "call_" + diff.tool_call_delta.id},
+                    {"name",      diff.tool_call_delta.name},
+                    {"type",      "function_call"},
+                    {"status",    "in_progress"},
+                };
+                if (const json * e = resp_tool_entry(resp_tools, diff.tool_call_delta.name)) {
+                    item["name"] = json_value(*e, "name", diff.tool_call_delta.name);
+                    if (e->contains("namespace")) {
+                        item["namespace"] = e->at("namespace");
+                    }
+                }
+                events.push_back(json {
+                    {"event", "response.output_item.added"},
+                    {"data", json {
+                        {"type",  "response.output_item.added"},
+                        {"item", item},
                     }},
-                }},
-            });
+                });
+            }
             oai_resp_fc_id = diff.tool_call_delta.id;
         }
 
-        if (!diff.tool_call_delta.arguments.empty()) {
+        if (!diff.tool_call_delta.arguments.empty() && !oai_resp_fc_custom) {
             events.push_back(json {
                 {"event", "response.function_call_arguments.delta"},
                 {"data", json {

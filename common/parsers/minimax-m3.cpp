@@ -1,3 +1,4 @@
+#include "json-schema-to-grammar.h"
 #include "parsers.h"
 
 common_chat_params common_chat_params_init_minimax_m3(const common_chat_template &          tmpl,
@@ -97,7 +98,7 @@ common_chat_params common_chat_params_init_minimax_m3(const common_chat_template
         foreach_function(inputs.tools, [&](const json & tool) {
             const auto & function = tool.at("function");
             std::string  name     = function.at("name");
-            auto         params   = function.contains("parameters") ? function.at("parameters") : json::object();
+            auto         params   = common_tool_parameters_flatten(function.contains("parameters") ? function.at("parameters") : json::object());
 
             auto schema_info = common_schema_info();
             schema_info.resolve_refs(params);

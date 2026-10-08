@@ -385,7 +385,7 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
     foreach_function(inputs.tools, [&](const json & tool) {
         const auto &          func       = tool.at("function");
         std::string           name       = func.at("name");
-        auto                  params     = func.contains("parameters") ? func.at("parameters") : json::object();
+        auto                  params     = common_tool_parameters_flatten(func.contains("parameters") ? func.at("parameters") : json::object());
         const auto &          properties = params.contains("properties") ? params.at("properties") : json::object();
 
         std::set<std::string> required;

@@ -6264,6 +6264,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
             task.params.oaicompat_model   = meta->model_name;
+            if (res_type == TASK_RESPONSE_TYPE_OAI_RESP && data.contains("strix_resp_tools") &&
+                    data.at("strix_resp_tools").is_object() && !data.at("strix_resp_tools").empty()) {
+                task.params.resp_tools = std::make_shared<const json>(data.at("strix_resp_tools"));
+            }
 
             // prepare child tasks
             if (task.params.n_cmpl > 1) {
@@ -6950,16 +6954,27 @@ void server_routes::init_routes() {
         json body = server_chat_convert_responses_to_chatcmpl(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
+        // strixllama: tools the model was not offered are named in a response header, so a client can tell
+        const json unsupported = json_value(body, "strix_resp_unsupported", json::array());
+        body.erase("strix_resp_unsupported");
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
             files);
-        return handle_completions_impl(
+        auto res_impl = handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
             files,
             TASK_RESPONSE_TYPE_OAI_RESP);
+        if (unsupported.is_array() && !unsupported.empty()) {
+            std::string names;
+            for (const auto & n : unsupported) {
+                names += (names.empty() ? "" : ", ") + (n.is_string() ? n.get<std::string>() : n.dump());
+            }
+            res_impl->headers["X-Rulith-Unsupported-Tools"] = names;
+        }
+        return res_impl;
     };
 
     this->post_responses_tok_oai = [this](const server_http_req & req) {

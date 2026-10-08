@@ -1,3 +1,4 @@
+#include "json-schema-to-grammar.h"
 #include "parsers.h"
 
 // MiniCPM5 format:
@@ -71,7 +72,7 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
             foreach_function(inputs.tools, [&](const json & tool) {
                 const auto &      function = tool.at("function");
                 const std::string name     = function.at("name");
-                auto              params   = function.contains("parameters") ? function.at("parameters") : json::object();
+                auto              params   = common_tool_parameters_flatten(function.contains("parameters") ? function.at("parameters") : json::object());
 
                 auto args = p.eps();
                 if (params.contains("properties") && params.at("properties").is_object() && !params.at("properties").empty()) {

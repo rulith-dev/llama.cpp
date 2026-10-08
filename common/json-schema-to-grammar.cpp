@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <set>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -1018,14 +1019,36 @@ public:
             std::vector<std::pair<std::string, json>> properties;
             std::map<std::string, size_t> enum_values;
             const std::string& hybrid_name = name;
+            // strixllama: a component's properties are required as its own "required" list says, not all of them -
+            // Rulith's ApplyBatch head atoms (allOf: [$ref atom, {not: {required: [naf]}}], the atom requiring only
+            // predicate) had predicate, args, negated and naf all forced, so every call carried "negated":false,"naf":false
+            // and was rejected. A {not: {required: [...]}} component forbids those properties: they are left out.
+            std::unordered_set<std::string> forbidden;
             std::function<void(const json &, bool)> add_component = [&](const json & comp_schema, bool is_required) {
                 if (comp_schema.contains("$ref")) {
                     add_component(_refs[comp_schema["$ref"]], is_required);
                 } else if (comp_schema.contains("properties")) {
                     for (const auto & prop : comp_schema["properties"].items()) {
-                        properties.emplace_back(prop.key(), prop.value());
-                        if (is_required) {
-                            required.insert(prop.key());
+                        bool seen = false;
+                        for (const auto & p : properties) {
+                            seen = seen || p.first == prop.key();
+                        }
+                        if (!seen) {
+                            properties.emplace_back(prop.key(), prop.value());
+                        }
+                    }
+                    if (is_required && comp_schema.contains("required") && comp_schema["required"].is_array()) {
+                        for (const auto & r : comp_schema["required"]) {
+                            if (r.is_string()) {
+                                required.insert(r.get<std::string>());
+                            }
+                        }
+                    }
+                } else if (comp_schema.contains("not") && comp_schema["not"].is_object() && comp_schema["not"].size() == 1 &&
+                           comp_schema["not"].contains("required") && comp_schema["not"]["required"].is_array()) {
+                    for (const auto & r : comp_schema["not"]["required"]) {
+                        if (r.is_string()) {
+                            forbidden.insert(r.get<std::string>());
                         }
                     }
                 } else if (comp_schema.contains("enum")) {
@@ -1040,14 +1063,25 @@ public:
                   // todo warning
                 }
             };
-            for (const auto & t : schema["allOf"]) {
-                if (t.contains("anyOf")) {
-                    for (const auto & tt : t["anyOf"]) {
+            // strixllama: oneOf parts count as anyOf ones (optional properties) and a nested allOf contributes its parts
+            // - both had their properties dropped, so the value lost those fields
+            std::function<void(const json &, int)> add_part = [&](const json & t, int depth) {
+                const json & r = t.contains("$ref") && t["$ref"].is_string() && _refs.count(t["$ref"].get<std::string>()) ?
+                                 _refs[t["$ref"].get<std::string>()] : t;
+                if (depth < 8 && r.contains("allOf") && r["allOf"].is_array() && !r.contains("properties")) {
+                    for (const auto & tt : r["allOf"]) {
+                        add_part(tt, depth + 1);
+                    }
+                } else if (t.contains("anyOf") || t.contains("oneOf")) {
+                    for (const auto & tt : t.contains("anyOf") ? t["anyOf"] : t["oneOf"]) {
                         add_component(tt, false);
                     }
                 } else {
                     add_component(t, true);
                 }
+            };
+            for (const auto & t : schema["allOf"]) {
+                add_part(t, 0);
             }
             if (!enum_values.empty()) {
                 std::vector<std::string> enum_intersection;
@@ -1058,6 +1092,18 @@ public:
                 }
                 if (!enum_intersection.empty()) {
                     return _add_rule(rule_name, "(" + string_join(enum_intersection, " | ") + ")");
+                }
+            }
+            if (!forbidden.empty()) {
+                std::vector<std::pair<std::string, json>> kept;
+                for (const auto & p : properties) {
+                    if (forbidden.find(p.first) == forbidden.end()) {
+                        kept.push_back(p);
+                    }
+                }
+                properties = std::move(kept);
+                for (const auto & f : forbidden) {
+                    required.erase(f);
                 }
             }
             return _add_rule(rule_name, _build_object_rule(properties, required, hybrid_name, json()));
@@ -1163,6 +1209,130 @@ common_schema_info::~common_schema_info() = default;
 common_schema_info::common_schema_info(common_schema_info &&) noexcept = default;
 common_schema_info & common_schema_info::operator=(common_schema_info &&) noexcept = default;
 
+common_json common_tool_parameters_flatten(const common_json & params) {
+    if (!params.is_object()) {
+        return params;
+    }
+    const bool combined = params.contains("$ref") || params.contains("allOf") || params.contains("oneOf") ||
+                          params.contains("anyOf") || params.contains("not");
+    if (!combined) {
+        return params;
+    }
+    // local references only: #/$defs/NAME and #/definitions/NAME of this schema
+    auto resolve = [&](const json & s0) -> json {
+        json s = s0;
+        for (int depth = 0; depth < 16 && s.is_object() && s.contains("$ref") && s.at("$ref").is_string(); ++depth) {
+            const std::string ref = s.at("$ref").get<std::string>();
+            json next;
+            bool found = false;
+            for (const char * key : {"$defs", "definitions"}) {
+                const std::string prefix = std::string("#/") + key + "/";
+                if (ref.rfind(prefix, 0) == 0 && params.contains(key) && params.at(key).is_object()) {
+                    const std::string name = ref.substr(prefix.size());
+                    if (params.at(key).contains(name)) {
+                        next  = params.at(key).at(name);
+                        found = true;
+                    }
+                }
+            }
+            if (!found) {
+                break;
+            }
+            s = next;
+        }
+        return s;
+    };
+    std::vector<std::string>              order;
+    std::map<std::string, json>           props;
+    std::set<std::string>                 required;
+    std::set<std::string>                 forbidden;
+    std::function<void(const json &, bool, int)> collect = [&](const json & s0, bool is_required, int depth) {
+        if (depth > 16) {
+            return;
+        }
+        const json s = resolve(s0);
+        if (!s.is_object()) {
+            return;
+        }
+        if (s.contains("properties") && s.at("properties").is_object()) {
+            for (const auto & [k, v] : s.at("properties").items()) {
+                if (props.find(k) == props.end()) {
+                    order.push_back(k);
+                    props[k] = v;
+                }
+            }
+        }
+        if (is_required && s.contains("required") && s.at("required").is_array()) {
+            for (const auto & r : s.at("required")) {
+                if (r.is_string()) {
+                    required.insert(r.get<std::string>());
+                }
+            }
+        }
+        if (s.contains("not") && s.at("not").is_object() && s.at("not").contains("required") &&
+                s.at("not").at("required").is_array()) {
+            for (const auto & r : s.at("not").at("required")) {
+                if (r.is_string()) {
+                    forbidden.insert(r.get<std::string>());
+                }
+            }
+        }
+        if (s.contains("allOf") && s.at("allOf").is_array()) {
+            for (const auto & part : s.at("allOf")) {
+                collect(part, is_required, depth + 1);
+            }
+        }
+        for (const char * key : {"oneOf", "anyOf"}) {
+            if (!s.contains(key) || !s.at(key).is_array()) {
+                continue;
+            }
+            size_t n_alt = 0;
+            std::map<std::string, size_t> n_req;
+            for (const auto & alt0 : s.at(key)) {
+                const json alt = resolve(alt0);
+                if (!alt.is_object()) {
+                    continue;
+                }
+                ++n_alt;
+                collect(alt, false, depth + 1);
+                if (alt.contains("required") && alt.at("required").is_array()) {
+                    for (const auto & r : alt.at("required")) {
+                        if (r.is_string()) {
+                            n_req[r.get<std::string>()]++;
+                        }
+                    }
+                }
+            }
+            if (is_required) {
+                for (const auto & [k, n] : n_req) {
+                    if (n_alt > 0 && n == n_alt) {
+                        required.insert(k);
+                    }
+                }
+            }
+        }
+    };
+    collect(params, true, 0);
+    if (order.empty()) {
+        return params;
+    }
+    json out   = params;
+    json p     = json::object();
+    json r     = json::array();
+    for (const auto & k : order) {
+        if (forbidden.find(k) != forbidden.end()) {
+            continue;
+        }
+        p[k] = props[k];
+        if (required.find(k) != required.end()) {
+            r.push_back(k);
+        }
+    }
+    out["properties"] = p;
+    out["required"]   = r;
+    return out;
+}
+
 void common_schema_info::resolve_refs(common_json & schema) {
     impl_->resolve_refs(schema, "");
 }
@@ -1227,16 +1397,20 @@ bool common_schema_info::resolves_to_string(const common_json & schema) {
             }
         }
 
-        // Check allOf - all components must be compatible with string type
+        // Check allOf - a string when a part says so and no part names another type (strixllama: a part that only
+        // constrains, {minLength: 1} next to a string $ref, made the value JSON and the model had to quote it)
         if (s.contains("allOf")) {
-            bool all_string = true;
+            bool any_string = false;
+            bool other_type = false;
             for (const auto & component : s["allOf"]) {
-                if (!check(component)) {
-                    all_string = false;
-                    break;
+                if (check(component)) {
+                    any_string = true;
+                } else if (component.is_object() && component.contains("type") &&
+                           !(component["type"].is_string() && component["type"] == "string")) {
+                    other_type = true;
                 }
             }
-            if (all_string) {
+            if (any_string && !other_type) {
                 return true;
             }
         }
