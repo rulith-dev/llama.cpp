@@ -968,6 +968,51 @@ public:
                     properties, required, name,
                     schema.contains("additionalProperties") ? schema["additionalProperties"] : json()));
         }
+        // strixllama: allOf over a non-object type (Rulith's QueryBoard roots: an array $ref plus minItems and items
+        // constraints) went through the object merge below, which knows only properties, and the value was forced to
+        // {}. Its keywords merge into one schema instead - nested objects such as items merged recursively, required
+        // lists joined, a later value otherwise winning - and that schema is visited
+        if (schema.contains("allOf") && schema["allOf"].is_array()) {
+            bool objecty = schema_type == "object";
+            json merged = json::object();
+            for (const auto & [k, v] : schema.items()) {
+                if (k != "allOf") {
+                    merged[k] = v;
+                }
+            }
+            std::function<void(json &, const json &)> merge = [&](json & dst, const json & src) {
+                for (const auto & [k, v] : src.items()) {
+                    if (k == "required" && dst.contains(k) && dst[k].is_array() && v.is_array()) {
+                        for (const auto & r : v) {
+                            dst[k].push_back(r);
+                        }
+                    } else if (dst.contains(k) && dst[k].is_object() && v.is_object()) {
+                        merge(dst[k], v);
+                    } else {
+                        dst[k] = v;
+                    }
+                }
+            };
+            for (const auto & comp0 : schema["allOf"]) {
+                json comp = comp0;
+                if (comp.is_object() && comp.contains("$ref") && comp["$ref"].is_string()) {
+                    comp = _refs[comp["$ref"].get<std::string>()];
+                }
+                if (!comp.is_object()) {
+                    continue;
+                }
+                // objects, and enum / const intersections, stay with the merge below
+                if (comp.contains("properties") || comp.contains("oneOf") || comp.contains("anyOf") ||
+                        comp.contains("enum") || comp.contains("const") ||
+                        (comp.contains("type") && comp["type"] == "object")) {
+                    objecty = true;
+                }
+                merge(merged, comp);
+            }
+            if (!objecty && !(merged.contains("type") && merged["type"] == "object")) {
+                return visit(merged, name);
+            }
+        }
         if ((schema_type.is_null() || schema_type == "object" || schema_type == "string") && schema.contains("allOf")) {
             std::unordered_set<std::string> required;
             std::vector<std::pair<std::string, json>> properties;

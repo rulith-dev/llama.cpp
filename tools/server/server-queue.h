@@ -203,6 +203,9 @@ public:
 // RAII wrapper to make working with server_queue and server_response easier
 // it provides a generator-like API for server responses
 // support pooling connection state and aggregating multiple results
+// strixllama: whether STRIX_REQUEST_LOG names a file (server-queue.cpp)
+bool server_request_log_on();
+
 struct server_response_reader {
     std::unordered_set<int> id_tasks;
     server_queue & queue_tasks;
@@ -219,8 +222,19 @@ struct server_response_reader {
     server_response_reader(server_queue & queue_tasks, server_response & queue_results, int polling_interval_seconds)
         : queue_tasks(queue_tasks), queue_results(queue_results), polling_interval_seconds(polling_interval_seconds) {}
     ~server_response_reader() {
+        log_unfinished();
         stop();
     }
+
+    // strixllama: STRIX_REQUEST_LOG=<file> - every completion request, one JSON line per task when it ends (or when
+    // the reader goes away first: a client that disconnected): the HTTP body as received, the parameters the server
+    // derived from it (grammar, triggers, parser; not the rendered prompt), the raw generated text and what the chat
+    // parser made of it. Set by handle_completions_impl; an empty log_body is not logged. See server-queue.cpp
+    std::string       log_body;
+    json              log_server;
+    std::vector<bool> log_done;
+    void log_task(size_t idx, server_task_result * res, const char * outcome);
+    void log_unfinished();
 
     int get_new_id() {
         return queue_tasks.get_new_id();

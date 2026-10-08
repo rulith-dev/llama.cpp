@@ -6194,6 +6194,16 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     auto & rd = res->rd;
     auto & params = this->params;
 
+    // strixllama: STRIX_REQUEST_LOG - the request as received and what the server derived from it, written with each
+    // task's result (server-queue.cpp); the rendered prompt is left out, it is the messages again
+    if (server_request_log_on()) {
+        rd.log_body   = req.body;
+        rd.log_server = data;
+        if (rd.log_server.is_object()) {
+            rd.log_server.erase("prompt");
+        }
+    }
+
     res->set_req(&req); // will also set spipe if needed
 
     int32_t sse_ping_interval = params.sse_ping_interval;
