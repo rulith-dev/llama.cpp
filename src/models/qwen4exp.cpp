@@ -1622,6 +1622,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             // graph of a conversation, one after a restore or a rewind - then selects what the cache would have
             pooled = ggml_get_rows(ctx0, kb, inp->kb_bid_rows);
             pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
+        } else {
+            // without the cache - switched off, several streams, an image ubatch, or any text after an image
+            // (kb_pos_dup) - the keys are rounded to F16 too: the block choice, and the text, came out different from
+            // a fresh server's once the server had seen one image (issue #16)
+            pooled = ggml_cast(ctx0, ggml_cast(ctx0, pooled, GGML_TYPE_F16), GGML_TYPE_F32);
         }
     }
     cb(pooled, "indexer_k", il);
