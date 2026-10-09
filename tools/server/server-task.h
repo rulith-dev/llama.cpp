@@ -109,6 +109,9 @@ struct task_params {
 
     // message spans for checkpointing
     common_chat_msg_spans message_spans;
+    // strixllama: the delimiters they were found with, to find them again when the prompt's tokens change
+    // (server_context_impl::splice_own_tokens)
+    std::shared_ptr<const common_chat_msg_delimiters> message_delims;
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)

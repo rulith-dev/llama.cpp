@@ -2732,6 +2732,109 @@ private:
         return output;
     }
 
+    // strixllama: a conversation's next request (a tool call's follow-up, an agent step, the next chat turn) sends the
+    // model's own answer back as text. The chat template renders that text byte for byte as it was generated, but
+    // tokenizing it again does not always give the tokens the model sampled (a word it produced in two pieces comes
+    // back as one), so the cached prefix stopped inside the answer and everything after the nearest checkpoint - the
+    // reasoning and the calls - was processed again: 7K of a 7.8K-token follow-up for two web searches, 5.7K tokens of
+    // a 31K chat turn (10-08/09). When the text after the common prefix starts with the text of the slot's own
+    // remaining tokens, those tokens are kept as they are and only the text after them is tokenized again; the slot
+    // continues where its answer ended. The tokens the model sees are the ones it produced, which is what its cache
+    // holds. Text only after the common prefix (an image before it stays); the cut falls at a token of the slot's own
+    // on a character boundary; at least 16 tokens. The template also trims an answer's content, so whitespace the model ended it with is missing from the
+    // text: when all the slot has left is whitespace and the text continues with the end of the turn, the slot keeps
+    // it too. STRIX_SPLICE_OWN=0: off.
+    void splice_own_tokens(server_slot & slot, server_task & task) {
+        static const bool on = !getenv("STRIX_SPLICE_OWN") || atoi(getenv("STRIX_SPLICE_OWN")) != 0;
+        if (!on || !task.params.cache_prompt || slot.prompt.tokens.empty() || task.tokens.empty()) {
+            return;
+        }
+        const server_tokens & ct = slot.prompt.tokens; // indexed: get_tokens() refuses prompts that may hold media
+        const server_tokens & pt = task.tokens;
+        const size_t k = ct.get_common_prefix(pt);
+        if (k == 0 || ct.size() <= k || pt.size() <= k) {
+            return;
+        }
+        for (size_t i = k; i < pt.size(); ++i) {
+            if (pt[i] == LLAMA_TOKEN_NULL) {
+                return; // an image or audio chunk after the prefix
+            }
+        }
+        for (size_t i = k; i < ct.size(); ++i) {
+            if (ct[i] == LLAMA_TOKEN_NULL) {
+                return;
+            }
+        }
+        // the prompt's text after the common prefix, built only as far as it is read
+        std::string text;
+        size_t n_text = k;
+        const auto text_to = [&](size_t n) {
+            while (text.size() < n && n_text < pt.size()) {
+                text += common_token_to_piece(ctx_tgt, pt[n_text++], true);
+            }
+            return text.size() >= n;
+        };
+        size_t off = 0, n_keep = 0, off_keep = 0, i = k;
+        for (; i < ct.size(); ++i) {
+            const std::string piece = common_token_to_piece(ctx_tgt, ct[i], true);
+            if (piece.empty() || !text_to(off + piece.size()) || text.compare(off, piece.size(), piece) != 0) {
+                break;
+            }
+            off += piece.size();
+            if (text_to(off + 1) && ((unsigned char) text[off] & 0xC0) == 0x80) {
+                continue; // inside a multi-byte character: not a place to cut
+            }
+            n_keep   = i + 1 - k;
+            off_keep = off;
+        }
+        // the trimmed end of an answer: whitespace only left in the slot, the end of the turn next in the text
+        bool ws_tail = false;
+        if (i < ct.size() && k + n_keep == i && text_to(off_keep + 1)) {
+            bool all_ws = true;
+            for (size_t j = i; j < ct.size() && all_ws; ++j) {
+                const std::string piece = common_token_to_piece(ctx_tgt, ct[j], true);
+                all_ws = !piece.empty() && piece.find_first_not_of(" \t\r\n") == std::string::npos;
+            }
+            bool turn_end = false;
+            for (const llama_token eog : { llama_vocab_eot(vocab), llama_vocab_eos(vocab) }) {
+                if (eog == LLAMA_TOKEN_NULL) {
+                    continue;
+                }
+                const std::string piece = common_token_to_piece(ctx_tgt, eog, true);
+                turn_end = turn_end || (!piece.empty() && text_to(off_keep + piece.size()) &&
+                                        text.compare(off_keep, piece.size(), piece) == 0);
+            }
+            if (all_ws && turn_end) {
+                n_keep  = ct.size() - k;
+                ws_tail = true;
+            }
+        }
+        if ((!ws_tail && n_keep < 16) || n_keep == 0) {
+            return;
+        }
+        text_to(std::string::npos); // the rest of the prompt
+        if (off_keep >= text.size()) {
+            return;
+        }
+        const llama_tokens rest = common_tokenize(ctx_tgt, text.substr(off_keep), false, true);
+        if ((int64_t) (k + n_keep + rest.size()) >= (int64_t) slot.n_ctx) {
+            return;
+        }
+        const size_t n_before = pt.size();
+        task.tokens.keep_first(k); // the prefix keeps its images
+        for (size_t j = k; j < k + n_keep; ++j) {
+            task.tokens.push_back(ct[j]);
+        }
+        for (const llama_token t : rest) {
+            task.tokens.push_back(t);
+        }
+        if (task.params.message_delims) {
+            task.params.message_spans = task.tokens.find_message_spans(*task.params.message_delims);
+        }
+        SLT_INF(slot, "own tokens kept: %zu more of its %zu (common prefix %zu%s); prompt %zu -> %zu tokens\n",
+                n_keep, ct.size(), k, ws_tail ? ", trimmed whitespace" : "", n_before, task.tokens.size());
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
@@ -2797,6 +2900,8 @@ private:
                 slot.alora_invocation_start = alora_invocation_start;
             }
         }
+
+        splice_own_tokens(slot, task);
 
         if (!task.tokens.validate(ctx_tgt)) {
             send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
@@ -5847,6 +5952,18 @@ private:
 
                 GGML_ASSERT(accepted.size() >= 1);
 
+                // strixllama: a turn that ends at an accepted draft token (the end of turn drafted with what follows it,
+                // a newline, the next turn's start) drops the tokens after it as a rejected draft. Kept, they went into
+                // the slot's cache and memory, past the end of the answer, and the next request of the conversation -
+                // the answer, the end of turn, the next message - parted from the slot before the state it held: the
+                // whole answer was processed again from its checkpoint (326 of 810 tokens for a third chat turn)
+                for (size_t i = 0; i + 1 < accepted.size(); ++i) {
+                    if (llama_vocab_is_eog(vocab, accepted[i])) {
+                        accepted.resize(i + 1);
+                        break;
+                    }
+                }
+
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
                 const bool use_ckpt_tgt =
@@ -6242,6 +6359,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         json delims = json_value(data, "message_delimiters", json::array());
         auto delimiters = common_chat_msg_delimiters_parse(delims);
         delimiters.tokenize(ctx_server.vocab);
+        const auto message_delims = std::make_shared<const common_chat_msg_delimiters>(delimiters);
 
         for (size_t i = 0; i < inputs.size(); i++) {
             server_task task = server_task(type);
@@ -6255,7 +6373,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     meta->logit_bias_eog,
                     data);
 
-            task.params.message_spans = task.tokens.find_message_spans(delimiters);
+            task.params.message_spans  = task.tokens.find_message_spans(delimiters);
+            task.params.message_delims = message_delims;
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
