@@ -1246,6 +1246,10 @@ common_json common_tool_parameters_flatten(const common_json & params) {
     std::map<std::string, json>           props;
     std::set<std::string>                 required;
     std::set<std::string>                 forbidden;
+    // strixllama: alternatives that each require a property, but no property in all of them (OpenCase: caseType or
+    // caseId) - the flat list requires none, and the grammar let a call through with no parameter at all, which
+    // every alternative rejects. minProperties: 1 on the flat schema keeps that much (issue: Deep Rulith, 10-09)
+    bool                                  need_one = false;
     std::function<void(const json &, bool, int)> collect = [&](const json & s0, bool is_required, int depth) {
         if (depth > 16) {
             return;
@@ -1286,7 +1290,7 @@ common_json common_tool_parameters_flatten(const common_json & params) {
             if (!s.contains(key) || !s.at(key).is_array()) {
                 continue;
             }
-            size_t n_alt = 0;
+            size_t n_alt = 0, n_alt_req = 0;
             std::map<std::string, size_t> n_req;
             for (const auto & alt0 : s.at(key)) {
                 const json alt = resolve(alt0);
@@ -1295,19 +1299,26 @@ common_json common_tool_parameters_flatten(const common_json & params) {
                 }
                 ++n_alt;
                 collect(alt, false, depth + 1);
+                bool alt_req = alt.contains("minProperties") && alt.at("minProperties").is_number() &&
+                               alt.at("minProperties").get<double>() >= 1;
                 if (alt.contains("required") && alt.at("required").is_array()) {
                     for (const auto & r : alt.at("required")) {
                         if (r.is_string()) {
                             n_req[r.get<std::string>()]++;
+                            alt_req = true;
                         }
                     }
                 }
+                n_alt_req += alt_req ? 1 : 0;
             }
             if (is_required) {
                 for (const auto & [k, n] : n_req) {
                     if (n_alt > 0 && n == n_alt) {
                         required.insert(k);
                     }
+                }
+                if (n_alt > 0 && n_alt_req == n_alt) {
+                    need_one = true;
                 }
             }
         }
@@ -1330,6 +1341,10 @@ common_json common_tool_parameters_flatten(const common_json & params) {
     }
     out["properties"] = p;
     out["required"]   = r;
+    if (need_one && r.empty() && !p.empty() &&
+            !(out.contains("minProperties") && out.at("minProperties").is_number() && out.at("minProperties").get<double>() >= 1)) {
+        out["minProperties"] = 1;
+    }
     return out;
 }
 

@@ -121,7 +121,13 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                 // order provided.
                 auto args = p.permute("tool-" + name + "-args", required_args);
                 if (!optional_args.empty()) {
-                    args = args + p.zero_or_more(p.choice(optional_args));
+                    // strixllama: none required, but the schema takes no empty call (minProperties, e.g. alternatives
+                    // that each require one): at least one parameter. Deep Rulith's OpenCase came through empty twice
+                    const json flat = common_tool_parameters_flatten(parameters);
+                    const bool need_one = required_args.empty() && flat.is_object() && flat.contains("minProperties") &&
+                                          flat.at("minProperties").is_number() && flat.at("minProperties").get<double>() >= 1;
+                    args = need_one ? args + p.choice(optional_args) + p.zero_or_more(p.choice(optional_args))
+                                    : args + p.zero_or_more(p.choice(optional_args));
                 }
 
                 auto func = p.tool(p.tool_open("<function=" + p.tool_name(p.literal(name)) + ">\n") +
