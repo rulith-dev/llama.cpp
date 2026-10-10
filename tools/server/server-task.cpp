@@ -3039,6 +3039,7 @@ void server_prompt_cache::set_disk(const std::string & root, size_t limit_mib, b
     spc_stage stage;
     int n_skipped = 0;
     int n_old = 0;
+    int n_no_draft = 0;
     uint64_t old_bytes = 0;
     for (const auto & de : list_dir(dir, false)) {
         if (de.path().extension() != ".spc") {
@@ -3051,9 +3052,14 @@ void server_prompt_cache::set_disk(const std::string & root, size_t limit_mib, b
         std::string why;
         bool foreign = false, old = false;
         bool ok = scan_entry(stage, e, disk_has_mtmd, disk_version, why, foreign, old);
-        // rows of another size - a K/V cache of another type, or no draft where this server drafts - are as
-        // unusable as an older format, and go the same way
-        if (ok && e.version == (int32_t) SPC_V3 && row_tgt > 0 && (e.row_tgt != row_tgt || (row_dft > 0 && e.row_dft != row_dft))) {
+        // strixllama: a conversation saved with MTP off has no draft rows. It went with the rows of another size
+        // below, so turning MTP back on deleted every conversation saved meanwhile (7 of them, 3.6 GiB, 10-09). It
+        // stays: the lookup passes it over while this server drafts (load_runs), and it is there again with MTP off
+        if (ok && e.version == (int32_t) SPC_V3 && row_tgt > 0 && e.row_tgt == row_tgt && row_dft > 0 && e.row_dft == 0) {
+            ++n_no_draft;
+        } else if (ok && e.version == (int32_t) SPC_V3 && row_tgt > 0 && (e.row_tgt != row_tgt || (row_dft > 0 && e.row_dft != row_dft))) {
+            // rows of another size - a K/V cache of another type, another draft - are as unusable as an older
+            // format, and go the same way
             ok = false;
             old = true;
         }
@@ -3194,8 +3200,11 @@ void server_prompt_cache::set_disk(const std::string & root, size_t limit_mib, b
     disk_thread = std::thread([this] { disk_writer(); });
 
     if (n_old > 0) {
-        SRV_INF(" - disk cache: %d entries of a format before version %d removed, %.2f GiB with the objects no entry names any more\n",
+        SRV_INF(" - disk cache: %d entries of a format before version %d or of another K/V cache type removed, %.2f GiB with the objects no entry names any more\n",
                 n_old, disk_version, (old_bytes + orphan_bytes) / (1024.0 * 1024.0 * 1024.0));
+    }
+    if (n_no_draft > 0) {
+        SRV_INF(" - disk cache: %d conversations saved with MTP off are kept, and used again with MTP off\n", n_no_draft);
     }
     char orphans[64] = "";
     if (n_orphans > 0) {

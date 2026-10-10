@@ -20,6 +20,8 @@
 #include "vendor/hash/xxhash/xxhash.h"
 
 #include <algorithm>
+#include <atomic>
+#include <climits>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -351,6 +353,14 @@ static uint64_t tail_hash(const llama_tokens & text, int64_t p0, int32_t n) {
 static uint64_t tail_forks_key(const llama_tokens & text, int64_t n) {
     return XXH3_64bits(text.data(), (size_t) n*sizeof(llama_token)) ^ (uint64_t) n;
 }
+
+// strixllama: the draft length the manager's "Draft length" setting asks for, below the --spec-draft-n-max the server
+// started with (the manager starts it with at least 3): STRIX_SPEC_DRAFT_CAP at start, POST /strix/spec while it runs.
+// A change took a reload before, and a reload empties the slots and the RAM cache (10-09). 0: no drafting
+static std::atomic<int> g_strix_draft_cap{ [] {
+    const char * e = getenv("STRIX_SPEC_DRAFT_CAP");
+    return e && *e ? std::max(0, atoi(e)) : INT_MAX;
+}() };
 
 struct server_slot {
     int id;
@@ -836,6 +846,23 @@ struct server_slot {
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
 
+    // strixllama (issue #18): a sampled draft on one generating conversation is the table's length (2) or one more,
+    // whichever gives more tokens a second here. Each pass of either length shows whether its first two positions
+    // were accepted (acc1, acc2, running means); a pass of the longer one also shows the third given the first two
+    // (acc3) and costs its own time (ms[1] against ms[0]). Tokens a pass: 1 + acc1 + acc2, plus acc2 * acc3 for the
+    // longer one. Kept across the slot's requests: a conversation's next request is the same kind of text
+    // The length holds for a block of passes: each switch rebuilds the verify graph (another shape), and passes
+    // alternating between lengths measured the longer one ~30 ms dearer than it is. The first passes of a block are
+    // not timed.
+    struct spec_len_stats {
+        double acc1 = 0, acc2 = 0, acc3 = 0, ms[2] = { 0, 0 };
+        int    n_acc = 0, n_acc3 = 0, n_ms[2] = { 0, 0 };
+        int    block = 0, block_arm = 0, block_left = 0, block_untimed = 0;
+    } spec_len;
+    int     spec_len_arm = -1; // this pass: 0 the table's length, 1 one more, -1 not chosen here
+    int64_t spec_len_t   = 0;  // when this slot's previous pass ended (0: none to time from)
+    int     spec_len_used[2] = { 0, 0 };
+
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
 
@@ -873,6 +900,16 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
+        spec_len_arm = -1;
+        spec_len_t   = 0;
+        spec_len_used[0] = spec_len_used[1] = 0;
+        // the previous request's statistics stay as a start, at the weight of a few passes: a chat that turns from code
+        // to prose kept code's acceptance of the third position for hundreds of passes
+        spec_len.n_acc     = std::min(spec_len.n_acc, 16);
+        spec_len.n_acc3    = std::min(spec_len.n_acc3, 16);
+        spec_len.n_ms[0]   = std::min(spec_len.n_ms[0], 8);
+        spec_len.n_ms[1]   = std::min(spec_len.n_ms[1], 8);
+        spec_len.block_left = 0;
 
         n_predict_max = -1;
 
@@ -1171,6 +1208,10 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+            if (spec_len_used[0] + spec_len_used[1] > 0) {
+                SLT_INF(*this, "draft length: %d passes at the table's, %d at one more (acc %.2f %.2f %.2f, %.1f / %.1f ms a pass)\n",
+                        spec_len_used[0], spec_len_used[1], spec_len.acc1, spec_len.acc2, spec_len.acc3, spec_len.ms[0], spec_len.ms[1]);
+            }
         }
 
         common_speculative_print_stats(spec);
@@ -2740,10 +2781,12 @@ private:
     // a 31K chat turn (10-08/09). When the text after the common prefix starts with the text of the slot's own
     // remaining tokens, those tokens are kept as they are and only the text after them is tokenized again; the slot
     // continues where its answer ended. The tokens the model sees are the ones it produced, which is what its cache
-    // holds. Text only after the common prefix (an image before it stays); the cut falls at a token of the slot's own
-    // on a character boundary; at least 16 tokens. The template also trims an answer's content, so whitespace the model ended it with is missing from the
-    // text: when all the slot has left is whitespace and the text continues with the end of the turn, the slot keeps
-    // it too. STRIX_SPLICE_OWN=0: off.
+    // holds. The cut falls at a token of the slot's own on a character boundary, or after an image; at least 16
+    // tokens. Images go along: one of the slot's is kept where the prompt has the same image (by its id) at the same
+    // place, and the prompt's images after the cut - a screenshot with every turn - follow as they came. The template
+    // also trims an answer's content, so whitespace the model ended it with is missing from the text: when all the
+    // slot has left is whitespace and the text continues with the end of the turn, the slot keeps it too.
+    // STRIX_SPLICE_OWN=0: off.
     void splice_own_tokens(server_slot & slot, server_task & task) {
         static const bool on = !getenv("STRIX_SPLICE_OWN") || atoi(getenv("STRIX_SPLICE_OWN")) != 0;
         if (!on || !task.params.cache_prompt || slot.prompt.tokens.empty() || task.tokens.empty()) {
@@ -2755,44 +2798,90 @@ private:
         if (k == 0 || ct.size() <= k || pt.size() <= k) {
             return;
         }
-        for (size_t i = k; i < pt.size(); ++i) {
-            if (pt[i] == LLAMA_TOKEN_NULL) {
-                return; // an image or audio chunk after the prefix
-            }
-        }
-        for (size_t i = k; i < ct.size(); ++i) {
-            if (ct[i] == LLAMA_TOKEN_NULL) {
-                return;
-            }
-        }
-        // the prompt's text after the common prefix, built only as far as it is read
-        std::string text;
-        size_t n_text = k;
-        const auto text_to = [&](size_t n) {
-            while (text.size() < n && n_text < pt.size()) {
-                text += common_token_to_piece(ctx_tgt, pt[n_text++], true);
-            }
-            return text.size() >= n;
+        const auto n_media = [](const server_tokens & t, size_t i) {
+            return (size_t) mtmd_input_chunk_get_n_tokens(t.find_chunk(i).get());
         };
-        size_t off = 0, n_keep = 0, off_keep = 0, i = k;
-        for (; i < ct.size(); ++i) {
+        // the prompt after the common prefix in runs: text (its text built only as far as it is read) or one media chunk
+        struct run {
+            size_t      b, e;
+            bool        media;
+            std::string text;
+            size_t      n_text; // tokens of the run in text so far
+        };
+        std::vector<run> runs;
+        for (size_t i = k; i < pt.size(); ) {
+            const bool media = pt[i] == LLAMA_TOKEN_NULL;
+            size_t e = i;
+            if (media) {
+                e = i + n_media(pt, i);
+            } else {
+                while (e < pt.size() && pt[e] != LLAMA_TOKEN_NULL) {
+                    ++e;
+                }
+            }
+            runs.push_back({ i, e, media, std::string(), i });
+            i = e;
+        }
+        const auto text_to = [&](run & x, size_t n) {
+            while (x.text.size() < n && x.n_text < x.e) {
+                x.text += common_token_to_piece(ctx_tgt, pt[x.n_text++], true);
+            }
+            return x.text.size() >= n;
+        };
+        // walk the slot's remaining tokens along the prompt; at a cut, n_keep of them are kept and the prompt resumes
+        // in run r_keep at off_keep
+        std::vector<size_t> media_at; // for each of the slot's images kept, where the prompt's copy of it starts
+        size_t i = k, r = 0, off = 0, n_keep = 0, r_keep = 0, off_keep = 0;
+        while (i < ct.size() && r < runs.size()) {
+            if (ct[i] == LLAMA_TOKEN_NULL) {
+                // an image of the slot's: the prompt must have the same one next, after the whole of its text run
+                size_t rm = r;
+                if (!runs[rm].media) {
+                    text_to(runs[rm], std::string::npos);
+                    if (off != runs[rm].text.size() || ++rm >= runs.size() || !runs[rm].media) {
+                        break;
+                    }
+                }
+                const mtmd_input_chunk * a = ct.find_chunk(i).get();
+                const mtmd_input_chunk * b = pt.find_chunk(runs[rm].b).get();
+                const size_t n = mtmd_input_chunk_get_n_tokens(a);
+                if (n != mtmd_input_chunk_get_n_tokens(b) ||
+                        std::string(mtmd_input_chunk_get_id(a)) != std::string(mtmd_input_chunk_get_id(b))) {
+                    break;
+                }
+                media_at.push_back(runs[rm].b);
+                i += n;
+                r = rm + 1;
+                off = 0;
+                n_keep   = i - k;
+                r_keep   = r;
+                off_keep = 0;
+                continue;
+            }
+            run & x = runs[r];
+            if (x.media) {
+                break;
+            }
             const std::string piece = common_token_to_piece(ctx_tgt, ct[i], true);
-            if (piece.empty() || !text_to(off + piece.size()) || text.compare(off, piece.size(), piece) != 0) {
+            if (piece.empty() || !text_to(x, off + piece.size()) || x.text.compare(off, piece.size(), piece) != 0) {
                 break;
             }
             off += piece.size();
-            if (text_to(off + 1) && ((unsigned char) text[off] & 0xC0) == 0x80) {
+            ++i;
+            if (text_to(x, off + 1) && ((unsigned char) x.text[off] & 0xC0) == 0x80) {
                 continue; // inside a multi-byte character: not a place to cut
             }
-            n_keep   = i + 1 - k;
+            n_keep   = i - k;
+            r_keep   = r;
             off_keep = off;
         }
         // the trimmed end of an answer: whitespace only left in the slot, the end of the turn next in the text
         bool ws_tail = false;
-        if (i < ct.size() && k + n_keep == i && text_to(off_keep + 1)) {
+        if (i < ct.size() && k + n_keep == i && r == r_keep && r_keep < runs.size() && !runs[r_keep].media &&
+                text_to(runs[r_keep], off_keep + 1)) {
             bool all_ws = true;
             for (size_t j = i; j < ct.size() && all_ws; ++j) {
-                const std::string piece = common_token_to_piece(ctx_tgt, ct[j], true);
+                const std::string piece = ct[j] == LLAMA_TOKEN_NULL ? std::string() : common_token_to_piece(ctx_tgt, ct[j], true);
                 all_ws = !piece.empty() && piece.find_first_not_of(" \t\r\n") == std::string::npos;
             }
             bool turn_end = false;
@@ -2801,8 +2890,8 @@ private:
                     continue;
                 }
                 const std::string piece = common_token_to_piece(ctx_tgt, eog, true);
-                turn_end = turn_end || (!piece.empty() && text_to(off_keep + piece.size()) &&
-                                        text.compare(off_keep, piece.size(), piece) == 0);
+                turn_end = turn_end || (!piece.empty() && text_to(runs[r_keep], off_keep + piece.size()) &&
+                                        runs[r_keep].text.compare(off_keep, piece.size(), piece) == 0);
             }
             if (all_ws && turn_end) {
                 n_keep  = ct.size() - k;
@@ -2812,27 +2901,141 @@ private:
         if ((!ws_tail && n_keep < 16) || n_keep == 0) {
             return;
         }
-        text_to(std::string::npos); // the rest of the prompt
-        if (off_keep >= text.size()) {
-            return;
+        // after the kept tokens: the rest of a run cut inside its text, tokenized again, then the prompt's runs as they are
+        std::string rest_text;
+        size_t r_next = r_keep;
+        if (r_keep < runs.size() && !runs[r_keep].media && off_keep > 0) {
+            text_to(runs[r_keep], std::string::npos);
+            rest_text = runs[r_keep].text.substr(off_keep);
+            r_next    = r_keep + 1;
         }
-        const llama_tokens rest = common_tokenize(ctx_tgt, text.substr(off_keep), false, true);
-        if ((int64_t) (k + n_keep + rest.size()) >= (int64_t) slot.n_ctx) {
+        if (rest_text.empty() && r_next >= runs.size()) {
+            return; // nothing of the prompt after them
+        }
+        // the new tail after the common prefix, its images copied before the prompt lets go of them
+        struct item {
+            llama_token           tok;
+            mtmd::input_chunk_ptr media;
+        };
+        std::vector<item> tail;
+        size_t n_tail = 0;
+        const auto add_media = [&](size_t at) {
+            tail.push_back({ LLAMA_TOKEN_NULL, mtmd::input_chunk_ptr(mtmd_input_chunk_copy(pt.find_chunk(at).get())) });
+            n_tail += n_media(pt, at);
+        };
+        const auto add_tok = [&](llama_token t) {
+            tail.push_back({ t, nullptr });
+            n_tail++;
+        };
+        // the slot's own tokens; its images from the prompt, which has their data (the slot may hold placeholders)
+        for (size_t j = k, m = 0; j < k + n_keep; ) {
+            if (ct[j] == LLAMA_TOKEN_NULL) {
+                add_media(media_at[m]);
+                j += n_media(pt, media_at[m++]);
+            } else {
+                add_tok(ct[j++]);
+            }
+        }
+        if (!rest_text.empty()) {
+            for (const llama_token t : common_tokenize(ctx_tgt, rest_text, false, true)) {
+                add_tok(t);
+            }
+        }
+        for (size_t j = r_next < runs.size() ? runs[r_next].b : pt.size(); j < pt.size(); ) {
+            if (pt[j] == LLAMA_TOKEN_NULL) {
+                const size_t n = n_media(pt, j);
+                add_media(j);
+                j += n;
+            } else {
+                add_tok(pt[j++]);
+            }
+        }
+        if ((int64_t) (k + n_tail) >= (int64_t) slot.n_ctx) {
             return;
         }
         const size_t n_before = pt.size();
-        task.tokens.keep_first(k); // the prefix keeps its images
-        for (size_t j = k; j < k + n_keep; ++j) {
-            task.tokens.push_back(ct[j]);
-        }
-        for (const llama_token t : rest) {
-            task.tokens.push_back(t);
+        const size_t n_img = media_at.size();
+        task.tokens.keep_first(k); // pt[k] is text here, so the common prefix ends at a chunk boundary
+        for (auto & it : tail) {
+            if (it.media) {
+                task.tokens.push_back(it.media.get());
+            } else {
+                task.tokens.push_back(it.tok);
+            }
         }
         if (task.params.message_delims) {
             task.params.message_spans = task.tokens.find_message_spans(*task.params.message_delims);
         }
-        SLT_INF(slot, "own tokens kept: %zu more of its %zu (common prefix %zu%s); prompt %zu -> %zu tokens\n",
-                n_keep, ct.size(), k, ws_tail ? ", trimmed whitespace" : "", n_before, task.tokens.size());
+        SLT_INF(slot, "own tokens kept: %zu more of its %zu (common prefix %zu%s%s); prompt %zu -> %zu tokens\n",
+                n_keep, ct.size(), k, ws_tail ? ", trimmed whitespace" : "",
+                n_img ? (", " + std::to_string(n_img) + " image(s) with them").c_str() : "", n_before, task.tokens.size());
+    }
+
+    // strixllama (issue #18): STRIX_SPEC_LEN_ADAPT=0 keeps the sampled table's length (2.4.1 - 0.5.5)
+    static bool spec_len_on() {
+        static const bool on = !getenv("STRIX_SPEC_LEN_ADAPT") || atoi(getenv("STRIX_SPEC_LEN_ADAPT")) != 0;
+        return on;
+    }
+
+    // the table's length (0) or one more (1), for a block of SPEC_LEN_BLOCK passes: the one with more tokens a second.
+    // Tokens a pass: 1 + acc1 + acc2 for the shorter, plus acc2 * acc2 / acc1 for the longer - the third position
+    // accepted as often after the second as the second after the first, which came within 0.05 of the measurement on
+    // code, an agent and prose (10-10). The longer pass's time over the shorter's: 1.14 at short contexts (12-14%
+    // measured on all three), rising with the context to 1.30 at 85K (one more position 18.5 ms there,
+    // docs/decode-budget.md). Times measured while it runs went stale - a length not chosen is not timed again - and
+    // kept code at the short draft, so they only go to the log. Nothing is spent finding out: acc1 and acc2 show in
+    // every pass
+    static constexpr int    SPEC_LEN_BLOCK   = 32;
+    static constexpr int    SPEC_LEN_UNTIMED = 2;
+    static int choose_spec_len(server_slot & slot) {
+        auto & st = slot.spec_len;
+        if (st.block_left <= 0) {
+            ++st.block;
+            int arm = 0;
+            if (st.n_acc >= 16 && st.acc1 > 0.0) {
+                const double ctx   = (double) slot.prompt.n_tokens();
+                const double ratio = 1.14 + 0.16 * std::min(ctx / 85000.0, 1.5);
+                const double tok0  = 1.0 + st.acc1 + st.acc2;
+                const double tok1  = tok0 + st.acc2 * std::min(1.0, st.acc2 / st.acc1);
+                // the longer draft only when it is clearly ahead: near the line the estimate's error decides
+                arm = tok1 / ratio > 1.02 * tok0 ? 1 : 0;
+            }
+            st.block_untimed = arm != st.block_arm ? SPEC_LEN_UNTIMED : 0;
+            st.block_arm  = arm;
+            st.block_left = SPEC_LEN_BLOCK;
+        }
+        st.block_left--;
+        return st.block_arm;
+    }
+
+    // a pass's outcome: the acceptance of its positions and the time since the slot's previous pass
+    static void note_spec_len(server_slot & slot, size_t n_accepted) {
+        auto & st = slot.spec_len;
+        const int arm = slot.spec_len_arm;
+        const int64_t t = ggml_time_us();
+        if (arm < 0) {
+            slot.spec_len_t = 0;
+            return;
+        }
+        const auto mean = [](double & m, double x, int & n, int window) {
+            n++;
+            m += (x - m) / std::min(n, window);
+        };
+        mean(st.acc1, n_accepted >= 1 ? 1.0 : 0.0, st.n_acc, 128);
+        st.n_acc--; // counted once for the pass, below
+        mean(st.acc2, n_accepted >= 2 ? 1.0 : 0.0, st.n_acc, 128);
+        if (arm == 1 && n_accepted >= 2) {
+            mean(st.acc3, n_accepted >= 3 ? 1.0 : 0.0, st.n_acc3, 64);
+        }
+        if (st.block_untimed > 0) {
+            st.block_untimed--;           // the passes right after a switch pay for the other shape's graph
+        } else if (slot.spec_len_t > 0) {
+            const double ms = (t - slot.spec_len_t) / 1e3;
+            if (ms < 1000.0) {
+                mean(st.ms[arm], ms, st.n_ms[arm], 64);
+            }
+        }
+        slot.spec_len_t = t;
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
@@ -4494,6 +4697,7 @@ private:
         // for itself less often: STRIX_SPEC_DRAFT_BY_SLOTS_SAMPLED is its table, also with one slot (unset: as greedy).
         int n_draft_cap         = INT_MAX;
         int n_draft_cap_sampled = INT_MAX;
+        int n_gen               = 0;
         if (spec) {
             auto table = [](const char * name) {
                 std::vector<int> v;
@@ -4507,7 +4711,6 @@ private:
             };
             static const std::vector<int> by_slots         = table("STRIX_SPEC_DRAFT_BY_SLOTS");
             static const std::vector<int> by_slots_sampled = table("STRIX_SPEC_DRAFT_BY_SLOTS_SAMPLED");
-            int n_gen = 0;
             for (const auto & s : slots) {
                 n_gen += s.state == SLOT_STATE_GENERATING;
             }
@@ -4517,11 +4720,15 @@ private:
             n_draft_cap_sampled = n_gen > 0 && !by_slots_sampled.empty()
                 ? by_slots_sampled[std::min<size_t>(n_gen, by_slots_sampled.size()) - 1]
                 : n_draft_cap;
+            const int user_cap = g_strix_draft_cap.load(std::memory_order_relaxed);
+            n_draft_cap         = std::min(n_draft_cap, user_cap);
+            n_draft_cap_sampled = std::min(n_draft_cap_sampled, user_cap);
         }
+        const int n_draft_limit = spec ? std::min(common_speculative_n_max(spec.get()), g_strix_draft_cap.load(std::memory_order_relaxed)) : 0;
 
         // strixllama: the cells this step's answers take so far (see pool_guard_on)
         int64_t n_pool_step = 0;
-        const int64_t n_spec_max = spec ? std::min<int64_t>(common_speculative_n_max(spec.get()), std::max(n_draft_cap, n_draft_cap_sampled)) : 0;
+        const int64_t n_spec_max = spec ? std::min<int64_t>(n_draft_limit, std::max(n_draft_cap, n_draft_cap_sampled + 1)) : 0;
 
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
@@ -4561,7 +4768,15 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = std::min(slot.get_n_draft_max(), slot.spec_sampling ? n_draft_cap_sampled : n_draft_cap);
+                int cap = slot.spec_sampling ? n_draft_cap_sampled : n_draft_cap;
+                slot.spec_len_arm = -1;
+                if (slot.spec_sampling && n_gen == 1 && cap >= 2 && cap < n_draft_limit && cap < slot.get_n_draft_max() &&
+                        spec_len_on()) {
+                    slot.spec_len_arm = choose_spec_len(slot);
+                    cap += slot.spec_len_arm;
+                    slot.spec_len_used[slot.spec_len_arm]++;
+                }
+                const int n_draft_max = std::min(slot.get_n_draft_max(), cap);
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -6016,6 +6231,9 @@ private:
             if (slot.spec_is_replay && n_accepted > 0) {
                 n_accepted--;
             }
+            if (!slot.spec_is_replay) {
+                note_spec_len(slot, n_accepted);
+            }
             slot.spec_is_replay = false;
 
             slot.stats.update_gen_last();
@@ -6707,6 +6925,25 @@ json server_routes::get_model_info() const {
     return get_res_model_info(*meta);
 }
 
+// strixllama: POST /strix/spec {"draft_max": n} - the draft length from the next step on, no reload (see g_strix_draft_cap)
+static std::unique_ptr<server_res_generator> strix_spec_response(std::unique_ptr<server_res_generator> res, const server_http_req & req) {
+    json body;
+    try {
+        body = json::parse(req.body);
+    } catch (const std::exception &) {
+        body = json::object();
+    }
+    if (!body.is_object() || !body.contains("draft_max") || !body.at("draft_max").is_number_integer()) {
+        res->error(format_error_response("draft_max (an integer) is required", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    const int n = std::max(0, body.at("draft_max").get<int>());
+    g_strix_draft_cap.store(n, std::memory_order_relaxed);
+    SRV_INF("draft length set to %d\n", n);
+    res->ok({ { "draft_max", n } });
+    return res;
+}
+
 // strixllama: POST /strix/persist - see SERVER_TASK_TYPE_DISK_PERSIST
 static std::unique_ptr<server_res_generator> strix_persist_response(std::unique_ptr<server_res_generator> res, const server_http_req & req) {
     auto & rd = res->rd;
@@ -7382,6 +7619,10 @@ void server_routes::init_routes() {
 
     this->post_strix_persist = [this](const server_http_req & req) {
         return strix_persist_response(create_response(), req);
+    };
+
+    this->post_strix_spec = [this](const server_http_req & req) {
+        return strix_spec_response(create_response(), req);
     };
 }
 
