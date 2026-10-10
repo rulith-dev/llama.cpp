@@ -1384,9 +1384,19 @@ json oaicompat_chat_params_parse(
     // Parse the OAI "reasoning_effort" field; "none" disables reasoning.
     if (body.contains("reasoning_effort")) {
         auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
+        // strixllama (issue #17): the ends of other APIs' scales, which templates reject with an exception (HTTP 500),
+        // become the ends every template with levels has
+        if (reasoning_effort == "minimal") {
+            reasoning_effort = "low";
+        } else if (reasoning_effort == "max") {
+            reasoning_effort = "high";
+        }
         if (reasoning_effort == "none") {
             inputs.enable_thinking = false;
             inputs.chat_template_kwargs.erase("reasoning_effort");
+            // strixllama (issue #17): the template reads the kwarg too, and --reasoning on (or a default
+            // enable_thinking kwarg) set it to true: the request thought, at the template's default level
+            inputs.chat_template_kwargs["enable_thinking"] = "false";
         } else if (!reasoning_effort.empty()) {
             inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
         }
@@ -1395,7 +1405,55 @@ json oaicompat_chat_params_parse(
     inputs.force_pure_content = opt.force_pure_content;
 
     // Apply chat template to the list of messages
-    auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+    // strixllama (issue #17): what a template refuses (raise_exception on a value it does not take) is the request's
+    // to fix - HTTP 400, not a server error
+    common_chat_params chat_params;
+    try {
+        chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+    } catch (const std::invalid_argument &) {
+        throw;
+    } catch (const std::exception & e) {
+        // strixllama (issue #12): templates that take one system message, first (the original Qwen3.8 template, its
+        // fine-tunes), refused two at the start - /v1/responses' instructions followed by a developer message - with
+        // "System message must be at the beginning.": the leading ones become one system message, and the request is
+        // rendered again. Only a request that failed takes this path
+        size_t n_lead = 0;
+        while (n_lead < inputs.messages.size() &&
+               (inputs.messages[n_lead].role == "system" || inputs.messages[n_lead].role == "developer")) {
+            n_lead++;
+        }
+        if (n_lead < 2 || std::string(e.what()).find("must be at the beginning") == std::string::npos) {
+            throw std::invalid_argument(std::string("the chat template refused the request: ") + e.what());
+        }
+        common_chat_msg merged;
+        merged.role = "system";
+        bool parts = false;
+        for (size_t i = 0; i < n_lead; ++i) {
+            parts = parts || !inputs.messages[i].content_parts.empty();
+        }
+        for (size_t i = 0; i < n_lead; ++i) {
+            const auto & msg = inputs.messages[i];
+            if (!parts) {
+                merged.content += (i > 0 ? "\n\n" : "") + msg.content;
+                continue;
+            }
+            if (i > 0) {
+                merged.content_parts.push_back({ "text", "\n\n" });
+            }
+            if (msg.content_parts.empty()) {
+                merged.content_parts.push_back({ "text", msg.content });
+            } else {
+                merged.content_parts.insert(merged.content_parts.end(), msg.content_parts.begin(), msg.content_parts.end());
+            }
+        }
+        inputs.messages.erase(inputs.messages.begin(), inputs.messages.begin() + n_lead);
+        inputs.messages.insert(inputs.messages.begin(), merged);
+        try {
+            chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+        } catch (const std::exception & e2) {
+            throw std::invalid_argument(std::string("the chat template refused the request: ") + e2.what());
+        }
+    }
 
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;

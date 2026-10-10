@@ -747,6 +747,9 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
         if (thinking_type == "enabled") {
             int budget_tokens = json_value(thinking, "budget_tokens", 10000);
             oai_body["thinking_budget_tokens"] = budget_tokens;
+        } else if (thinking_type == "disabled") {
+            // strixllama (issue #17): ignored before, so the request thought at the server's default
+            oai_body["reasoning_effort"] = "none";
         }
     }
 
