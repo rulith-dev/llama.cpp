@@ -1435,6 +1435,156 @@ private:
 
     common_speculative_ptr spec;
 
+    // strixllama: the draft length when several conversations generate (STRIX_SPEC_ADAPT=0: the STRIX_SPEC_DRAFT_BY_SLOTS
+    // table). A draft position pays when the tokens its acceptance adds outweigh what the longer verify costs, and both
+    // vary with the text: on prose four conversations made the most tokens with one draft each and lost 16% with two,
+    // on repetitive text eight made 58% more with two than without (homogeneous prompts), and on eight distinct real
+    // tasks two conversations did best with three, four with two, eight with one (10-12). The verify's cost depends on
+    // how many experts the conversations' tokens share, and the drafter cuts a draft short where it is unsure. So each
+    // cap is judged by what it did on this server: per number of generating conversations and cap, running means of a
+    // step's time and of the tokens the step produced. A cap not yet seen there is tried first, one not seen for 256
+    // steps again, in probing blocks of a few steps; otherwise the best holds for a block of 16 steps, and moves only for
+    // one 3% ahead. One conversation keeps the table (and issue #18's choice)
+    struct spec_adapt_t {
+        static constexpr int NG = 9;   // generating conversations 2 .. 8 (more count as 8)
+        static constexpr int ND = 4;   // caps 0 .. 3
+        double  ms[NG][ND]  = {};      // a step's time, running mean
+        double  tok[NG][ND] = {};      // the tokens it produced, running mean
+        int     n[NG][ND]   = {};
+        int64_t at[NG][ND]  = {};      // the step it was last measured in
+        int64_t step    = 0;
+        int     d       = -1;          // the cap in force
+        int     d_ng    = 0;           // for this many generating conversations
+        int     left    = 0;           // steps it still holds
+        bool    probing = false;
+        int     untimed = 0;           // steps not measured after a change of shape (the new shape's graph is built)
+        // the step being measured
+        int64_t t0 = 0;
+        int64_t t_gen0 = 0;            // tokens generated before it, all slots
+        int     t_ng = 0, t_d = -1, t_gen_rows = 0;
+        bool    t_pure = false;
+    } spec_adapt;
+
+    static bool spec_adapt_on() {
+        static const bool on = !getenv("STRIX_SPEC_ADAPT") || atoi(getenv("STRIX_SPEC_ADAPT")) != 0;
+        return on;
+    }
+
+    static int spec_adapt_dbg() {
+        static const int v = getenv("STRIX_SPEC_ADAPT_DEBUG") ? atoi(getenv("STRIX_SPEC_ADAPT_DEBUG")) : 0;
+        return v;
+    }
+
+    int64_t spec_adapt_tokens_so_far() const {
+        int64_t n = 0;
+        for (const auto & sl : slots) {
+            n += sl.stats.n_gen;
+        }
+        return n;
+    }
+
+    // a step starts (pre_decode)
+    void spec_adapt_tick() {
+        auto & sa = spec_adapt;
+        sa.t0 = ggml_time_us();
+        sa.t_gen0 = spec_adapt_tokens_so_far();
+        sa.t_pure = false;
+        sa.t_ng = 0;
+        sa.t_d = -1;
+        sa.t_gen_rows = 0;
+        sa.step++;
+    }
+
+    // the step's last post_decode is done: measured if it carried only generation rows, under a chosen cap (not idle
+    // time between requests, not a prompt's prefill)
+    void spec_adapt_done() {
+        auto & sa = spec_adapt;
+        if (sa.t0 <= 0 || !sa.t_pure || sa.t_ng < 2 || sa.t_d < 0 || sa.t_d >= spec_adapt_t::ND) {
+            return;
+        }
+        if (sa.untimed > 0) {
+            sa.untimed--;
+            return;
+        }
+        const double  ms  = (ggml_time_us() - sa.t0) / 1e3;
+        const int64_t tok = spec_adapt_tokens_so_far() - sa.t_gen0;
+        if (tok <= 0 || tok > 64 * sa.t_ng) {
+            return;                    // a slot was reset in between
+        }
+        double & m = sa.ms[sa.t_ng][sa.t_d];
+        double & t = sa.tok[sa.t_ng][sa.t_d];
+        int    & n = sa.n[sa.t_ng][sa.t_d];
+        // a stall (another program, a disk read) is not this cap's time
+        if (ms < 2000.0 && (n < 4 || ms < 3.0 * m)) {
+            n = std::min(n + 1, 24);
+            m += (ms - m) / n;
+            t += ((double) tok - t) / n;
+            sa.at[sa.t_ng][sa.t_d] = sa.step;
+        }
+    }
+
+    // the draft cap for this step when ng (>= 2) conversations generate; table_d: the table's value (a start)
+    int spec_adapt_choose(int ng, int d_max, int table_d) {
+        auto & sa = spec_adapt;
+        ng = std::min(ng, spec_adapt_t::NG - 1);
+        d_max = std::min(d_max, spec_adapt_t::ND - 1);
+        if (sa.left > 0 && sa.d_ng == ng && sa.d >= 0 && sa.d <= d_max) {
+            sa.left--;
+            sa.t_ng = ng;
+            sa.t_d = sa.d;
+            return sa.d;
+        }
+        double tp[spec_adapt_t::ND];
+        for (int d = 0; d <= d_max; ++d) {
+            tp[d] = sa.n[ng][d] >= 2 ? sa.tok[ng][d] / sa.ms[ng][d] : -1.0;
+        }
+        const int d_prev = (sa.d_ng == ng && sa.d >= 0 && sa.d <= d_max) ? sa.d : std::min(std::max(table_d, 0), d_max);
+        // a cap to probe: one never measured here, else the stalest one past 256 steps
+        int probe = -1;
+        for (int d = 0; d <= d_max && probe < 0; ++d) {
+            if (sa.n[ng][d] < 2) {
+                probe = d;
+            }
+        }
+        if (probe < 0) {
+            int64_t oldest = 256;
+            for (int d = 0; d <= d_max; ++d) {
+                if (d != d_prev && sa.step - sa.at[ng][d] > oldest) {
+                    oldest = sa.step - sa.at[ng][d];
+                    probe = d;
+                }
+            }
+        }
+        int d_new = d_prev;
+        if (probe < 0) {
+            int d_best = d_prev;
+            for (int d = 0; d <= d_max; ++d) {
+                if (tp[d] > tp[d_best]) {
+                    d_best = d;
+                }
+            }
+            if (tp[d_prev] <= 0.0 || tp[d_best] > 1.03 * tp[d_prev]) {
+                d_new = d_best;        // clearly ahead: near the line the measurements' noise decides
+            }
+        }
+        const int d_go = probe >= 0 ? probe : d_new;
+        if (spec_adapt_dbg()) {
+            SRV_INF("spec adapt: %d generating, tok/ms %.4f %.4f %.4f %.4f -> cap %d%s (step %lld)\n", ng,
+                    tp[0], d_max >= 1 ? tp[1] : -1.0, d_max >= 2 ? tp[2] : -1.0, d_max >= 3 ? tp[3] : -1.0, d_go,
+                    probe >= 0 ? " (probe)" : "", (long long) sa.step);
+        }
+        if (d_go != sa.d || ng != sa.d_ng) {
+            sa.untimed = 1;
+        }
+        sa.probing = probe >= 0;
+        sa.d    = d_go;
+        sa.d_ng = ng;
+        sa.left = sa.probing ? 3 : 15;
+        sa.t_ng = ng;
+        sa.t_d  = d_go;
+        return d_go;
+    }
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -4568,6 +4718,10 @@ private:
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
         }
 
+        if (spec && spec_adapt_on()) {
+            spec_adapt.t_pure = spec_adapt.t_gen_rows > 0 && batch.size() == spec_adapt.t_gen_rows;
+        }
+
         llama_batch batch_view;
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
@@ -4610,10 +4764,17 @@ private:
                 break; // stop any further processing
             }
         }
+        if (spec && spec_adapt_on()) {
+            spec_adapt_done();
+        }
         if (strixllama_spec_timing::enabled()) { g_spec_timing.t_exit = ggml_time_us(); }
     }
 
     void pre_decode() {
+        if (spec && spec_adapt_on()) {
+            spec_adapt_tick();
+        }
+
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -4723,6 +4884,10 @@ private:
             const int user_cap = g_strix_draft_cap.load(std::memory_order_relaxed);
             n_draft_cap         = std::min(n_draft_cap, user_cap);
             n_draft_cap_sampled = std::min(n_draft_cap_sampled, user_cap);
+            if (n_gen >= 2 && spec_adapt_on()) {
+                const int d_max = std::min(common_speculative_n_max(spec.get()), user_cap);
+                n_draft_cap = n_draft_cap_sampled = spec_adapt_choose(n_gen, d_max, std::min(n_draft_cap, d_max));
+            }
         }
         const int n_draft_limit = spec ? std::min(common_speculative_n_max(spec.get()), g_strix_draft_cap.load(std::memory_order_relaxed)) : 0;
 
@@ -4914,6 +5079,9 @@ private:
         iterate(generating, [&](server_slot & slot) {
             slot.handle_last_sampled_token(batch);
         });
+        if (spec && spec_adapt_on()) {
+            spec_adapt.t_gen_rows = batch.size();
+        }
 
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
