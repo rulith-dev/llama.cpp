@@ -2318,6 +2318,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
         q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
         k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
 
+        // strixllama: ggml-cuda runs the conv - and these two norms - straight from x_g and the gathered state rows at the
+        // conv's node (gdn-conv.cu), and the allocator frees both after the concat, the last node reading them: the SiLU's
+        // output could land on them while that pass reads them. The norms' outputs take the state rows (3 x channels) as
+        // an extra source, which no backend reads and which keeps them allocated past the SiLU's. x_g kept too raised the
+        // compute buffer by 50 MB: gdn-conv.cu copies the halos when the SiLU's output is x_g's block, and falls back when
+        // it is elsewhere on it
+        if (q_conv->op == GGML_OP_SCALE && k_conv->op == GGML_OP_SCALE && conv_input->op == GGML_OP_CONCAT) {
+            for (ggml_tensor * t : { q_conv, k_conv }) {
+                GGML_ASSERT(t->src[1] == nullptr);
+                t->src[1] = conv_input->src[0];
+            }
+        }
+
         // repeat to match shapes when head keys != value keys; unneeded with the fused GDN (and the deferred-rollback
         // net)
         if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch) && lazy_mode != 1) {

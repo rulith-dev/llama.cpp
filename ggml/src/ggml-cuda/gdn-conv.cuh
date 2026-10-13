@@ -9,8 +9,20 @@ struct ggml_cuda_gdn_conv_match {
     ggml_tensor * conv_out = nullptr;
     int64_t C = 0, T = 0, tail_from = 0;  // first concat column that must be materialized
     bool silu = false;
+    bool alias = false;                   // the SiLU's output is x's own memory (the halos are copied first)
+};
+// strixllama: the q and k L2 norms right after the conv's SiLU (VIEW, RMS_NORM, SCALE twice), done in the conv's pass
+struct ggml_cuda_gdn_conv_norm {
+    ggml_tensor * q = nullptr, * k = nullptr;   // the SCALE nodes: [D, H, T], never written (the net reads the SiLU's rows)
+    int64_t nq = 0;                              // channels of q (= of k): the first 2 nq of the conv's are normed
+    float eps = 0.0f, scale = 1.0f, bias = 0.0f;
+    int last = -1;                               // the last node it covers (the second SCALE)
+    const ggml_tensor * vq = nullptr, * vk = nullptr;   // the views of the SiLU the norms read
+    const ggml_tensor * gdn = nullptr;           // the net that reads the norms' outputs (only it)
 };
 bool ggml_cuda_gdn_conv_match_at_concat(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv_match & m);
 bool ggml_cuda_gdn_conv_match_at_conv(const ggml_cgraph * cgraph, int j, ggml_cuda_gdn_conv_match & m);
+bool ggml_cuda_gdn_conv_norm_match(const ggml_cgraph * cgraph, const ggml_cuda_gdn_conv_match & m, ggml_cuda_gdn_conv_norm & n);
 void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
 void ggml_cuda_gdn_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
+void ggml_cuda_gdn_conv_norm_run(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m, const ggml_cuda_gdn_conv_norm & n);

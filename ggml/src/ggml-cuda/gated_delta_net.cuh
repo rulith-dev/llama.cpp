@@ -13,6 +13,11 @@ struct ggml_cuda_gated_delta_net_fused_cache {
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// strixllama: the next run of the net gdn reads q and k from q / k with these strides (in floats: head, token, sequence)
+// instead of its sources' data - gdn-conv.cu's fused conv wrote them normed into the SiLU's rows, and the norms' outputs
+// the sources name are never written
+void ggml_cuda_gdn_qk_from(const ggml_tensor * gdn, const float * q, const float * k, int64_t s1, int64_t s2, int64_t s3);
+
 // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
 void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                               ggml_cuda_gated_delta_net_fused_cache cache);

@@ -5244,6 +5244,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return 1;
         }
         if (node->op == GGML_OP_SSM_CONV && ggml_cuda_gdn_conv_match_at_conv(cgraph, i, gm)) {
+            // strixllama: with the q and k norms after it in the same pass (STRIX_GDN_CONV_NORM=0: off)
+            ggml_cuda_gdn_conv_norm gn;
+            if (ggml_cuda_gdn_conv_norm_match(cgraph, gm, gn)) {
+                ggml_cuda_gdn_conv_norm_run(*cuda_ctx, gm, gn);
+                return gn.last - i;
+            }
             ggml_cuda_gdn_conv_direct(*cuda_ctx, gm);
             return 1;
         }
