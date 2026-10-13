@@ -1,5 +1,12 @@
 # llama.cpp
 
+> **This is the inference engine of [Rulith Inference](https://github.com/rulith-dev/rulith-inference)**, a Windows app
+> that runs Qwen3.8-Flash-Next on one AMD Strix Halo machine. Get the app from its
+> [releases](https://github.com/rulith-dev/rulith-inference/releases), and report problems and ideas
+> [there](https://github.com/rulith-dev/rulith-inference/issues). This branch (`rulith`) is upstream llama.cpp plus the
+> patch set that repository keeps in `patches/`, which `bootstrap/` replays onto the pinned upstream revision.
+> Everything below is upstream's README.
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">

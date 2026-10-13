@@ -138,6 +138,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
     // skip device enumeration so the CUDA primary context stays uncreated
     common_params_print_info(params, !is_router_server);
+    SRV_INF("Rulith Inference engine, build %s - https://github.com/rulith-dev/rulith-inference\n", llama_build_info());
 
     if (!is_router_server) {
         // validate batch size for embeddings
