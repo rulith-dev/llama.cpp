@@ -950,7 +950,15 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         GGML_ASSERT(t0 == n_tokens);
     }
 
-    const int64_t n_embd_all = batch.embd ? (int64_t) n_tokens*n_embd : 0;
+    // strixllama: a ubatch of consecutive tokens of the batch reads their embedding rows where they are, as the
+    // whole-batch ubatch does. Copied - after zero-filling the copy - the rows of an 8192-token MTP catch-up (40 KB a
+    // token, 335 MB) took ~70 ms of one thread before its first pass. The batch outlives its ubatches
+    bool embd_in_place = batch.embd != nullptr && !idxs.empty();
+    for (size_t i = 1; embd_in_place && i < idxs.size(); ++i) {
+        embd_in_place = idxs[i] == idxs[0] + (int32_t) i;
+    }
+
+    const int64_t n_embd_all = batch.embd && !embd_in_place ? (int64_t) n_tokens*n_embd : 0;
     const int64_t n_pos_all  =              (int64_t) n_tokens*n_pos_per_embd;
 
     udata->token     .resize(n_tokens);
@@ -971,7 +979,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
             udata->token[i] = batch.token[idxs[i]];
         }
 
-        if (batch.embd) {
+        if (batch.embd && !embd_in_place) {
             memcpy(udata->embd.data() + i*n_embd, batch.embd + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
         }
 
@@ -1024,7 +1032,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.n_pos        =*/ n_pos_per_embd,
 
         /*.token        =*/ batch.token ? udata->token.data() : nullptr,
-        /*.embd         =*/ batch.embd ? udata->embd.data() : nullptr,
+        /*.embd         =*/ batch.embd ? (embd_in_place ? batch.embd + (int64_t) idxs[0]*n_embd : udata->embd.data()) : nullptr,
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
         /*.seq_id       =*/ udata->seq_id.data(),
