@@ -127,7 +127,7 @@ enum mmvq_parameter_table_id {
 // the MoE down projection, each reading 360 bytes of IQ4_NL. Wider blocks reuse the activation
 // vector across rows and cut the grid by this factor.
 #ifndef STRIX_MMVQ_RDNA35_ROWS
-#define STRIX_MMVQ_RDNA35_ROWS 2
+#define STRIX_MMVQ_RDNA35_ROWS 4
 #endif
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
