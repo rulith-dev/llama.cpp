@@ -2759,7 +2759,9 @@ static void strix_tl_after(ggml_backend_cuda_context * ctx, const void * graph_k
             fprintf(stderr, "GPU_ORDER %5zu %9.2f us  %s\n", k, (double) (int64_t) (ts[k + 2] - ts[k + 1]) * us - overhead, c.keys[k].c_str());
         }
     }
-    if (++a.readings % 8 != 0) {
+    // STRIX_GPU_TIMELINE_PRINT=n: a table every n readings (default 8; 1 for a single prompt)
+    static const int print_every = getenv("STRIX_GPU_TIMELINE_PRINT") ? std::max(1, atoi(getenv("STRIX_GPU_TIMELINE_PRINT"))) : 8;
+    if (++a.readings % print_every != 0) {
         return;
     }
     std::vector<std::pair<std::string, std::pair<double, double>>> rows(a.by_class.begin(), a.by_class.end());
@@ -6597,7 +6599,9 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 
 static void strix_ab_step(const ggml_cgraph * cgraph) {
     static const int every = getenv("STRIX_AB") ? atoi(getenv("STRIX_AB")) : 0;
-    if (every <= 0 || cgraph->n_nodes < 64 || ggml_nrows(cgraph->nodes[0]) >= 64) {
+    // STRIX_AB_MIN_NODES=n: only graphs of at least n nodes count (with MTP: the verify passes, a step apart)
+    static const int min_nodes = getenv("STRIX_AB_MIN_NODES") ? atoi(getenv("STRIX_AB_MIN_NODES")) : 64;
+    if (every <= 0 || cgraph->n_nodes < min_nodes || ggml_nrows(cgraph->nodes[0]) >= 64) {
         return;
     }
     // the wall time from one decode graph's compute to the next, by side (a whole step for one conversation without
