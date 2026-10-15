@@ -6231,6 +6231,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
             strix_tl_start(cuda_ctx, cgraph, graph_key);
+            // strixllama: no conv state copy left marked from a graph that stopped early (node addresses are reused)
+            ggml_cuda_gdn_conv_tail_reset();
 
             if (stream_ctx.concurrent_events.size() > 0) {
                 should_launch_concurrent_events = true;
@@ -6408,6 +6410,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 // strixllama: a state gather the gated delta net does without (see ggml_cuda_gdn_gather_skip)
                 if (ggml_cuda_gdn_gather_skip(cgraph, i)) {
+                    continue;
+                }
+                // strixllama: a conv state copy the conv's kernel does (ggml_cuda_gdn_conv_match::n_tail)
+                if (ggml_cuda_gdn_conv_tail_skip(node)) {
                     continue;
                 }
 

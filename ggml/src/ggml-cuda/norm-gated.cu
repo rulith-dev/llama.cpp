@@ -128,14 +128,14 @@ bool ggml_cuda_rms_rows_plain(const float * x, float * dst, int ncols, int64_t n
 }
 
 // strixllama: RMS_NORM of narrow rows followed by SCALE, its only reader (STRIX_NORM_SCALE=0: off)
-int ggml_cuda_norm_scale_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_norm_scale_match & m) {
+int ggml_cuda_norm_scale_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_norm_scale_match & m, int64_t min_rows) {
     static const bool on = !getenv("STRIX_NORM_SCALE") || atoi(getenv("STRIX_NORM_SCALE")) != 0;
     if (!on || !norm_rows_enabled() || i + 1 >= cgraph->n_nodes) return 0;
     const ggml_tensor * rms = cgraph->nodes[i]; ggml_tensor * sc = cgraph->nodes[i+1];
     if (rms->op != GGML_OP_RMS_NORM || sc->op != GGML_OP_SCALE || sc->src[0] != rms || !ggml_node_has_n_uses(cgraph, i, 1)) return 0;
     const ggml_tensor * x = rms->src[0];
     if (x->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 || sc->type != GGML_TYPE_F32 || x->nb[0] != 4) return 0;
-    if (x->ne[0] > 256 || x->ne[0] % 32 != 0 || x->ne[1] * x->ne[2] * x->ne[3] < 4096) return 0;
+    if (x->ne[0] > 256 || x->ne[0] % 32 != 0 || x->ne[1] * x->ne[2] * x->ne[3] < min_rows) return 0;
     if (!ggml_is_contiguous(rms) || !ggml_is_contiguous(sc) || !ggml_are_same_shape(rms, sc)) return 0;
     float eps; memcpy(&eps, rms->op_params, sizeof(float)); if (eps < 0.0f) return 0;
     float s, b; memcpy(&s, (const float *) sc->op_params + 0, sizeof(float)); memcpy(&b, (const float *) sc->op_params + 1, sizeof(float));

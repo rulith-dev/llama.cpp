@@ -2,6 +2,7 @@
 #include "unary.cuh"
 #include "norm-gated.cuh"
 #include "gated_delta_net.cuh"
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -10,6 +11,44 @@
 // STRIX_GDN_CONV_HALO=1: the halo copies even when the conv's output is not x's memory (a test of that path)
 static bool gdn_conv_force_halo() { static const bool v = getenv("STRIX_GDN_CONV_HALO") && atoi(getenv("STRIX_GDN_CONV_HALO")) != 0; return v; }
 static bool gdn_conv_enabled() { static const int v = getenv("LLAMA_GDN_CONV") ? atoi(getenv("LLAMA_GDN_CONV")) : 0; return v != 0; }
+
+// strixllama: STRIX_GDN_CONV_NORM_LAZY=0 - the deferred-rollback net reads the unfused norms' q and k (-1: the STRIX_AB side)
+static bool gdn_conv_norm_lazy() {
+    static const int v = getenv("STRIX_GDN_CONV_NORM_LAZY") ? atoi(getenv("STRIX_GDN_CONV_NORM_LAZY")) : 1;
+    return v > 0 || (v < 0 && ggml_cuda_strix_ab());
+}
+// strixllama: STRIX_GDN_CONV_TAIL=0 - the decode batch's state copies stay CPY nodes (-1: the STRIX_AB side)
+static bool gdn_conv_tail_on() {
+    static const int v = getenv("STRIX_GDN_CONV_TAIL") ? atoi(getenv("STRIX_GDN_CONV_TAIL")) : 1;
+    return v > 0 || (v < 0 && ggml_cuda_strix_ab());
+}
+
+// the state copies a kernel of the conv does (ggml_cuda_gdn_conv_match::n_tail): slot s gets the concat's columns
+// col[s] .. col[s] + 2 of every channel, laid out as the CPY of that [3, C] view into a contiguous row writes them
+struct gdn_conv_tails {
+    float * dst[8];
+    int     col[8];
+    int     n;
+};
+
+static gdn_conv_tails gdn_conv_tails_of(const ggml_cuda_gdn_conv_match & m) {
+    gdn_conv_tails tl = {};
+    tl.n = m.n_tail;
+    for (int s = 0; s < m.n_tail; ++s) { tl.dst[s] = m.tail_dst[s]; tl.col[s] = m.tail_col[s]; }
+    return tl;
+}
+
+// a thread's channel, before the kernel writes anything (its output may be x's own memory)
+static __device__ __forceinline__ void gdn_conv_write_tails(const gdn_conv_tails & tl, const float * __restrict__ state,
+        const float * x, const int C, const int c) {
+    for (int s = 0; s < tl.n; ++s) {
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            const int col = tl.col[s] + k;
+            tl.dst[s][c * 3 + k] = col < 3 ? state[c * 3 + col] : x[(size_t) (col - 3) * C + c];
+        }
+    }
+}
 
 // tail-only materialization of the concat: columns [tail_from, T+3) of every channel row
 static __global__ void gdn_concat_tail(const float * __restrict__ state, const float * __restrict__ x, float * __restrict__ out,
@@ -45,10 +84,12 @@ static __device__ __forceinline__ float gdn_conv_start(const float * __restrict_
 
 template <bool apply_silu, int TT>
 static __global__ void __launch_bounds__(256) gdn_conv_direct_kernel(const float * __restrict__ state, const float * x,
-        const float * __restrict__ w, float * y, const int C, const int T, const float * __restrict__ halo) {
+        const float * __restrict__ w, float * y, const int C, const int T, const float * __restrict__ halo,
+        const gdn_conv_tails tails = {}) {
     const int c  = blockIdx.x * 256 + threadIdx.x;
     const int t0 = blockIdx.y * TT;
     if (c >= C) return;
+    if (tails.n > 0 && blockIdx.y == 0) gdn_conv_write_tails(tails, state, x, C, c);
     float wr[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) wr[j] = w[c * 4 + j];
@@ -84,9 +125,10 @@ static __device__ __forceinline__ float gdn_xor_tree(float v) {
 template <int TT, int TB>
 static __global__ void __launch_bounds__(256) gdn_conv_norm_kernel(const float * __restrict__ state, const float * x,
         const float * __restrict__ w, float * y, const int C, const int T, const int nq, const int ncols, const float eps,
-        const float post_scale, const float post_bias, const float * __restrict__ halo) {
+        const float post_scale, const float post_bias, const float * __restrict__ halo, const gdn_conv_tails tails = {}) {
     const int c  = blockIdx.x * 256 + threadIdx.x;
     const int t0 = blockIdx.y * TT;
+    if (tails.n > 0 && blockIdx.y == 0) gdn_conv_write_tails(tails, state, x, C, c);
     float wr[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) wr[j] = w[c * 4 + j];
@@ -180,9 +222,12 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
     if (st->ne[0] != 3 || st->ne[1] != C || st->ne[2] != 1 || st->ne[3] != 1 || !ggml_is_contiguous(st)) return false;
     if (tr->ne[0] != T || tr->ne[1] != C || tr->view_offs != 0) return false;
     if (cc->ne[0] != T + 3 || cc->ne[1] != C || cc->ne[2] != 1 || cc->ne[3] != 1 || !ggml_is_contiguous(cc)) return false;
-    if (T < 256 || C % 256 != 0) return false;
+    // strixllama: STRIX_GDN_CONV_MIN_T - the fewest tokens the fused conv takes (a decode step: 1)
+    static const int min_t = getenv("STRIX_GDN_CONV_MIN_T") ? atoi(getenv("STRIX_GDN_CONV_MIN_T")) : 1;
+    if (T < min_t || C % 256 != 0) return false;
     if (i + 1 >= cgraph->n_nodes || cgraph->nodes[i + 1]->op != GGML_OP_VIEW || cgraph->nodes[i + 1]->view_src != cc) return false;
     int64_t tail_from = T + 3; int conv = -1;
+    int cpys[8]; int ncpy = 0; bool cont_reader = false;
     for (int n = i + 1; n < cgraph->n_nodes && n < i + 64; ++n) {
         const ggml_tensor * t = cgraph->nodes[n];
         if (t->op == GGML_OP_SSM_CONV && t->src[0] == cc) { conv = n; break; }
@@ -194,9 +239,13 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
             const int64_t col = (int64_t) (t->view_offs / sizeof(float)); if (col < 0 || col + 3 > T + 3) return false;
             tail_from = std::min(tail_from, col); continue;
         }
-        if (t->op == GGML_OP_CONT && t->src[0]->op == GGML_OP_VIEW && t->src[0]->view_src == cc) continue;
+        if (t->op == GGML_OP_CONT && t->src[0]->op == GGML_OP_VIEW && t->src[0]->view_src == cc) { cont_reader = true; continue; }
         // strixllama: the state update copies the tail straight out of the concat now, without a cont first
-        if (t->op == GGML_OP_CPY && t->src[0]->op == GGML_OP_VIEW && t->src[0]->view_src == cc) continue;
+        if (t->op == GGML_OP_CPY && t->src[0]->op == GGML_OP_VIEW && t->src[0]->view_src == cc) {
+            if (ncpy < 8) cpys[ncpy] = n;
+            ++ncpy;
+            continue;
+        }
         return false;
     }
     if (conv < 0) return false;
@@ -219,6 +268,33 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
     m.alias = alias;
     m.concat_idx = i; m.conv_idx = conv; m.x = x; m.state = st; m.concat = cc; m.w = w; m.conv_out = cgraph->nodes[conv + 1];
     m.C = C; m.T = T; m.tail_from = tail_from; m.silu = true;
+    // a decode batch: the copies of the tail into the cache rows, each a [3, C] view of the concat to a contiguous row
+    // its CPY's only effect, done by the conv's kernel instead (ggml_cuda_gdn_conv_tail_skip)
+    m.n_tail = 0;
+    if (gdn_conv_tail_on() && T <= 8 && !cont_reader && ncpy > 0 && ncpy <= 8) {
+        bool ok = true;
+        for (int q = 0; q < ncpy && ok; ++q) {
+            const ggml_tensor * cp = cgraph->nodes[cpys[q]];
+            const ggml_tensor * sv = cp->src[0], * dv = cp->src[1];
+            ok = sv->ne[0] == 3 && sv->ne[1] == C && sv->ne[2] == 1 && sv->ne[3] == 1 && sv->nb[0] == sizeof(float) &&
+                 sv->nb[1] == cc->nb[1] && sv->view_offs % sizeof(float) == 0 && sv->view_offs / sizeof(float) + 3 <= (size_t) (T + 3) &&
+                 dv != nullptr && dv->type == GGML_TYPE_F32 && dv->data != nullptr && ggml_nelements(dv) == 3 * C &&
+                 ggml_is_contiguous(dv) && cp->type == GGML_TYPE_F32 && ggml_node_get_use_count(cgraph, cpys[q]) == 0;
+            if (ok) {
+                m.tail_dst[q] = (float *) dv->data;
+                m.tail_col[q] = (int) (sv->view_offs / sizeof(float));
+                m.tail_cpy[q] = cp;
+            }
+        }
+        // nothing after the conv reads the concat (it is not written at all)
+        for (int n = conv + 1; n < cgraph->n_nodes && ok; ++n) {
+            const ggml_tensor * t = cgraph->nodes[n];
+            for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
+                if (t->src[s] == cc || t->src[s]->view_src == cc) ok = false;
+            }
+        }
+        if (ok) m.n_tail = ncpy;
+    }
     return true;
 }
 
@@ -258,7 +334,8 @@ bool ggml_cuda_gdn_conv_norm_match(const ggml_cgraph * cgraph, const ggml_cuda_g
         if (k + 2 >= cgraph->n_nodes) return false;
         const ggml_tensor * v = cgraph->nodes[k];
         if (v->op != GGML_OP_VIEW || v->view_src != y || cgraph->nodes[k + 1]->op != GGML_OP_RMS_NORM || cgraph->nodes[k + 1]->src[0] != v) return false;
-        if (ggml_cuda_norm_scale_match_at(cgraph, k + 1, sm[r]) <= 0 || sm[r].dst != cgraph->nodes[k + 2] || sm[r].x != v) return false;
+        // any number of rows: the fused kernel's row code is rms_rows_f32's at every count
+        if (ggml_cuda_norm_scale_match_at(cgraph, k + 1, sm[r], 0) <= 0 || sm[r].dst != cgraph->nodes[k + 2] || sm[r].x != v) return false;
         if (ggml_node_get_use_count(cgraph, k) != 1) return false;   // a view: has_n_uses refuses views, the scan below covers the rest
         if (v->ne[0] != 128 || v->nb[0] != sizeof(float) || v->nb[1] != 128 * sizeof(float) || v->ne[2] != m.T || v->ne[3] != 1 ||
             v->nb[2] != (size_t) m.C * sizeof(float) || v->view_offs % sizeof(float)) return false;
@@ -291,12 +368,13 @@ bool ggml_cuda_gdn_conv_norm_match(const ggml_cgraph * cgraph, const ggml_cuda_g
     }
     n.q = vq == views[0] ? sm[0].dst : sm[1].dst;
     n.k = vq == views[0] ? sm[1].dst : sm[0].dst;
-    // their only reader: the plain net (not the deferred-rollback one), as its q and k
+    // their only reader: the net, plain or with deferred rollback (mode 1; mode 2 is the replay alone), as its q and k
     n.gdn = nullptr;
     for (int t = js + 7; t < cgraph->n_nodes && t < js + 64; ++t) {
         const ggml_tensor * g = cgraph->nodes[t];
         if (g->op == GGML_OP_GATED_DELTA_NET && (g->src[0] == n.q || g->src[1] == n.q)) {
-            if (g->src[0] != n.q || g->src[1] != n.k || ggml_get_op_params_i32(g, 1) != 0) return false;
+            const int mode = ggml_get_op_params_i32(g, 1);
+            if (g->src[0] != n.q || g->src[1] != n.k || (mode != 0 && (mode != 1 || !gdn_conv_norm_lazy()))) return false;
             n.gdn = g;
             break;
         }
@@ -343,8 +421,11 @@ void ggml_cuda_gdn_conv_norm_run(ggml_backend_cuda_context & ctx, const ggml_cud
         }
     }
     float * y = (float *) m.conv_out->data;
-    gdn_conv_norm_kernel<TT, TB><<<grid, 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.x->data,
-        (const float *) m.w->data, y, (int) m.C, (int) m.T, (int) n.nq, 128, n.eps, n.scale, n.bias, halo);
+    // a decode batch: rounds of one token, the kernel's code a fraction of the eight-token round's (it is fetched anew at
+    // every launch between the large products); the same per-row operations
+    auto kernel = m.T <= 8 ? gdn_conv_norm_kernel<TT, 1> : gdn_conv_norm_kernel<TT, TB>;
+    kernel<<<grid, 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.x->data,
+        (const float *) m.w->data, y, (int) m.C, (int) m.T, (int) n.nq, 128, n.eps, n.scale, n.bias, halo, gdn_conv_tails_of(m));
     CUDA_CHECK(cudaGetLastError());
     ggml_cuda_gdn_qk_from(n.gdn, y, y + n.nq, 128, m.C, m.C * m.T);
     if (do_check) {
@@ -368,7 +449,29 @@ void ggml_cuda_gdn_conv_norm_run(ggml_backend_cuda_context & ctx, const ggml_cud
     }
 }
 
+static std::vector<const ggml_tensor *> g_gdn_conv_tail_skip;
+
+void ggml_cuda_gdn_conv_tail_reset() {
+    g_gdn_conv_tail_skip.clear();
+}
+
+bool ggml_cuda_gdn_conv_tail_skip(const ggml_tensor * node) {
+    if (node->op != GGML_OP_CPY || g_gdn_conv_tail_skip.empty()) return false;
+    for (auto it = g_gdn_conv_tail_skip.begin(); it != g_gdn_conv_tail_skip.end(); ++it) {
+        if (*it == node) { g_gdn_conv_tail_skip.erase(it); return true; }
+    }
+    return false;
+}
+
 void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m) {
+    if (m.n_tail > 0) {   // the conv's kernel writes the copies, nobody reads the concat
+        // the previous layer's copies were all reached before this concat (they read that layer's concat)
+        g_gdn_conv_tail_skip.clear();
+        for (int s = 0; s < m.n_tail; ++s) {
+            g_gdn_conv_tail_skip.push_back(m.tail_cpy[s]);
+        }
+        return;
+    }
     const int ncols = (int) (m.T + 3 - m.tail_from);
     if (ncols <= 0) return;
     const int64_t n = m.C * ncols;
@@ -387,6 +490,7 @@ void ggml_cuda_gdn_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_
         CUDA_CHECK(cudaGetLastError());
     }
     gdn_conv_direct_kernel<true, TT><<<grid, 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.x->data,
-        (const float *) m.w->data, (float *) m.conv_out->data, (int) m.C, (int) m.T, (m.alias || gdn_conv_force_halo()) && grid.y > 1 ? halo.get() : nullptr);
+        (const float *) m.w->data, (float *) m.conv_out->data, (int) m.C, (int) m.T, (m.alias || gdn_conv_force_halo()) && grid.y > 1 ? halo.get() : nullptr,
+        gdn_conv_tails_of(m));
     CUDA_CHECK(cudaGetLastError());
 }

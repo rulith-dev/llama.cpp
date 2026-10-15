@@ -1065,11 +1065,23 @@ static void ggml_cuda_op_gated_delta_net_lazy(ggml_backend_cuda_context & ctx, g
     const int64_t n_tokens = src_v->ne[2];
     const int64_t rq3      = src_v->ne[3] / src_q->ne[3];
 
+    // strixllama: q and k from where the fused conv + norms left them (ggml_cuda_gdn_qk_from), as the plain net
+    const float * q_d = (const float *) src_q->data;
+    const float * k_d = (const float *) dst->src[1]->data;
+    int64_t sq1 = src_q->nb[1] / sizeof(float), sq2 = src_q->nb[2] / sizeof(float), sq3 = src_q->nb[3] / sizeof(float);
+    for (auto it = g_gdn_qk.begin(); it != g_gdn_qk.end(); ++it) {
+        if (it->gdn == dst && it->data == dst->data) {
+            q_d = it->q; k_d = it->k; sq1 = it->s1; sq2 = it->s2; sq3 = it->s3;
+            g_gdn_qk.erase(it);
+            break;
+        }
+    }
+
     ggml_cuda_kernel_launch(two ? gated_delta_net_lazy_cuda<128, false, 2> : gated_delta_net_lazy_cuda<128, false, 1>, params,
-        (const float *) src_q->data, (const float *) dst->src[1]->data, (const float *) src_v->data,
+        q_d, k_d, (const float *) src_v->data,
         (const float *) dst->src[3]->data, (const float *) src_beta->data, state_all, rec, info, (float *) dst->data,
         H, H_k, n_tokens,
-        (int64_t) (src_q->nb[1] / sizeof(float)), (int64_t) (src_q->nb[2] / sizeof(float)), (int64_t) (src_q->nb[3] / sizeof(float)),
+        sq1, sq2, sq3,
         (int64_t) (src_v->nb[1] / sizeof(float)), (int64_t) (src_v->nb[2] / sizeof(float)), (int64_t) (src_v->nb[3] / sizeof(float)),
         (int64_t) (src_beta->nb[1] / sizeof(float)), (int64_t) (src_beta->nb[2] / sizeof(float)), (int64_t) (src_beta->nb[3] / sizeof(float)),
         init_fastdiv_values(rq3), 1.0f / sqrtf((float) S_v), rec_floats, R);
