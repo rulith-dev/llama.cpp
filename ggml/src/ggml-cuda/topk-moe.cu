@@ -127,7 +127,8 @@ static __device__ __forceinline__ void topk_moe_argmax_dpp(float & v, int & e) {
 }
 #endif
 
-template <int n_experts, bool has_bias>
+// strixllama: spec 1 - softmax, top-k, normalized weights, DPP argmax, all compile-time (launch_topk_moe_cuda)
+template <int n_experts, bool has_bias, int spec = 0>
 __launch_bounds__(TOPK_MOE_ROWS_PER_BLOCK * WARP_SIZE, 1)
 __global__ void topk_moe_cuda(const float *         logits,
                               float *               weights,
@@ -143,6 +144,11 @@ __global__ void topk_moe_cuda(const float *         logits,
     if (row >= n_rows) {
         return;
     }
+    const bool c_sigmoid  = spec == 1 ? false : config.use_sigmoid;
+    const bool c_softplus = spec == 1 ? false : config.use_sqrt_softplus;
+    const bool c_norm     = spec == 1 ? true  : config.with_norm;
+    const bool c_delayed  = spec == 1 ? false : config.delayed_softmax;
+    [[maybe_unused]] const bool c_dpp = spec == 1 ? true : use_dpp;
 
     logits += n_experts * row;
     weights += n_expert_used * row;
@@ -168,10 +174,10 @@ __global__ void topk_moe_cuda(const float *         logits,
     // Weights and IDs can alias logits, so wait until every row in the block reads its logits.
     __syncthreads();
 
-    if (!config.delayed_softmax) {
-        if (config.use_sigmoid) {
+    if (!c_delayed) {
+        if (c_sigmoid) {
            sigmoid_warp_inplace<experts_per_thread, false>(wt, n_experts, threadIdx.x);
-        } else if (config.use_sqrt_softplus) {
+        } else if (c_softplus) {
            sqrt_softplus_warp_inplace<experts_per_thread, false>(wt, n_experts, threadIdx.x);
         } else {
            softmax_warp_inplace<experts_per_thread, false>(wt, n_experts, threadIdx.x);
@@ -264,7 +270,7 @@ __global__ void topk_moe_cuda(const float *         logits,
             }
 
 #ifdef TOPK_MOE_DPP
-            if (use_dpp) {
+            if (c_dpp) {
                 topk_moe_argmax_dpp(max_val, max_expert);
             } else
 #endif
@@ -291,13 +297,13 @@ __global__ void topk_moe_cuda(const float *         logits,
 
         if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
             ids[k] = max_expert;
-            if (config.with_norm) {
+            if (c_norm) {
                 wt_sum += max_val;
             }
         }
     }
 
-    if (config.with_norm) {
+    if (c_norm) {
         wt_sum              = warp_reduce_sum(wt_sum);
         wt_sum              = max(wt_sum, clamp_val);
         const float inv_sum = 1.0f / wt_sum;
@@ -307,7 +313,7 @@ __global__ void topk_moe_cuda(const float *         logits,
         }
     }
 
-    if (config.delayed_softmax) {
+    if (c_delayed) {
         softmax_warp_inplace<experts_per_thread, true>(output_weights, n_expert_used, threadIdx.x);
     }
 
@@ -383,6 +389,16 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, use_dpp);
             break;
         case 512:
+            if constexpr (!has_bias) {
+                // strixllama: STRIX_TOPK_MOE_SPEC=0 off, -1 the STRIX_AB side
+                static const int spec_env = getenv("STRIX_TOPK_MOE_SPEC") ? atoi(getenv("STRIX_TOPK_MOE_SPEC")) : 1;
+                if ((spec_env > 0 || (spec_env < 0 && ggml_cuda_strix_ab())) && use_dpp && !config.use_sigmoid &&
+                        !config.use_sqrt_softplus && config.with_norm && !config.delayed_softmax) {
+                    ggml_cuda_kernel_launch(topk_moe_cuda<512, false, 1>, launch_params,
+                        logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, use_dpp);
+                    break;
+                }
+            }
             ggml_cuda_kernel_launch(topk_moe_cuda<512, has_bias>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, use_dpp);
             break;
