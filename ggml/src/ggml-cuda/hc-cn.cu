@@ -103,7 +103,11 @@ __device__ __forceinline__ uint32_t hc_pack2(const float a, const float b) {
 // two elements per thread per iteration, packed 32-bit accesses (Halogen's k_hc_scatter_norm layout)
 // strixllama: INJ - also the next hc_inject's dot products (hc == 4) over this stream's slice of xn, written as
 // inj_part[(t * hc + c) * 4 + m]; hc_inject_reduce sums the streams. Saves the inject's own pass over the F32 xn.
-template <bool INJ>
+// strixllama: NF > 0 - n_embd is NF * 2 * HC_CN_BLOCK2 (2560: 5), so with F32 streams every iteration is whole and the
+// loops run without per-iteration guards: all of a thread's loads go out before its first arithmetic. Guarded, each
+// iteration compiled to a load, a wait and the arithmetic, and at one token (four workgroups on the whole GPU) the kernel
+// paid two rounds of five memory round trips. The arithmetic and its order are the guarded loops' own
+template <bool INJ, int NF = 0>
 static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b256(
         const float * inject, const float * residual,
         const float * block_out, const float * gamma,
@@ -126,6 +130,27 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b2
     constexpr int KP = (HC_CN_MAX_EMB / 2 + HC_CN_BLOCK2 - 1) / HC_CN_BLOCK2;
     float xs[2 * KP];
     float tmp = 0.0f;
+    const bool whole = NF > 0 && !res16 && !blk16 && !dst16;
+    if constexpr (NF > 0) { if (whole) {
+    float2 rv[NF], mv[NF];
+#pragma unroll
+    for (int k = 0; k < NF; ++k) {
+        const int col = (tid + k * HC_CN_BLOCK2) * 2;
+        rv[k] = *(const float2 *)(res + col);
+        mv[k] = *(const float2 *)(blk + col);
+    }
+#pragma unroll
+    for (int k = 0; k < NF; ++k) {
+        const int col = (tid + k * HC_CN_BLOCK2) * 2;
+        const float r0 = rv[k].x, r1 = rv[k].y, m0 = mv[k].x, m1 = mv[k].y;
+        const float a0 = hc_add_rn(r0, hc_mul_rn(m0, w));
+        const float a1 = hc_add_rn(r1, hc_mul_rn(m1, w));
+        *(float2 *)(dst + col) = make_float2(a0, a1);
+        xs[2 * k] = a0; xs[2 * k + 1] = a1;
+        tmp += a0 * a0 + a1 * a1;
+    }
+    } }
+    if (!whole)
 #pragma unroll
     for (int k = 0; k < KP; ++k) {
         const int col = (tid + k * HC_CN_BLOCK2) * 2;
@@ -164,6 +189,36 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b2
     const int64_t wk = (int64_t) hc * n_embd;
     const float * wi = INJ ? inj_w + (int64_t) c * n_embd : nullptr;
     float pa[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if constexpr (NF > 0) { if (whole) {
+    float2 gvs[NF], wvs[INJ ? 4 : 1][NF];
+#pragma unroll
+    for (int k = 0; k < NF; ++k) {
+        const int col = (tid + k * HC_CN_BLOCK2) * 2;
+        gvs[k] = *(const float2 *)(g + col);
+        if (INJ) {
+#pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                wvs[INJ ? m : 0][k] = *(const float2 *)(wi + m * wk + col);
+            }
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < NF; ++k) {
+        const int col = (tid + k * HC_CN_BLOCK2) * 2;
+        const float2 gv = gvs[k];
+        const float v0 = scale * xs[2 * k] * gv.x, v1 = scale * xs[2 * k + 1] * gv.y;
+        if (store_xn_f32) *(float2 *)(xn + col) = make_float2(v0, v1);
+        if (xh) *(uint32_t *)(xh + col) = hc_pack2(v0, v1);
+        if (INJ) {
+#pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                const float2 wv = wvs[INJ ? m : 0][k];
+                pa[m] = fmaf(v1, wv.y, fmaf(v0, wv.x, pa[m]));
+            }
+        }
+    }
+    } }
+    if (!whole)
 #pragma unroll
     for (int k = 0; k < KP; ++k) {
         const int col = (tid + k * HC_CN_BLOCK2) * 2;
@@ -254,7 +309,11 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
     GGML_ASSERT(!a.inject_w || (shape == 1 && a.inject_part && hc == 4 && n_embd % 2 == 0 && n_tokens <= HC_INJ_MAX_T));
     if (shape == 1) {
         const ggml_cuda_kernel_launch_params lp2(dim3((int) hc, (int) n_tokens, 1), HC_CN_BLOCK2, 0, ctx.stream());
-        auto kernel = a.inject_w ? hc_combine_norm_f32_b256<true> : hc_combine_norm_f32_b256<false>;
+        // strixllama: 2560-wide streams take the unguarded loops (STRIX_HC_CN_WHOLE=0: off)
+        static const bool whole = !getenv("STRIX_HC_CN_WHOLE") || atoi(getenv("STRIX_HC_CN_WHOLE")) != 0;
+        auto kernel = (whole && n_embd == 5 * 2 * HC_CN_BLOCK2)
+            ? (a.inject_w ? hc_combine_norm_f32_b256<true, 5> : hc_combine_norm_f32_b256<false, 5>)
+            : (a.inject_w ? hc_combine_norm_f32_b256<true>    : hc_combine_norm_f32_b256<false>);
         ggml_cuda_kernel_launch(kernel, lp2,
             (const float *) a.inject->data, (const float *) a.residual->data,
             (const float *) a.block_out->data, (const float *) a.gamma->data,
