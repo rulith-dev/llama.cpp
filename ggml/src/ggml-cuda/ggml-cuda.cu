@@ -5175,6 +5175,68 @@ static void ggml_cuda_idx_dec_check(ggml_backend_cuda_context & ctx, const ggml_
     }
 }
 
+// strixllama: SSM_SCAN and the CPY of its new states into the recurrent cache (Mamba-2, one snapshot slot): the scan
+// writes the cache rows itself, several sequences at once (ggml_cuda_ssm_scan_cache), and the CPY dispatches nothing.
+// At eight conversations the copy was 310 us of each of Nemotron 3.5 Super's 40 Mamba layers (4 MiB of state a sequence).
+static int ggml_cuda_ssm_scan_cache_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+#ifdef GGML_USE_HIP
+    static const bool on = !getenv("STRIX_SSM_CACHE") || atoi(getenv("STRIX_SSM_CACHE")) != 0;
+    ggml_tensor * ssm = cgraph->nodes[i];
+    if (!on || ssm->op != GGML_OP_SSM_SCAN || ssm->type != GGML_TYPE_F32 || (ssm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    const ggml_tensor * s = ssm->src[0];
+    const ggml_tensor * x = ssm->src[1];
+    if (ggml_get_op_params_i32(ssm, 0) > 1 || ssm->src[3]->nb[1] != sizeof(float) || s->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    // the CPY is the first node after the scan that dispatches anything (the extra states' copy is empty)
+    const ggml_tensor * cpy = nullptr;
+    int skip = 0;
+    for (int j = i + 1; j < cgraph->n_nodes && cpy == nullptr; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+        cpy  = n;
+        skip = j - i;
+    }
+    if (cpy == nullptr) {
+        return 0;
+    }
+    const int64_t n_seqs = x->ne[3];
+    const int64_t D      = s->ne[0] * s->ne[1] * s->ne[2];
+    const ggml_tensor * tail = cpy->src[0];
+    const ggml_tensor * rows = cpy->src[1];
+    if (tail->op != GGML_OP_VIEW || tail->view_src != ssm || tail->view_offs != (size_t) ggml_nelements(x) * sizeof(float) || !ggml_is_contiguous(tail) ||
+            tail->ne[0] != D || ggml_nelements(tail) != D * n_seqs) {
+        return 0;
+    }
+    // the rows are rows of the states the scan reads, which its ids count from s's first
+    const ggml_tensor * root = s->view_src ? s->view_src : s;
+    if (rows->op != GGML_OP_VIEW || rows->type != GGML_TYPE_F32 || rows->data == nullptr || rows->view_src != root ||
+            s->data != root->data || rows->ne[0] != D || rows->ne[1] != n_seqs || ggml_nelements(rows) != D * n_seqs ||
+            rows->nb[0] != sizeof(float) || rows->nb[1] != s->nb[3] || s->nb[3] != (size_t) D * sizeof(float)) {
+        return 0;
+    }
+    const ptrdiff_t off = (const char *) rows->data - (const char *) s->data;
+    if (off < 0 || off % (ptrdiff_t) s->nb[3] != 0) {
+        return 0;
+    }
+    ggml_cuda_ssm_scan_cache c;
+    c.rows = (char *) rows->data;
+    c.row0 = getenv("STRIX_SSM_CACHE_FIXUP_ALL") ? -1 : off / (ptrdiff_t) s->nb[3];   // DEV: every sequence through the fixup
+    ggml_cuda_op_ssm_scan(ctx, ssm, &c);
+    return skip;
+#else
+    GGML_UNUSED(ctx); GGML_UNUSED(cgraph); GGML_UNUSED(i);
+    return 0;
+#endif
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -5183,6 +5245,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_SSM_SCAN) {
+        const int sk = ggml_cuda_ssm_scan_cache_fuse(*cuda_ctx, cgraph, i);
+        if (sk > 0) {
+            return sk;
+        }
+    }
 
     // strixllama: a decode strip's indexer score (ggml_cuda_match_idx_score_dec): skip the keys' GET_ROWS and its RESHAPE,
     // run the whole score at the MUL_MAT

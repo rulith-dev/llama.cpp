@@ -139,6 +139,38 @@ __global__ void __launch_bounds__(splitD, 1)
 #pragma clang diagnostic pop
 #endif // __clang__
 
+// strixllama: whether this block's sequence writes its new state into its cache row (ggml_cuda_ssm_scan_cache): not
+// when another sequence of the launch reads that row as its old state - its warps may not have read it yet. That
+// sequence writes the dst tail instead and ssm_scan_cache_fixup copies it once the scan is done.
+static __device__ __forceinline__ bool ssm_scan_to_cache(const char * s_cache, const int32_t * ids, const int64_t row0) {
+    if (s_cache == nullptr || row0 < 0) {   // row0 < 0: DEV, every sequence through the tail and the fixup
+        return false;
+    }
+    for (int s = 0; s < (int) gridDim.y; ++s) {
+        if (s != (int) blockIdx.y && ids[s] == row0 + blockIdx.y) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static __global__ void ssm_scan_cache_fixup(const char * tail, char * s_cache, const int32_t * ids, const int64_t row0,
+                                            const int64_t row_bytes) {
+    const int seq = blockIdx.y;
+    bool read_by_other = row0 < 0;
+    for (int s = 0; s < (int) gridDim.y; ++s) {
+        read_by_other |= s != seq && ids[s] == row0 + seq;
+    }
+    if (!read_by_other) {
+        return;
+    }
+    const float4 * src = (const float4 *) (tail + seq * row_bytes);
+    float4 *       dst = (float4 *) (s_cache + seq * row_bytes);
+    for (int64_t k = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; k < row_bytes / 16; k += (int64_t) gridDim.x * blockDim.x) {
+        dst[k] = src[k];
+    }
+}
+
 // assumes as many threads as d_state
 template <int c_factor, int d_state>
 __global__ void __launch_bounds__(d_state, 1)
@@ -149,7 +181,8 @@ __global__ void __launch_bounds__(d_state, 1)
         const int src0_nb2, const int src0_nb3, const int src1_nb2, const int src1_nb3,
         const int src2_nb1, const int src2_nb2, const int src3_nb1,
         const int src4_nb2, const int src4_nb3, const int src5_nb2, const int src5_nb3,
-        const int64_t s_off, const int64_t n_head, const int64_t d_head, const int64_t n_group, const int64_t n_tok, const int64_t K) {
+        const int64_t s_off, const int64_t n_head, const int64_t d_head, const int64_t n_group, const int64_t n_tok, const int64_t K,
+        char * s_cache, const int64_t row0) {
     const float   * GGML_CUDA_RESTRICT src0 = src0_ptr;
     const float   * GGML_CUDA_RESTRICT src1 = src1_ptr;
     const float   * GGML_CUDA_RESTRICT src2 = src2_ptr;
@@ -178,7 +211,8 @@ __global__ void __launch_bounds__(d_state, 1)
     const float * B_warp  = (const float *) ((const char *) src4 + (seq_idx * src4_nb3) + (group_off));
     const float * C_warp  = (const float *) ((const char *) src5 + (seq_idx * src5_nb3) + (group_off));
     float *       y_warp  = dst + (seq_idx * n_tok * n_head * d_head) + warp_idx;
-    float *       s_warp  = (float *) ((char *) dst + s_off + seq_idx * src0_nb3 + head_idx * src0_nb2 + head_off * d_state);
+    float *       s_warp  = (float *) ((ssm_scan_to_cache(s_cache, src6, row0) ? s_cache : (char *) dst + s_off) +
+                                          seq_idx * src0_nb3 + head_idx * src0_nb2 + head_off * d_state);
 
     // strides across n_seq_tokens
     const int stride_x  = src1_nb2 / sizeof(float);
@@ -236,17 +270,243 @@ __global__ void __launch_bounds__(d_state, 1)
     }
 }
 
+// strixllama: the Mamba-2 prompt scan, bit for bit ssm_scan_f32_group's. That kernel gives each (head, d) row of the
+// state a warp, and every warp walks all of the ubatch's tokens in turn: 8192 warps for Nemotron 3.5 Super, 183 ms a
+// layer at 8K tokens on gfx1151, a third of its prefill. Here two neighbouring threads keep a row in registers, each the
+// half its warp kernel's lanes 0-15 or 16-31 held, and a block of HPB heads of one group shares B and C through LDS,
+// T tokens at a time, the next tile loaded while this one is used. A row's output adds the same products in the same
+// order: per lane l the fma chain over state[32j+l]*C[32j+l] for j in turn, then the xor tree over the lanes - its
+// first step (16) pairs the two threads' partials, the rest (8, 4, 2, 1) runs in one thread.
+static bool ssm_scan_rows_enabled() {
+    static const bool on = !getenv("STRIX_SSM_SCAN_ROWS") || atoi(getenv("STRIX_SSM_SCAN_ROWS")) != 0;
+    return on;
+}
+
+static int ssm_scan_rows_min_tokens() {
+    static const int n = getenv("STRIX_SSM_SCAN_ROWS_MIN") ? atoi(getenv("STRIX_SSM_SCAN_ROWS_MIN")) : 32;
+    return n;
+}
+
+// strixllama DEV: STRIX_SSM_SCAN_CHECK=1, the warp kernel run beside the rows kernel and their words compared
+static bool ssm_scan_rows_check() {
+    static const bool on = getenv("STRIX_SSM_SCAN_CHECK") && atoi(getenv("STRIX_SSM_SCAN_CHECK")) != 0;
+    return on;
+}
+
+static __global__ void ssm_scan_count_diff(const uint32_t * a, const uint32_t * b, const int64_t n, unsigned long long * count) {
+    for (int64_t k = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; k < n; k += (int64_t) gridDim.x * blockDim.x) {
+        if (a[k] != b[k]) {
+            atomicAdd(count, 1ULL);
+        }
+    }
+}
+
+template <int d_state, int d_head, int HPB, int T>
+__global__ void __launch_bounds__(HPB * d_head * 2, 1)
+    ssm_scan_f32_rows(
+        const float * src0, const float * src1, const float * src2,
+        const float * src3, const float * src4, const float * src5,
+        const int32_t * src6, float * dst,
+        const int src0_nb2, const int src0_nb3, const int src1_nb2, const int src1_nb3,
+        const int src2_nb1, const int src2_nb2, const int src3_nb1,
+        const int src4_nb2, const int src4_nb3, const int src5_nb2, const int src5_nb3,
+        const int64_t s_off, const int64_t n_head, const int64_t n_group, const int64_t n_tok, const int64_t K,
+        char * s_cache, const int64_t row0) {
+    constexpr int NT  = HPB * d_head * 2;
+    constexpr int L   = WARP_SIZE;              // the warp kernel's lanes
+    constexpr int H   = L / 2;                  // of which a thread here has 16
+    constexpr int J   = d_state / L;            // the warp kernel's c_factor
+    constexpr int PER = T * d_state / NT;       // B (and C) values a thread loads per tile
+    static_assert(d_state % L == 0 && (T * d_state) % NT == 0, "tile shape");
+
+    __shared__ float sB[2][T * d_state];
+    __shared__ float sC[2][T * d_state];
+
+    const int tid       = threadIdx.x;
+    const int half      = tid & 1;              // lanes 0-15 or 16-31 of the warp kernel
+    const int row       = tid >> 1;
+    const int head_idx  = blockIdx.x * HPB + row / d_head;
+    const int warp_idx  = head_idx * d_head + row % d_head;    // the warp kernel's warp for this row
+    const int head_off  = (warp_idx % d_head) * sizeof(float);
+    const int seq_idx   = blockIdx.y;
+    const int group_off = (head_idx / (n_head / n_group)) * d_state * sizeof(float);   // one group for the block
+
+    const float * s0_row = (const float *) ((const char *) src0 + src6[seq_idx] * src0_nb3 + head_idx * src0_nb2 + head_off * d_state);
+    const float * x_row  = (const float *) ((const char *) src1 + (seq_idx * src1_nb3) + (warp_idx * sizeof(float)));
+    const float * dt_row = (const float *) ((const char *) src2 + (seq_idx * src2_nb2) + head_idx * sizeof(float));
+    const float * A_row  = (const float *) ((const char *) src3 + head_idx * src3_nb1);
+    const float * B_blk  = (const float *) ((const char *) src4 + (seq_idx * src4_nb3) + (group_off));
+    const float * C_blk  = (const float *) ((const char *) src5 + (seq_idx * src5_nb3) + (group_off));
+    float *       y_row  = dst + (seq_idx * n_tok * n_head * d_head) + warp_idx;
+    float *       s_row  = (float *) ((ssm_scan_to_cache(s_cache, src6, row0) ? s_cache : (char *) dst + s_off) +
+                                         seq_idx * src0_nb3 + head_idx * src0_nb2 + head_off * d_state);
+
+    const int stride_x  = src1_nb2 / sizeof(float);
+    const int stride_dt = src2_nb1 / sizeof(float);
+    const int stride_B  = src4_nb2 / sizeof(float);
+    const int stride_C  = src5_nb2 / sizeof(float);
+    const int stride_y  = n_head * d_head;
+
+    float rb[PER], rc[PER];
+    auto fetch = [&](const int64_t t0) {
+#pragma unroll
+        for (int k = 0; k < PER; ++k) {
+            const int     idx = k * NT + tid;
+            const int64_t tok = t0 + idx / d_state;
+            const int     n   = idx % d_state;
+            rb[k] = tok < n_tok ? B_blk[tok * stride_B + n] : 0.0f;
+            rc[k] = tok < n_tok ? C_blk[tok * stride_C + n] : 0.0f;
+        }
+    };
+    auto store = [&](const int buf) {
+#pragma unroll
+        for (int k = 0; k < PER; ++k) {
+            sB[buf][k * NT + tid] = rb[k];
+            sC[buf][k * NT + tid] = rc[k];
+        }
+    };
+
+    // state[j*H + l] is the warp kernel's state[j] of lane half*H + l, i.e. element L*j + half*H + l of the row
+    float state[J * H];
+#pragma unroll
+    for (int j = 0; j < J; ++j) {
+#pragma unroll
+        for (int l = 0; l < H; ++l) {
+            state[j * H + l] = s0_row[L * j + half * H + l];
+        }
+    }
+
+    fetch(0);
+    store(0);
+    __syncthreads();
+
+    int buf = 0;
+    for (int64_t t0 = 0; t0 < n_tok; t0 += T) {
+        const bool more = t0 + T < n_tok;
+        if (more) {
+            fetch(t0 + T);
+        }
+        const int tn = (int) min((int64_t) T, n_tok - t0);
+        for (int t = 0; t < tn; ++t) {
+            const int64_t i = t0 + t;
+            const float dt_soft_plus = (dt_row[i * stride_dt] <= 20.0f ? log1pf(expf(dt_row[i * stride_dt])) : dt_row[i * stride_dt]);
+            const float dA   = expf(dt_soft_plus * A_row[0]);
+            const float x_dt = x_row[i * stride_x] * dt_soft_plus;
+            const float * Bt = sB[buf] + t * d_state + half * H;
+            const float * Ct = sC[buf] + t * d_state + half * H;
+
+            float p[H];
+#pragma unroll
+            for (int l = 0; l < H; ++l) {
+                p[l] = 0.0f;
+            }
+#pragma unroll
+            for (int j = 0; j < J; ++j) {
+#pragma unroll
+                for (int l = 0; l < H; ++l) {
+                    float & s = state[j * H + l];
+                    s = (s * dA) + (Bt[L * j + l] * x_dt);
+                    p[l] += s * Ct[L * j + l];
+                }
+            }
+            // the tree's first step: lane l (< 16) adds lane l + 16's partial, which the other thread of the pair holds
+#pragma unroll
+            for (int l = 0; l < H; ++l) {
+                p[l] = p[l] + __shfl_xor_sync(0xffffffff, p[l], 1, WARP_SIZE);
+            }
+#pragma unroll
+            for (int off = H / 2; off > 0; off >>= 1) {
+#pragma unroll
+                for (int l = 0; l < off; ++l) {
+                    p[l] = p[l] + p[l + off];
+                }
+            }
+            if (half == 0) {
+                y_row[i * stride_y] = p[0];
+            }
+
+            // Slot 0 is the final state written below; slots 1..K-1 are rollback snapshots.
+            const int64_t slot = n_tok - 1 - i;
+            if (K > 1 && slot > 0 && slot < K) {
+                float * s_snapshot = (float *) ((char *) dst + s_off + (slot * gridDim.y + seq_idx) * src0_nb3 + head_idx * src0_nb2 + head_off * d_state);
+#pragma unroll
+                for (int j = 0; j < J; ++j) {
+#pragma unroll
+                    for (int l = 0; l < H; ++l) {
+                        s_snapshot[L * j + half * H + l] = state[j * H + l];
+                    }
+                }
+            }
+        }
+        if (more) {
+            __syncthreads();
+            store(buf ^ 1);
+            __syncthreads();
+            buf ^= 1;
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < J; ++j) {
+#pragma unroll
+        for (int l = 0; l < H; ++l) {
+            s_row[L * j + half * H + l] = state[j * H + l];
+        }
+    }
+}
+
 static void ssm_scan_f32_cuda(const float * src0, const float * src1, const float * src2, const float * src3,
                               const float * src4, const float * src5, const int32_t * src6, float * dst,
                               const int src0_nb2, const int src0_nb3, const int src1_nb2, const int src1_nb3, const int src2_nb1,
                               const int src2_nb2, const int src3_nb1, const int src4_nb2, const int src4_nb3, const int src5_nb2,
                               const int src5_nb3, const int64_t s_off, const int64_t d_state, const int64_t head_dim,
                               const int64_t n_head, const int64_t n_group, const int64_t n_tok, const int64_t n_seq,
-                              const int64_t K, cudaStream_t stream) {
+                              const int64_t K, char * s_cache, const int64_t row0, cudaStream_t stream) {
     // NOTE: if you change conditions here, be sure to update the corresponding supports_op condition!
     if (src3_nb1 == sizeof(float)) {
         // Mamba-2
-        if (d_state == 128) {
+        if (d_state == 128 && head_dim == 64 && n_tok >= ssm_scan_rows_min_tokens() && n_group > 0 && (n_head / n_group) % 4 == 0 &&
+                ssm_scan_rows_enabled()) {
+            constexpr int HPB = 4;
+            const dim3 blocks(n_head / HPB, n_seq, 1);
+            const int64_t n_y   = n_seq * n_tok * n_head * head_dim;
+            const int64_t n_all = n_y + K * n_seq * (src0_nb3 / (int64_t) sizeof(float));
+            static float * ref = nullptr;
+            static int64_t ref_n = 0;
+            static unsigned long long * diff = nullptr;
+            if (ssm_scan_rows_check()) {
+                if (ref_n < n_all) {
+                    if (ref) { CUDA_CHECK(cudaFree(ref)); }
+                    CUDA_CHECK(cudaMalloc(&ref, n_all * sizeof(float)));
+                    ref_n = n_all;
+                }
+                if (!diff) { CUDA_CHECK(cudaMalloc(&diff, sizeof(unsigned long long))); }
+                const dim3 wblocks((n_head * head_dim + (128 / WARP_SIZE - 1)) / (128 / WARP_SIZE), n_seq, 1);
+                ssm_scan_f32_group<128 / WARP_SIZE, 128><<<wblocks, 128, 0, stream>>>(
+                        src0, src1, src2, src3, src4, src5, src6, ref,
+                        src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
+                        src4_nb2, src4_nb3, src5_nb2, src5_nb3, n_y * (int64_t) sizeof(float), n_head, head_dim, n_group, n_tok, K, nullptr, 0);
+            }
+            ssm_scan_f32_rows<128, 64, HPB, 16><<<blocks, HPB * 64 * 2, 0, stream>>>(
+                    src0, src1, src2, src3, src4, src5, src6, dst,
+                    src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
+                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, n_group, n_tok, K, s_cache, row0);
+            if (ssm_scan_rows_check()) {
+                GGML_ASSERT(s_off == n_y * (int64_t) sizeof(float));
+                const int64_t n = s_cache ? n_y : n_all;
+                CUDA_CHECK(cudaMemsetAsync(diff, 0, sizeof(unsigned long long), stream));
+                ssm_scan_count_diff<<<256, 256, 0, stream>>>((const uint32_t *) dst, (const uint32_t *) ref, n, diff);
+                unsigned long long h = 0;
+                CUDA_CHECK(cudaMemcpyAsync(&h, diff, sizeof(h), cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                static long long calls = 0, bad = 0;
+                ++calls; bad += h != 0;
+                if (h != 0 || calls % 200 == 1) {
+                    fprintf(stderr, "SSM_SCAN_CHECK: tokens %lld seqs %lld words %lld differ %llu (calls %lld, with differences %lld)\n",
+                            (long long) n_tok, (long long) n_seq, (long long) n, h, calls, bad);
+                }
+            }
+        } else if (d_state == 128) {
             constexpr int threads   = 128;
             constexpr int num_warps = threads/WARP_SIZE;
 
@@ -255,7 +515,7 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
             ggml_cuda_kernel_launch(ssm_scan_f32_group<128/WARP_SIZE, 128>, launch_params,
                     src0, src1, src2, src3, src4, src5, src6, dst,
                     src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
-                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok, K);
+                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok, K, s_cache, row0);
         } else if (d_state == 256) { // Falcon-H1
             constexpr int threads   = 256;
             constexpr int num_warps = threads/WARP_SIZE;
@@ -265,13 +525,13 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
             ggml_cuda_kernel_launch(ssm_scan_f32_group<256/WARP_SIZE, 256>, launch_params,
                     src0, src1, src2, src3, src4, src5, src6, dst,
                     src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
-                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok, K);
+                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok, K, s_cache, row0);
         } else {
             GGML_ABORT("doesn't support d_state!=(128 or 256).");
         }
     } else {
         // Mamba-1
-        GGML_ASSERT(K == 1);
+        GGML_ASSERT(K == 1 && s_cache == nullptr);
         constexpr int threads = 128;
         GGML_ASSERT(n_head % threads == 0);
         GGML_ASSERT(head_dim == 1);
@@ -764,7 +1024,7 @@ static void ssm_scan_ssd_f32_cuda(
 }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
-void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_ssm_scan_cache * cache) {
     const struct ggml_tensor * src0 = dst->src[0];  // s
     const struct ggml_tensor * src1 = dst->src[1];  // x
     const struct ggml_tensor * src2 = dst->src[2];  // dt
@@ -826,7 +1086,7 @@ void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // Requires NVIDIA Turing+ otherwise fallback to scan.
     const bool is_mamba2 = (src3->nb[1] == sizeof(float));
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    const bool use_ssd = is_mamba2 && n_t > SSM_SSD_MIN_TOKENS
+    const bool use_ssd = is_mamba2 && n_t > SSM_SSD_MIN_TOKENS && cache == nullptr
                       && K == 1
                       && n_t <= SSM_SSD_MAX_TOKENS
                       && GGML_CUDA_CC_IS_NVIDIA(cc)
@@ -855,5 +1115,9 @@ void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ssm_scan_f32_cuda(src0_d, src1_d, src2_d, src3_d, src4_d, src5_d, src6_d, dst_d,
                       src0->nb[2], src0->nb[3], src1->nb[2], src1->nb[3], src2->nb[1], src2->nb[2],
                       src3->nb[1], src4->nb[2], src4->nb[3], src5->nb[2], src5->nb[3],
-                      s_off, nc, nr, nh, ng, n_t, n_s, K, stream);
+                      s_off, nc, nr, nh, ng, n_t, n_s, K, cache ? cache->rows : nullptr, cache ? cache->row0 : 0, stream);
+    if (cache) {
+        GGML_ASSERT(K == 1 && src0->nb[3] % 16 == 0);
+        ssm_scan_cache_fixup<<<dim3(64, n_s, 1), 256, 0, stream>>>((const char *) dst_d + s_off, cache->rows, src6_d, cache->row0, src0->nb[3]);
+    }
 }
