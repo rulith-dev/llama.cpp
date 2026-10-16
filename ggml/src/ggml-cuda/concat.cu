@@ -132,6 +132,26 @@ static __global__ void concat_transposed_src1_dim0(
     }
 }
 
+// strixllama: dim 0, one token (src1 [1, C, S]) after ne00 state columns (src0 [ne00, C, S]): a thread per channel and
+// sequence writes its row of the output
+template <typename T>
+static __global__ void concat_one_token_dim0(
+        const char * src0, const char * src1, char * dst, const int64_t ne00, const int64_t C, const int64_t S,
+        const uint64_t nb00, const uint64_t nb01, const uint64_t nb02, const uint64_t nb11, const uint64_t nb12,
+        const uint64_t nb0, const uint64_t nb1, const uint64_t nb2) {
+    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= C * S) {
+        return;
+    }
+    const int64_t c = idx % C;
+    const int64_t s = idx / C;
+    char * d = dst + s * nb2 + c * nb1;
+    for (int64_t k = 0; k < ne00; ++k) {
+        *(T *) (d + k * nb0) = *(const T *) (src0 + s * nb02 + c * nb01 + k * nb00);
+    }
+    *(T *) (d + ne00 * nb0) = *(const T *) (src1 + s * nb12 + c * nb11);
+}
+
 // non-contiguous kernel (slow)
 template <typename T, int dim>
 static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
@@ -196,11 +216,24 @@ template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     // strixllama: the tiled transpose from 2 tokens on (STRIX_CONCAT_T_MIN): below 32 the GDN conv input of a verify
     // step - [3 + tokens, 10240, sequences] - took the non-contiguous kernel, one block of 256 threads per channel and
-    // sequence for 3 + tokens values, ~30K blocks at three conversations. One token is contiguous and unchanged
+    // sequence for 3 + tokens values, ~30K blocks at three conversations. One token is contiguous and unchanged, unless
+    // it is one token of several sequences in a view with gaps: Mamba-2's xBC is a view into the in-projection's rows
+    // (nb[0] past the channels), 196 us a layer at eight conversations and 5.3 ms at 8K tokens in the slow kernel
     static const int64_t concat_t_min = getenv("STRIX_CONCAT_T_MIN") ? atoll(getenv("STRIX_CONCAT_T_MIN")) : 2;
-    if (dst->type == GGML_TYPE_F32 && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) && dim == 0 && src1->ne[0] >= concat_t_min && src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1 &&
+    static const bool concat_gaps = !getenv("STRIX_CONCAT_GAPS") || atoi(getenv("STRIX_CONCAT_GAPS")) != 0;
+    if (concat_gaps && dst->type == GGML_TYPE_F32 && dim == 0 && src1->ne[0] == 1 && !ggml_is_contiguous_to_3(src1) &&
+            src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1 && src0->ne[1] == src1->ne[1] && src0->ne[2] == src1->ne[2]) {
+        const int64_t C = src1->ne[1], S = src1->ne[2];
+        concat_one_token_dim0<T><<<(C * S + 255) / 256, 256, 0, stream>>>(
+            (const char *) src0->data, (const char *) src1->data, (char *) dst->data, src0->ne[0], C, S,
+            src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], src1->nb[2], dst->nb[0], dst->nb[1], dst->nb[2]);
+        return;
+    }
+    if (dst->type == GGML_TYPE_F32 && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) && dim == 0 &&
+            (src1->ne[0] >= concat_t_min || (concat_gaps && !ggml_is_contiguous_to_3(src1))) && src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1 &&
             src0->nb[0] == sizeof(T) && src0->nb[1] == src0->ne[0] * sizeof(T) &&
-            src1->nb[1] == sizeof(T) && src1->nb[0] == src1->ne[1] * sizeof(T) &&
+            src1->nb[1] == sizeof(T) &&
+            (src1->nb[0] == src1->ne[1] * sizeof(T) || (concat_gaps && src1->nb[0] > src1->ne[1] * sizeof(T) && src1->nb[0] % sizeof(T) == 0)) &&
             dst->nb[0] == sizeof(T) && dst->nb[1] == dst->ne[0] * sizeof(T) &&
             src0->ne[1] == src1->ne[1] && src0->ne[2] == src1->ne[2]) {
         constexpr int tile = 32;
