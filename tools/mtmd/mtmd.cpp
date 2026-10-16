@@ -843,6 +843,12 @@ struct mtmd_context {
                 {
                     image_preproc = std::make_unique<mtmd_image_preprocessor_fixed_size>(ctx_v);
                 } break;
+            case PROJECTOR_TYPE_NEMOTRON_OMNI:
+                {
+                    img_beg = "<img>";
+                    img_end = "</img>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                } break;
             case PROJECTOR_TYPE_LFM2:
                 {
                     // multi-tile:
