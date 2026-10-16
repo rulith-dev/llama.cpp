@@ -1200,6 +1200,169 @@ static bool ggml_cuda_mul_mat_vec_q6_K_i8(
     return true;
 }
 
+// strixllama: and for Q4_K at 2-8 columns (Nemotron 3.5 Super's dense weights at several conversations). Lane l of
+// mul_mat_vec_q's Q4_K path takes, of superblock kb = l/16 + 2i at position p = l%16, ints p%4 and p%4 + 4 of the q8_1
+// blocks 2(p/4) and 2(p/4) + 1 and those two blocks' scales; here a column's four ints sit together
+// (((kb*16 + p)*NQ + c)*16 bytes) and the two scales of every column of a group p/4 as well
+// (((kb*4 + p/4)*NQ + c)*2 + i). The weight's ints, scales and mins are unpacked once for all the columns, where the
+// generic kernel unpacked them a column: at eight columns its products were compute bound, Nemotron's ssm_out
+// [8192 -> 4096] 253 us for 19 MB.
+static __global__ void quantize_q8_1_q4_K_i8(
+        const float * __restrict__ x, char * __restrict__ vy, const int ne00, const int s01, const int nq) {
+    const int i0 = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i0 >= ne00) {
+        return;
+    }
+    const int c = blockIdx.y;
+
+    const float xi = x[(int64_t) c*s01 + i0];
+    float amax = fabsf(xi);
+    amax = warp_reduce_max<QK8_1>(amax);
+
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+    const int kb  = i0 / QK_K;
+    const int qb  = (i0 % QK_K) / QK8_1;   // q8_1 block in the superblock
+    const int iq  = i0 % QK8_1;
+    const int ii  = iq / 4;                // int in the block
+    const int pos = (qb/2)*4 + ii % 4;     // the lane position that reads it
+    const int k   = 2*(qb % 2) + ii / 4;   // as its int k
+    vy[((int64_t) (kb*16 + pos)*nq + c)*16 + k*4 + iq % 4] = q;
+
+    if (iq > 0) {
+        return;
+    }
+    const int nsb = ne00 / QK_K;
+    float * yd = (float *) (vy + (int64_t) nsb*16*nq*16);
+    yd[((int64_t) (kb*4 + qb/2)*nq + c)*2 + qb % 2] = __half2float(__float2half(d));
+}
+
+template <int ncols_dst>
+__launch_bounds__(4*32, 1)
+static __global__ void mul_mat_vec_q4_K_i8(
+        const void * __restrict__ vx, const char * __restrict__ vy, float * __restrict__ dst,
+        const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_dst) {
+#if defined(RDNA3_5)
+    constexpr int NQ = mmvq_i8_nq(ncols_dst);
+
+    const int lane = threadIdx.x;
+    const int row  = blockIdx.x*blockDim.y + threadIdx.y;
+    if (row >= nrows_x) {
+        return;
+    }
+
+    const int nsb = ncols_x/QK_K;
+    const int pos = lane % 16;                  // iqs/2 of mul_mat_vec_q's lane
+    const int k0  = lane / 16;                  // its first superblock
+    const int bq8_offset = QR4_K * (pos / (QI8_1/2));
+
+    // what vec_dot_q4_K_q8_1 takes from the weight's scales, lane pos
+    const int j  = bq8_offset/2;
+    const int jm = j & 1;
+    const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
+
+    const block_q4_K * x  = (const block_q4_K *) vx + (int64_t) row*stride_row_x;
+    const int4       * yq = (const int4 *) (vy + (int64_t) (k0*16 + pos)*NQ*16);
+    const float2     * yd = (const float2 *) ((const float *) (vy + (int64_t) nsb*16*NQ*16) + (int64_t) (k0*4 + pos/4)*NQ*2);
+
+    float tmp[ncols_dst] = {0.0f};
+
+    for (int kbx = k0; kbx < nsb; kbx += 2) {
+        const block_q4_K * bq4_K = x + kbx;
+
+        int v[2];
+        const int * q4 = (const int *) (bq4_K->qs + 16 * bq8_offset + 4 * (pos % 4));
+        v[0] = q4[0];
+        v[1] = q4[4];
+
+        const uint16_t * scales = (const uint16_t *) bq4_K->scales;
+        const uint32_t s0 = scales[jm + 0];
+        const uint32_t s2 = scales[jm + 2];
+        const uint32_t s4 = scales[jm + 4];
+        uint16_t aux[2];
+        aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+        aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+        const uint8_t * sc = (const uint8_t *) aux;
+        const uint8_t * m  = sc + 2;
+
+#pragma unroll
+        for (int c = 0; c < ncols_dst; ++c) {
+            const int4   t = yq[c];
+            const float2 f = yd[c];
+            const int   u[2*QR4_K]  = {t.x, t.y, t.z, t.w};
+            const float d8[QR4_K]   = {f.x, f.y};
+            tmp[c] += vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
+        }
+        yq += 2*16*NQ;
+        yd += 2*4*NQ;
+    }
+
+#pragma unroll
+    for (int c = 0; c < ncols_dst; ++c) {
+        tmp[c] = mmvq_warp_reduce_sum<GGML_TYPE_Q4_K, 32>(tmp[c]);
+    }
+
+    if (lane == 0) {
+#pragma unroll
+        for (int c = 0; c < ncols_dst; ++c) {
+            dst[c*stride_col_dst + row] = tmp[c];
+        }
+    }
+#else
+    GGML_UNUSED_VARS(vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_dst);
+    NO_DEVICE_CODE;
+#endif // defined(RDNA3_5)
+}
+
+static int strix_mmvq_i8_q4k_min_cols() {
+    static const int v = getenv("STRIX_MMVQ_I8_Q4K") ? atoi(getenv("STRIX_MMVQ_I8_Q4K")) : 2;
+    return v;
+}
+
+static bool ggml_cuda_mul_mat_vec_q4_K_i8(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const int ncols    = src1->ne[1];
+    const int min_cols = strix_mmvq_i8_q4k_min_cols();
+    const int cc       = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (min_cols <= 0 || ncols < std::max(min_cols, 2) || ncols > 8 || src0->type != GGML_TYPE_Q4_K || !GGML_CUDA_CC_IS_RDNA3_5(cc) ||
+            src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            src0->nb[0] != ggml_type_size(src0->type) || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
+            src1->ne[0] % QK_K != 0 || src1->ne[0] != src0->ne[0]) {
+        return false;
+    }
+    cudaStream_t stream = ctx.stream();
+
+    const int ne00 = src1->ne[0];
+    const int nsb  = ne00/QK_K;
+    const int nq   = mmvq_i8_nq(ncols);
+    ggml_cuda_pool_alloc<char> y(ctx.pool(), (size_t) nsb*16*nq*16 + (size_t) nsb*4*nq*2*sizeof(float));
+    {
+        const dim3 num_blocks((ne00 + CUDA_QUANTIZE_BLOCK_SIZE - 1)/CUDA_QUANTIZE_BLOCK_SIZE, ncols, 1);
+        quantize_q8_1_q4_K_i8<<<num_blocks, CUDA_QUANTIZE_BLOCK_SIZE, 0, stream>>>(
+            (const float *) src1->data, y.get(), ne00, src1->nb[1]/sizeof(float), nq);
+    }
+
+    const void * vx             = src0->data;
+    float      * dst_d          = (float *) dst->data;
+    const int    nrows_x        = src0->ne[1];
+    const int    stride_row_x   = src0->nb[1]/ggml_type_size(src0->type);
+    const int    stride_col_dst = dst->nb[1]/sizeof(float);
+    const dim3   block_dims(32, 4, 1);
+    const dim3   block_nums((nrows_x + 3)/4, 1, 1);
+    switch (ncols) {
+        case 2: mul_mat_vec_q4_K_i8<2><<<block_nums, block_dims, 0, stream>>>(vx, y.get(), dst_d, ne00, nrows_x, stride_row_x, stride_col_dst); break;
+        case 3: mul_mat_vec_q4_K_i8<3><<<block_nums, block_dims, 0, stream>>>(vx, y.get(), dst_d, ne00, nrows_x, stride_row_x, stride_col_dst); break;
+        case 4: mul_mat_vec_q4_K_i8<4><<<block_nums, block_dims, 0, stream>>>(vx, y.get(), dst_d, ne00, nrows_x, stride_row_x, stride_col_dst); break;
+        case 5: mul_mat_vec_q4_K_i8<5><<<block_nums, block_dims, 0, stream>>>(vx, y.get(), dst_d, ne00, nrows_x, stride_row_x, stride_col_dst); break;
+        case 6: mul_mat_vec_q4_K_i8<6><<<block_nums, block_dims, 0, stream>>>(vx, y.get(), dst_d, ne00, nrows_x, stride_row_x, stride_col_dst); break;
+        case 7: mul_mat_vec_q4_K_i8<7><<<block_nums, block_dims, 0, stream>>>(vx, y.get(), dst_d, ne00, nrows_x, stride_row_x, stride_col_dst); break;
+        case 8: mul_mat_vec_q4_K_i8<8><<<block_nums, block_dims, 0, stream>>>(vx, y.get(), dst_d, ne00, nrows_x, stride_row_x, stride_col_dst); break;
+        default: return false;
+    }
+    return true;
+}
+
 // Dedicated MoE multi-token kernel.
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
@@ -1880,7 +2043,8 @@ void ggml_cuda_mul_mat_vec_q(
     // scratch, compared bit for bit (see the end of this function)
     static const bool i8_check = getenv("STRIX_MMVQ_I8_CHECK") && atoi(getenv("STRIX_MMVQ_I8_CHECK")) != 0;
     if (!i8_check && !ids && !fusion &&
-            (ggml_cuda_mul_mat_vec_q8_0_i8(ctx, src0, src1, dst) || ggml_cuda_mul_mat_vec_q6_K_i8(ctx, src0, src1, dst))) {
+            (ggml_cuda_mul_mat_vec_q8_0_i8(ctx, src0, src1, dst) || ggml_cuda_mul_mat_vec_q6_K_i8(ctx, src0, src1, dst) ||
+             ggml_cuda_mul_mat_vec_q4_K_i8(ctx, src0, src1, dst))) {
         return;
     }
 
@@ -1926,7 +2090,8 @@ void ggml_cuda_mul_mat_vec_q(
         ggml_cuda_pool_alloc<float> scratch(ctx.pool(), n);
         ggml_tensor dst_c = *dst;
         dst_c.data = scratch.get();
-        if (ggml_cuda_mul_mat_vec_q8_0_i8(ctx, src0, src1, &dst_c) || ggml_cuda_mul_mat_vec_q6_K_i8(ctx, src0, src1, &dst_c)) {
+        if (ggml_cuda_mul_mat_vec_q8_0_i8(ctx, src0, src1, &dst_c) || ggml_cuda_mul_mat_vec_q6_K_i8(ctx, src0, src1, &dst_c) ||
+                ggml_cuda_mul_mat_vec_q4_K_i8(ctx, src0, src1, &dst_c)) {
             std::vector<float> want(n), got(n);
             CUDA_CHECK(cudaMemcpyAsync(want.data(), dst->data, n*sizeof(float), cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(cudaMemcpyAsync(got.data(), scratch.get(), n*sizeof(float), cudaMemcpyDeviceToHost, stream));
