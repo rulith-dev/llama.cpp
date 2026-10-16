@@ -163,6 +163,13 @@ private:
     //       ref: https://github.com/ggml-org/llama.cpp/issues/13694#issuecomment-2983871762
     const uint32_t n_pos_per_embd;
 
+public:
+    // strixllama: positions may jump forward, as with M-RoPE - an MTP draft context, which never sees a prompt's
+    // image tokens (the drafter skips embedding batches), on a model with plain RoPE (Nemotron 3.5 Super)
+    bool allow_pos_jumps = false;
+
+private:
+
     uint32_t n_embd;
     uint32_t n_seq_max;
     uint32_t n_outputs;

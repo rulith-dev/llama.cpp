@@ -252,7 +252,7 @@ bool llama_batch_allocr::init(
     // consistency checks
     //
 
-    if (n_pos_per_embd > 1) {
+    if (n_pos_per_embd > 1 || allow_pos_jumps) {
         // M-RoPE case: allow position to "jump" forward only (non-continuous positions are allowed)
         for (uint32_t s = 0; s < n_seq_max; ++s) {
             if (seq_pos[s].empty()) {

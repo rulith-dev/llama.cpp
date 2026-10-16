@@ -119,6 +119,9 @@ llama_context::llama_context(
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
 
+    // strixllama: an MTP draft context skips the target's image batches, so its positions jump over them
+    balloc->allow_pos_jumps = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
 
