@@ -5684,7 +5684,7 @@ class GGMLQuantizationType(IntEnum):
     Q1_0    = 41
     Q2_0    = 42
     # strixllama: EXL3 (ExLlamaV3, MIT), the ids of ranma.cpp (MIT)
-    # EXL3 trellis (mul1, mcg and 3inst codebooks), see exl3.py; 43 .. 255 are left to upstream
+    # EXL3 trellis (mul1, mcg and 3inst codebooks), see ggml/src/ggml-exl3.c; 43 .. 255 are left to upstream
     EXL3_M1  = 256
     EXL3_M2  = 257
     EXL3_M3  = 258
@@ -5712,7 +5712,7 @@ class GGMLQuantizationType(IntEnum):
     EXL3_T6  = 293
     EXL3_T7  = 294
     EXL3_T8  = 295
-    # EXL3 row codec (n-gram tables), see exl3.py; 312 .. 319 are reserved
+    # EXL3 row codec (n-gram tables), see ggml/src/ggml-exl3.c; 312 .. 319 are reserved
     EXL3R_M1 = 304
     EXL3R_M2 = 305
     EXL3R_M3 = 306

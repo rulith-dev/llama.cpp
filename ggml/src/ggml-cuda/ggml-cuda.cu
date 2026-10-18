@@ -5260,6 +5260,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // strixllama: {MUL_MAT_HAD, MUL_MAT_HAD, GLU swiglu}: the second product writes silu(gate)*up in its epilogue (EXL3
+    // experts and shared experts: no GLU pass, no write and read of its second input)
+    if (node->op == GGML_OP_MUL_MAT_HAD && i + 2 < cgraph->n_nodes) {
+        static const bool glu_env = !getenv("STRIX_MMH_GLU") || atoi(getenv("STRIX_MMH_GLU")) != 0;
+        ggml_tensor * a   = cgraph->nodes[i];
+        ggml_tensor * b   = cgraph->nodes[i + 1];
+        ggml_tensor * glu = cgraph->nodes[i + 2];
+        if (glu_env && b->op == GGML_OP_MUL_MAT_HAD && glu->op == GGML_OP_GLU && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+                glu->src[1] && ggml_get_op_params_i32(glu, 1) == 0 &&
+                ((glu->src[0] == a && glu->src[1] == b) || (glu->src[0] == b && glu->src[1] == a)) &&
+                glu->type == GGML_TYPE_F32 && ggml_are_same_shape(a, b) && ggml_are_same_shape(a, glu) &&
+                ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(glu) &&
+                ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT_HAD, GGML_OP_MUL_MAT_HAD, GGML_OP_GLU }, { i + 2 })) {
+            int out_nodes[] = { i + 2 };
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 1)) {
+                ggml_cuda_mul_mat_had(*cuda_ctx, a);
+                ggml_cuda_mul_mat_had_glu(*cuda_ctx, b, a, glu, glu->src[0] == b);
+                return 2;
+            }
+        }
+    }
+
     // strixllama: a decode strip's indexer score (ggml_cuda_match_idx_score_dec): skip the keys' GET_ROWS and its RESHAPE,
     // run the whole score at the MUL_MAT
     if (node->op == GGML_OP_MUL_MAT && g_idx_dec_pending.mm == i && g_idx_dec_pending.a.out) {
