@@ -5683,6 +5683,44 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    # strixllama: EXL3 (ExLlamaV3, MIT), the ids of ranma.cpp (MIT)
+    # EXL3 trellis (mul1, mcg and 3inst codebooks), see exl3.py; 43 .. 255 are left to upstream
+    EXL3_M1  = 256
+    EXL3_M2  = 257
+    EXL3_M3  = 258
+    EXL3_M4  = 259
+    EXL3_M5  = 260
+    EXL3_M6  = 261
+    EXL3_M7  = 262
+    EXL3_M8  = 263
+    EXL3_M1H = 264
+    EXL3_M2H = 265
+    EXL3_M3H = 266
+    EXL3_G1  = 272
+    EXL3_G2  = 273
+    EXL3_G3  = 274
+    EXL3_G4  = 275
+    EXL3_G5  = 276
+    EXL3_G6  = 277
+    EXL3_G7  = 278
+    EXL3_G8  = 279
+    EXL3_T1  = 288
+    EXL3_T2  = 289
+    EXL3_T3  = 290
+    EXL3_T4  = 291
+    EXL3_T5  = 292
+    EXL3_T6  = 293
+    EXL3_T7  = 294
+    EXL3_T8  = 295
+    # EXL3 row codec (n-gram tables), see exl3.py; 312 .. 319 are reserved
+    EXL3R_M1 = 304
+    EXL3R_M2 = 305
+    EXL3R_M3 = 306
+    EXL3R_M4 = 307
+    EXL3R_M5 = 308
+    EXL3R_M6 = 309
+    EXL3R_M7 = 310
+    EXL3R_M8 = 311
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -5876,6 +5914,42 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    # strixllama: EXL3 (trellis 128 weights a block of a row, rows in groups of 128; row codec 160 a row)
+    GGMLQuantizationType.EXL3_M1:  (128, 16),
+    GGMLQuantizationType.EXL3_M2:  (128, 32),
+    GGMLQuantizationType.EXL3_M3:  (128, 48),
+    GGMLQuantizationType.EXL3_M4:  (128, 64),
+    GGMLQuantizationType.EXL3_M5:  (128, 80),
+    GGMLQuantizationType.EXL3_M6:  (128, 96),
+    GGMLQuantizationType.EXL3_M7:  (128, 112),
+    GGMLQuantizationType.EXL3_M8:  (128, 128),
+    GGMLQuantizationType.EXL3_M1H: (128, 24),
+    GGMLQuantizationType.EXL3_M2H: (128, 40),
+    GGMLQuantizationType.EXL3_M3H: (128, 56),
+    GGMLQuantizationType.EXL3_G1:  (128, 16),
+    GGMLQuantizationType.EXL3_G2:  (128, 32),
+    GGMLQuantizationType.EXL3_G3:  (128, 48),
+    GGMLQuantizationType.EXL3_G4:  (128, 64),
+    GGMLQuantizationType.EXL3_G5:  (128, 80),
+    GGMLQuantizationType.EXL3_G6:  (128, 96),
+    GGMLQuantizationType.EXL3_G7:  (128, 112),
+    GGMLQuantizationType.EXL3_G8:  (128, 128),
+    GGMLQuantizationType.EXL3_T1:  (128, 16),
+    GGMLQuantizationType.EXL3_T2:  (128, 32),
+    GGMLQuantizationType.EXL3_T3:  (128, 48),
+    GGMLQuantizationType.EXL3_T4:  (128, 64),
+    GGMLQuantizationType.EXL3_T5:  (128, 80),
+    GGMLQuantizationType.EXL3_T6:  (128, 96),
+    GGMLQuantizationType.EXL3_T7:  (128, 112),
+    GGMLQuantizationType.EXL3_T8:  (128, 128),
+    GGMLQuantizationType.EXL3R_M1: (160, 22),
+    GGMLQuantizationType.EXL3R_M2: (160, 42),
+    GGMLQuantizationType.EXL3R_M3: (160, 62),
+    GGMLQuantizationType.EXL3R_M4: (160, 82),
+    GGMLQuantizationType.EXL3R_M5: (160, 102),
+    GGMLQuantizationType.EXL3R_M6: (160, 122),
+    GGMLQuantizationType.EXL3R_M7: (160, 142),
+    GGMLQuantizationType.EXL3R_M8: (160, 162),
 }
 
 

@@ -638,6 +638,9 @@ struct llama_model {
     struct ggml_tensor * output_res_score = nullptr; // kimi-k3: final cross-layer residual mix
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
+
+    // strixllama: the rot_in / rot_out of the EXL3 weights (llama-weight-aux.h)
+    llama_weight_aux_map waux;
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
 
@@ -669,6 +672,7 @@ struct llama_model {
     struct ggml_tensor * altup_proj           = nullptr;
     struct ggml_tensor * altup_unembd_proj    = nullptr;
     struct ggml_tensor * per_layer_tok_embd   = nullptr;
+    struct ggml_tensor * per_layer_tok_embd_b = nullptr; // strixllama: [head_dim, n_heads] of an EXL3 row codec table
 
     struct ggml_tensor * hc_head_norm = nullptr;
     struct ggml_tensor * hc_head_down = nullptr;

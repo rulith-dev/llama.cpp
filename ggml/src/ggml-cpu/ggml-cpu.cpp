@@ -429,6 +429,22 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
+    // strixllama: EXL3 weights have no row API (to_float, vec_dot), only MUL_MAT_HAD reads them; EXL3 row codec
+    // tables are only gathered (to_float) (ranma.cpp, MIT)
+    if (op->op == GGML_OP_MUL_MAT_HAD) {
+        const ggml_tensor * w = op->src[0];
+        return (w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_F16 || ggml_is_exl3(w->type)) && src1->type == GGML_TYPE_F32 &&
+            (w->buffer == nullptr || !ggml_backend_cpu_is_extra_buffer_type(w->buffer->buft));
+    }
+    if (ggml_is_exl3(op->type) || ggml_is_exl3_row(op->type)) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (op->src[i] && (ggml_is_exl3(op->src[i]->type) || (ggml_is_exl3_row(op->src[i]->type) && op->op != GGML_OP_GET_ROWS))) {
+            return false;
+        }
+    }
+
     // check extra buffer types
     // note: only the first sources are checked for extra buffer types to reduce overhead, increase if necessary
     for (int i = 0; i < 4; i++) {

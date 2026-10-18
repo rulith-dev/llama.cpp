@@ -206,6 +206,8 @@ add_library(ggml-base
             ggml-opt.cpp
             ggml-threading.cpp
             ggml-threading.h
+            ggml-exl3.c
+            ggml-exl3.h
             ggml-quants.c
             ggml-quants.h
             gguf.cpp)

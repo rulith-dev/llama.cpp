@@ -616,6 +616,24 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 }
 
+// strixllama: an MTP draft context whose ubatches without outputs only store K/V (LLAMA_MTP_STORE_ONLY, the default)
+// never runs a prompt-sized graph with outputs: a catch-up is stored, a draft step is a token a slot. The generic
+// worst case (a draft-ubatch graph with outputs: the sparse prefill over the whole pool) held ~4.6 KiB of compute
+// buffer a KV cell that no graph used, so such a context reserves the graphs it runs: the store-only catch-up, the
+// IndexShare capture (MTP_CAPTURE_MAX tokens or fewer, the indexer over the pool) and the draft step.
+// STRIX_MTP_FULL_RESERVE=1 restores the generic reserve.
+static bool mtp_lean_reserve(const llama_cparams & cparams) {
+    if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+        return false;
+    }
+    static const bool full = getenv("STRIX_MTP_FULL_RESERVE") && atoi(getenv("STRIX_MTP_FULL_RESERVE")) != 0;
+    static const bool store_only = !getenv("LLAMA_MTP_STORE_ONLY") || atoi(getenv("LLAMA_MTP_STORE_ONLY")) != 0;
+    return store_only && !full;
+}
+
+// the largest catch-up that keeps its tokens' selections (qwen4exp QWEN4EXP_SHARE_KEEP_ALL)
+static constexpr uint32_t MTP_CAPTURE_MAX = 32;
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -664,7 +682,8 @@ void llama_context::sched_reserve() {
     int n_splits_tg = -1;
     int n_nodes_tg  = -1;
 
-    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+    const bool mtp_lean = mtp_lean_reserve(cparams);
+    const uint32_t n_outputs_pp = mtp_lean ? 0 : std::min(n_tokens, cparams.n_outputs_max);
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
@@ -684,6 +703,14 @@ void llama_context::sched_reserve() {
 
         n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
         n_nodes_pp  = ggml_graph_n_nodes(gf);
+    }
+
+    // strixllama: the MTP draft's IndexShare capture, the one graph it runs that scores the whole pool
+    if (mtp_lean && n_seqs <= MTP_CAPTURE_MAX) {
+        const uint32_t n_cap = std::min(n_tokens, MTP_CAPTURE_MAX / n_seqs * n_seqs);
+        if (!graph_reserve(n_cap, n_seqs, 0, mctx.get(), model.hparams.no_alloc)) {
+            throw std::runtime_error("failed to allocate compute capture buffers");
+        }
     }
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
@@ -879,7 +906,18 @@ bool llama_context::memory_update(bool optimize) {
         const uint32_t n_seqs = cparams.n_seq_max;
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
-        const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
+        const bool mtp_lean = mtp_lean_reserve(cparams);
+        const uint32_t n_outputs_max = mtp_lean ? 0 : std::min(n_tokens, cparams.n_outputs_max);
+
+        // strixllama: an MTP draft context reserves the graphs it runs (see mtp_lean_reserve)
+        if (mtp_lean) {
+            if (n_seqs <= MTP_CAPTURE_MAX && !graph_reserve(std::min(n_tokens, MTP_CAPTURE_MAX / n_seqs * n_seqs), n_seqs, 0, mctx.get())) {
+                LLAMA_LOG_ERROR("%s: failed to reserve the capture graph after the memory update\n", __func__);
+            }
+            if (!graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get())) {
+                LLAMA_LOG_ERROR("%s: failed to reserve the draft-step graph after the memory update\n", __func__);
+            }
+        }
 
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
         if (!gf) {
@@ -2522,7 +2560,7 @@ static void ubatch_prepare_reserve(
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
-    GGML_ASSERT(n_outputs >= 1);
+    GGML_ASSERT(n_outputs >= 1 || mtp_lean_reserve(cparams));   // strixllama: store-only MTP graphs have none
 
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
@@ -2592,6 +2630,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.waux        =*/ &model.waux,
     };
 }
 

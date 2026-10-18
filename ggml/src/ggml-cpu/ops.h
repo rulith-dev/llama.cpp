@@ -117,6 +117,9 @@ void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * p
 void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_qsa_pack(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_mul_mat_had(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+size_t ggml_cpu_mul_mat_had_wsize(const struct ggml_tensor * node, int n_tasks);
 void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);

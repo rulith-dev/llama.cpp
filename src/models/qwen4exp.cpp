@@ -232,6 +232,11 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
                                            { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+        // strixllama: an EXL3 row codec table (ExLlamaV3's n-gram codec) comes with its per-head bias
+        if (per_layer_tok_embd && ggml_is_exl3_row(per_layer_tok_embd->type)) {
+            per_layer_tok_embd_b = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "bias"),
+                                                 { hparams.ple_head_dim, hparams.ple_n_heads }, 0);
+        }
 
         ple_reader = load_lazy_reader(ml, ple_name.c_str(), per_layer_tok_embd);
     }
@@ -895,7 +900,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // samples from the candidates and the target verifies as before, so outputs stay the target's
     static const int lr_k = getenv("STRIX_MTP_LR_K") ? atoi(getenv("STRIX_MTP_LR_K")) : 512;
     const int64_t nt = cur->ne[1];
-    if (layer.nextn.lr_proj && layer.nextn.lr_scores && lr_k > 0 && head_s == nullptr && nt > 0) {
+    // (an EXL3 head has no rows to gather - its output rotation mixes 128 rows - so it is multiplied in full)
+    if (layer.nextn.lr_proj && layer.nextn.lr_scores && lr_k > 0 && head_s == nullptr && nt > 0 && !ggml_is_exl3(head_w->type)) {
         ggml_tensor * q   = ggml_mul_mat(ctx0, layer.nextn.lr_proj, cur);                        // [rank, nt]
         ggml_tensor * sc  = ggml_mul_mat(ctx0, layer.nextn.lr_scores, q);                        // [n_vocab, nt]
         cb(sc, "mtp_lr_scores", -1);
@@ -1903,11 +1909,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     auto kv_for_packing = [&](ggml_tensor * t) {
         return t->type == GGML_TYPE_Q8_0 ? ggml_cast(ctx0, t, GGML_TYPE_F16) : t;
     };
+    // strixllama: GGML_OP_QSA_PACK writes the packed layouts from the cache view itself, dequantizing a Q8_0 cache as
+    // the cast did: no f16 copy of the cache and no CONT of its permuted view, which the compute buffer held for
+    // the whole pool (~2 KiB a KV cell). STRIX_QSA_PACK_OP=0 builds the old nodes.
+    static const bool pack_op = !getenv("STRIX_QSA_PACK_OP") || atoi(getenv("STRIX_QSA_PACK_OP")) != 0;
+    auto pack_direct = [&](const ggml_tensor * c) {
+        return pack_op && (c->type == GGML_TYPE_F16 || c->type == GGML_TYPE_Q8_0) &&
+            c->ne[0] == 256 && c->ne[2] % 4 == 0 && c->ne[3] == 1 && c->nb[0] == ggml_type_size(c->type);
+    };
     if (layout_prefill && pack_option && atoi(pack_option)!=0) {
-        auto * original_keys=ggml_permute(ctx0,kv_for_packing(mctx_cur->get_k(ctx0,il)),0,2,1,3);
+        ggml_tensor * k_cache = mctx_cur->get_k(ctx0, il);
+        if (pack_direct(k_cache)) {
+            packed_keys = ggml_qsa_pack(ctx0, k_cache, false);
+            ggml_set_name(packed_keys, "qsa_packed_keys");
+            ggml_build_forward_expand(gf, packed_keys);
+        } else {
+        auto * original_keys=ggml_permute(ctx0,kv_for_packing(k_cache),0,2,1,3);
         if (original_keys->type==GGML_TYPE_F16 && original_keys->ne[0]==256 && original_keys->ne[1]%4==0 && original_keys->ne[3]==1) {
             packed_keys=qsa_pack_keys(ctx0,original_keys);
             ggml_build_forward_expand(gf,packed_keys);
+        }
         }
     }
     // QSA attention v2 (qsa-attn/qsa2.cu) consumes V^T fragments straight from a [4 keys][256 dims] block
@@ -1915,10 +1936,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * packed_values=nullptr;
     const char * packv_option=getenv("LLAMA_QSA_PACK_VALUES");
     if (layout_prefill && packv_option && atoi(packv_option)!=0) {
-        auto * original_values=ggml_permute(ctx0,kv_for_packing(mctx_cur->get_v(ctx0,il)),0,2,1,3);
+        ggml_tensor * v_cache = mctx_cur->get_v(ctx0, il);
+        if (pack_direct(v_cache)) {
+            packed_values = ggml_qsa_pack(ctx0, v_cache, true);
+            ggml_set_name(packed_values, "qsa_packed_values");
+            ggml_build_forward_expand(gf, packed_values);
+        } else {
+        auto * original_values=ggml_permute(ctx0,kv_for_packing(v_cache),0,2,1,3);
         if (original_values->type==GGML_TYPE_F16 && original_values->ne[0]==256 && original_values->ne[1]%4==0 && original_values->ne[3]==1) {
             packed_values=qsa_pack_values(ctx0,original_values);
             ggml_build_forward_expand(gf,packed_values);
+        }
         }
     }
     std::vector<ggml_tensor *> output;
@@ -2733,6 +2761,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
         ggml_tensor * data = ple_inp->data;
         res->add_input(std::move(ple_inp));
 
+        // strixllama: the rows of an EXL3 row codec table as ExLlamaV3 reconstructs them, fp16(row + bias[head])
+        if (model.per_layer_tok_embd_b) {
+            data = llama_weight_aux_row_bias(ctx0, data, model.per_layer_tok_embd_b, n_heads);
+        }
         emb = ggml_reshape_2d(ctx0, data, hparams.ple_head_dim * n_heads, n_tokens);
     } else {
         ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
@@ -2742,6 +2774,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
 
         // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
         emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+        if (model.per_layer_tok_embd_b) {
+            emb = llama_weight_aux_row_bias(ctx0, emb, model.per_layer_tok_embd_b, n_heads);
+        }
         emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     }
     cb(emb, "ple_embd", -1);

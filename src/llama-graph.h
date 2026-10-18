@@ -1,5 +1,6 @@
 #pragma once
 
+#include "llama-weight-aux.h"
 #include "llama-arch.h"
 #include "llama-batch.h"
 #include "llama-hparams.h"
@@ -831,6 +832,9 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // strixllama: the rot_in / rot_out of the model's EXL3 weights (llama-weight-aux.h)
+    const llama_weight_aux_map * waux = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -1062,6 +1066,8 @@ struct llm_graph_context {
 
     llm_graph_result * res;
 
+    const llama_weight_aux_map * waux;
+
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
@@ -1089,6 +1095,9 @@ struct llm_graph_context {
               ggml_tensor * w_s = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
+    // strixllama: the aux map that holds w's rotations: the model's, or for a weight a draft borrows the target's
+    const llama_weight_aux_map * waux_for(const ggml_tensor * w) const;
+
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b

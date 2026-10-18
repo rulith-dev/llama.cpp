@@ -38,6 +38,7 @@
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/qsa.cuh"
+#include "ggml-cuda/mul-mat-had.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -3143,6 +3144,12 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
             break;
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
+            break;
+        case GGML_OP_QSA_PACK:
+            ggml_cuda_qsa_pack(ctx, dst);
+            break;
+        case GGML_OP_MUL_MAT_HAD:
+            ggml_cuda_mul_mat_had(ctx, dst);
             break;
         default:
             return false;
@@ -8188,6 +8195,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+        case GGML_OP_QSA_PACK:
+            return ggml_cuda_qsa_pack_supported(op);
+        case GGML_OP_MUL_MAT_HAD:
+            return ggml_cuda_mul_mat_had_supported(dev_ctx->device, op);
 
         default:
             return false;

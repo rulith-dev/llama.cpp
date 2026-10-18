@@ -5176,6 +5176,14 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_EXL3R_M1:   // strixllama: EXL3 row codec tables (to_float of a row)
+        case GGML_TYPE_EXL3R_M2:
+        case GGML_TYPE_EXL3R_M3:
+        case GGML_TYPE_EXL3R_M4:
+        case GGML_TYPE_EXL3R_M5:
+        case GGML_TYPE_EXL3R_M6:
+        case GGML_TYPE_EXL3R_M7:
+        case GGML_TYPE_EXL3R_M8:
             {
                 ggml_compute_forward_get_rows_q(params, dst);
             } break;
@@ -11519,6 +11527,36 @@ void ggml_compute_forward_dsv4_hc_post(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+// ggml_compute_forward_qsa_pack (strixllama): the reference for the CUDA kernel, see ggml_qsa_pack
+
+void ggml_compute_forward_qsa_pack(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src = dst->src[0];
+    const bool values = ggml_get_op_params_i32(dst, 0) != 0;
+    const int64_t heads = src->ne[1], nblk = src->ne[2] / 4, N = heads * nblk;
+    ggml_to_float_t const to_float = src->type == GGML_TYPE_F16 ? nullptr : ggml_get_type_traits(src->type)->to_float;
+    ggml_fp16_t * out = (ggml_fp16_t *) dst->data;
+    float row[256];
+    for (int64_t m = params->ith; m < N; m += params->nth) {
+        const int64_t h = m / nblk, n = m - h * nblk;
+        for (int b = 0; b < 4; ++b) {
+            const char * p = (const char *) src->data + h * src->nb[1] + (4 * n + b) * src->nb[2];
+            if (to_float) {
+                to_float(p, row, 256);
+            }
+            for (int d = 0; d < 256; ++d) {
+                const ggml_fp16_t v = to_float ? GGML_CPU_FP32_TO_FP16(row[d]) : ((const ggml_fp16_t *) p)[d];
+                if (values) {
+                    out[m * 1024 + 4 * d + b] = v;                               // [4, 256, N]
+                } else {
+                    out[m * 1024 + (d % 16) + 16 * b + 64 * (d / 16)] = v;       // [16, 4, 16, N]
+                }
+            }
+        }
     }
 }
 

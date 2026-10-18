@@ -1866,6 +1866,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
             } break;
+        case GGML_OP_MUL_MAT_HAD:
+            {
+                ggml_compute_forward_mul_mat_had(params, tensor);
+            } break;
         case GGML_OP_OUT_PROD:
             {
                 ggml_compute_forward_out_prod(params, tensor);
@@ -2101,6 +2105,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
             } break;
+        case GGML_OP_QSA_PACK:
+            {
+                ggml_compute_forward_qsa_pack(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2284,6 +2292,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
+        case GGML_OP_QSA_PACK:
             {
                 n_tasks = n_threads;
             } break;
@@ -2355,6 +2364,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT_HAD:
         case GGML_OP_OUT_PROD:
             {
                 n_tasks = n_threads;
@@ -2888,6 +2898,10 @@ struct ggml_cplan ggml_graph_plan(
                         if (ggml_cpu_iqp_supports_mul_mat(node)) {
                             cur = GGML_PAD(cur, 64) + n_tasks * ggml_cpu_iqp_scratch_size(node);
                         }
+                    } break;
+                case GGML_OP_MUL_MAT_HAD:
+                    {
+                        cur = ggml_cpu_mul_mat_had_wsize(node, n_tasks);
                     } break;
                 case GGML_OP_MUL_MAT_ID:
                     {

@@ -34,6 +34,7 @@ set(LLAMA_CORE_SOURCES
     llama-memory-recurrent.cpp
     llama-mmap.cpp
     llama-model-loader.cpp
+    llama-weight-aux.cpp
     llama-model-saver.cpp
     llama-model.cpp
     llama-quant.cpp

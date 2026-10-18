@@ -1572,6 +1572,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
+    waux             (params.waux),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -1607,7 +1608,12 @@ ggml_tensor * llm_graph_context::build_lora_mm(
             w_mm = twin;
         }
     }
-    ggml_tensor * res = ggml_mul_mat(ctx0, w_mm, cur);
+    // strixllama: an EXL3 weight is a product between its Hadamard rotations (llama-weight-aux.h); a draft's borrowed
+    // target weight has its rotations in the target's map
+    ggml_tensor * res = llama_weight_aux_mul_mat(ctx0, waux_for(w), w, cur, nullptr);
+    if (res == nullptr) {
+        res = ggml_mul_mat(ctx0, w_mm, cur);
+    }
 
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
@@ -1634,12 +1640,23 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     return res;
 }
 
+const llama_weight_aux_map * llm_graph_context::waux_for(const ggml_tensor * w) const {
+    const ggml_tensor * src = w->view_src ? w->view_src : w;
+    if (ggml_is_exl3(w->type) && (waux == nullptr || waux->count(src) == 0) && cparams.ctx_other != nullptr) {
+        return &llama_get_model(cparams.ctx_other)->waux;
+    }
+    return waux;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    ggml_tensor * res = llama_weight_aux_mul_mat(ctx0, waux_for(w), w, cur, ids);
+    if (res == nullptr) {
+        res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    }
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];

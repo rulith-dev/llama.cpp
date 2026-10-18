@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include "dequantize.cuh"
 #include "qsa.cuh"
 #include <cstdio>
 #include <cstdlib>
@@ -513,6 +514,102 @@ static __global__ void qsa_pack_values_kernel(const char * __restrict__ src, uin
     o.z = (v0 >> 16) | (v1 & 0xffff0000u);
     o.w = (v2 >> 16) | (v3 & 0xffff0000u);
     dst[q] = o;
+}
+
+// strixllama: the same layouts from a Q8_0 cache, dequantized value for value as get_rows / cpy do
+// (dequantize_q8_0, then __float2half), so it packs to the bytes cast(F16) + pack gave
+template <ggml_type T>
+static __device__ __forceinline__ half qsa_deq(const char * row, const int d) {
+    static_assert(T == GGML_TYPE_Q8_0, "a Q8_0 cache");
+    float2 v;
+    dequantize_q8_0(row, d / QK8_0, (d % QK8_0) & ~1, v);
+    return __float2half((d & 1) ? v.y : v.x);
+}
+
+template <ggml_type T>
+static __global__ void qsa_pack_keys_q_kernel(const char * __restrict__ src, half * __restrict__ dst, const int64_t nblk,
+        const int64_t nb_cell, const int64_t nb_head, const int64_t n_chunks) {
+    const int64_t q = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;   // one run of 16 dims
+    if (q >= n_chunks) {
+        return;
+    }
+    const int     b = (int) (q & 3), c = (int) ((q >> 2) & 15);
+    const int64_t m = q >> 6, h = m / nblk, n = m - h * nblk;
+    const char * row = src + h * nb_head + (4 * n + b) * nb_cell;
+    half v[16];
+#pragma unroll
+    for (int a = 0; a < 16; ++a) {
+        v[a] = qsa_deq<T>(row, 16 * c + a);
+    }
+    uint4 w[2];
+    memcpy(w, v, sizeof(w));
+    uint4 * o = (uint4 *) (dst + 16 * q);
+    o[0] = w[0];
+    o[1] = w[1];
+}
+
+template <ggml_type T>
+static __global__ void qsa_pack_values_q_kernel(const char * __restrict__ src, half * __restrict__ dst, const int64_t nblk,
+        const int64_t nb_cell, const int64_t nb_head, const int64_t n_pairs) {
+    const int64_t q = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;   // dims 2d, 2d+1 of the block's four cells
+    if (q >= n_pairs) {
+        return;
+    }
+    const int     d2 = (int) (q & 127);
+    const int64_t m  = q >> 7, h = m / nblk, n = m - h * nblk;
+    const char *  s  = src + h * nb_head + 4 * n * nb_cell;
+    half v[8];   // dim 2d cells 0..3, then dim 2d+1 cells 0..3
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+        v[b]     = qsa_deq<T>(s + b * nb_cell, 2 * d2);
+        v[4 + b] = qsa_deq<T>(s + b * nb_cell, 2 * d2 + 1);
+    }
+    uint4 w;
+    memcpy(&w, v, sizeof(w));
+    *(uint4 *) (dst + 8 * q) = w;
+}
+
+bool ggml_cuda_qsa_pack_supported(const ggml_tensor * op) {
+    const ggml_tensor * s = op->src[0];
+    if (s->ne[0] != 256 || s->ne[2] % 4 != 0 || s->ne[3] != 1 || s->nb[0] != ggml_type_size(s->type)) {
+        return false;
+    }
+    if (s->type == GGML_TYPE_F16) {
+        return s->nb[1] % 16 == 0 && s->nb[2] % 16 == 0;
+    }
+    return s->type == GGML_TYPE_Q8_0;
+}
+
+void ggml_cuda_qsa_pack(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * s = dst->src[0];
+    const bool values = ggml_get_op_params_i32(dst, 0) != 0;
+    const int64_t heads = s->ne[1], nblk = s->ne[2] / 4, N = heads * nblk;
+    const int64_t nb_head = s->nb[1], nb_cell = s->nb[2];
+    GGML_ASSERT(ggml_nelements(dst) == 256 * s->ne[2] * heads && ggml_is_contiguous(dst));
+    const char * src = (const char *) s->data;
+    cudaStream_t st = ctx.stream();
+    const int64_t n = values ? N * 128 : N * 64;
+    const unsigned grid = (unsigned) ((n + 255) / 256);
+    switch (s->type) {
+        case GGML_TYPE_F16:
+            GGML_ASSERT(((uintptr_t) src) % 16 == 0 && ((uintptr_t) dst->data) % 16 == 0);
+            if (values) {
+                qsa_pack_values_kernel<<<grid, 256, 0, st>>>(src, (uint4 *) dst->data, nblk, nb_cell, nb_head, n);
+            } else {
+                qsa_pack_keys_kernel<<<grid, 256, 0, st>>>(src, (uint4 *) dst->data, nblk, nb_cell, nb_head, n);
+            }
+            break;
+        case GGML_TYPE_Q8_0:
+            if (values) {
+                qsa_pack_values_q_kernel<GGML_TYPE_Q8_0><<<grid, 256, 0, st>>>(src, (half *) dst->data, nblk, nb_cell, nb_head, n);
+            } else {
+                qsa_pack_keys_q_kernel<GGML_TYPE_Q8_0><<<grid, 256, 0, st>>>(src, (half *) dst->data, nblk, nb_cell, nb_head, n);
+            }
+            break;
+        default:
+            GGML_ABORT("qsa_pack: unsupported cache type");
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 // the tensors' memory [first byte, one past the last) as a view reaches it

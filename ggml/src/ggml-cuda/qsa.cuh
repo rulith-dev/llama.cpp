@@ -15,6 +15,10 @@ int ggml_cuda_qsa_pack_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph *
 // the same match on the graph's structure alone: the source to keep allocated until `out` is computed (graph_optimize)
 bool ggml_cuda_qsa_pack_deps(const ggml_cgraph * g, int i, ggml_tensor ** src_root, ggml_tensor ** out);
 
+// strixllama: GGML_OP_QSA_PACK - a K or V cache view (F16, Q8_0, Q5_1) written into the packed layouts directly
+bool ggml_cuda_qsa_pack_supported(const ggml_tensor * op);
+void ggml_cuda_qsa_pack(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 // strixllama: CONT(strided F32 view) followed by its only reader SIGMOID, in one pass; the nodes consumed after
 // nodes[i], or 0
 int ggml_cuda_cont_sigmoid_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * g, int i);
