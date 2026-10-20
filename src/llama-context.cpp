@@ -782,7 +782,13 @@ void llama_context::synchronize() {
         return;
     }
 
-    ggml_backend_sched_synchronize(sched.get());
+    {
+        const int64_t st0 = strixllama_decode_timing::enabled() ? ggml_time_us() : 0;
+        ggml_backend_sched_synchronize(sched.get());
+        if (st0 && n_queued_tokens > 64) {
+            fprintf(stderr, "DT sync n=%d at=%.1f waited=%.1fms\n", (int) n_queued_tokens, st0 / 1000.0, (ggml_time_us() - st0) / 1000.0);
+        }
+    }
 
     // strixllama: a small batch's GPU work is done; the next one's PLE gather will want the drive up
     if (n_queued_tokens > 0 && n_queued_tokens <= 64) {
@@ -2166,8 +2172,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (dt) {
         const auto & g = g_decode_timing;
         const int64_t total = ggml_time_us() - dt_t0;
-        fprintf(stderr, "DT decode n=%d total=%.1fms prep=%.2f graph=%.2f inputs=%.2f compute=%.2f post=%.2f reused=%d/%d\n",
-                (int) batch_inp.n_tokens, total / 1000.0, g.prep / 1000.0, g.graph / 1000.0, g.inputs / 1000.0,
+        fprintf(stderr, "DT decode n=%d at=%.1f total=%.1fms prep=%.2f graph=%.2f inputs=%.2f compute=%.2f post=%.2f reused=%d/%d\n",
+                (int) batch_inp.n_tokens, dt_t0 / 1000.0, total / 1000.0, g.prep / 1000.0, g.graph / 1000.0, g.inputs / 1000.0,
                 g.compute / 1000.0, (total - g.prep - g.graph - g.inputs - g.compute) / 1000.0,
                 g.n_reused, g.n_ubatch);
     }

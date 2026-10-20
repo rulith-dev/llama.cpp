@@ -22,10 +22,11 @@
 // The CPU backend always computes the fp32 grade.
 
 #include "mul-mat-had.cuh"
+
+#include <string>
+#include <vector>
 #include "unary.cuh"
 
-// strixllama (dev): MMH_DEV_FAST builds the EXL3 kernels for M4 and M6 only (minutes less per build); never in a release
-// #define MMH_DEV_FAST
 
 #include <algorithm>
 #include <cfloat>
@@ -50,6 +51,8 @@ static __device__ __forceinline__ void mmh_lds_sync() {
 #define MMH_FUSED_LDS   49152 // LDS of a GEMV block that stages its own input (fused)
 #define MMH_FUSED_MAX_BLOCKS 512 // fused GEMV up to this many blocks with work (each block transforms its own input)
 #define MMH_GEMV_WAVES  640  // GEMV waves the k split aims at (strixllama: 1280 split too finely on gfx1151: decode +9%)
+#define MMH_GEMV_WAVES_1ROW 320 // the same for a dense op of one row (single-stream decode): z / ssm_out -4..6%; at 2+ rows
+                               // the smaller split is slower (ssm_out 76 -> 115 us at 2 rows)
 #define MMH_GEMV_MIN_KSLICES 16 // fewest 16-value k slices per GEMV wave from the k split
 #define MMH_GEMV_MAX_SPLIT 64 // largest k split
 // rows of one expert per GEMV pass with ids and several tokens: 2 for 2 tokens, 4 for 3 or more (the 4-row instance decodes a
@@ -108,10 +111,23 @@ struct mmh_params {
     // other product, in the same layout; glu 1: this product is the gate (dst = silu(y)*other), 2: the up (silu(other)*y)
     const float * glu_other;
     int glu;
+    // strixllama: routing-weight epilogue (ggml_cuda_mul_mat_had_rowmul): dst is the MUL's output and row_w the weights
+    // [1, ne1, ne2] (bytes per slot and per token), each stored value multiplied by its row's weight
+    const float * row_w;
+    int64_t row_w_nb1;
+    int64_t row_w_nb2;
 
     // strixllama: the staged rows of mmh_gemm_et: row r at sorted position pos[r] in panels of 16 rows (mmh_xh_panel)
     const int * pos;
+    int panel_rows;  // the prologue writes row r at panel position r (no pos)
+    unsigned long long * trace; // strixllama (dev): STRIX_MMH_TRACE, the GEMV's block timeline (start, end, cu | dup << 16)
+    int tok_rows;    // mmh_gemm_et: one staged row per token for the tok_rows rows (expert slots) of the token
 
+    // strixllama: per-expert widths (ggml_mul_mat_had_classes): expert e is in class cmap[e] >> 24 at index
+    // cmap[e] & 0xFFFFFF; one launch per class, with that class's weight (nb01, nb02, type) and cls; ids, rotations and
+    // n_exp stay global
+    const int32_t * cmap;
+    int cls;
 };
 
 static __device__ __forceinline__ int mmh_expert(const mmh_params & p, const int r) {
@@ -144,6 +160,16 @@ static __device__ __forceinline__ float * mmh_dst_row(const mmh_params & p, cons
     return (float *) ((char *) p.dst + i1*p.nb1 + i2*p.nb2 + i3*p.nb3);
 }
 
+// strixllama: the routing weight of row r (ggml_cuda_mul_mat_had_rowmul), 1 without one
+static __device__ __forceinline__ float mmh_row_w(const mmh_params & p, const int r) {
+    if (p.row_w == nullptr) {
+        return 1.0f;
+    }
+    const int i1 = r % p.ne1;
+    const int i2 = (r / p.ne1) % p.ne2;
+    return *(const float *) ((const char *) p.row_w + i1*p.row_w_nb1 + i2*p.row_w_nb2);
+}
+
 // output value c of the row at out: y, or with the GLU epilogue silu(gate)*up as unary_gated_op_kernel computes it
 static __device__ __forceinline__ void mmh_store(const mmh_params & p, float * out, const int c, const float y) {
     if (p.glu == 0) {
@@ -163,6 +189,43 @@ static __device__ __forceinline__ int64_t mmh_xh_panel(const mmh_params & p, con
     return ((int64_t) (q/16)*(p.k/MMH_ET_CW) + c/MMH_ET_CW)*(16*MMH_ET_CW) + (q % 16)*MMH_ET_CW + c % MMH_ET_CW;
 }
 
+// strixllama: the 4 rotation values of a lane, elements st*(c0 + 32*j + lane), j = 0..3: one branch on the type, then
+// four independent loads (mmh_rot per value branches per value, and clang then waits for each load before the next)
+static __device__ __forceinline__ void mmh_rot4(const char * base, const int f16, const int64_t c0, const int lane,
+        const int64_t st, float r[4]) {
+    if (f16) {
+        const half * h = (const half *) base;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            r[j] = __half2float(h[(c0 + 32*j + lane)*st]);
+        }
+    } else {
+        const float * f = (const float *) base;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            r[j] = f[(c0 + 32*j + lane)*st];
+        }
+    }
+}
+
+// max over i = i0, i0 + step, .. < k of |src[i]*rot[i]| (the branch on the rotation's type outside the loop)
+static __device__ __forceinline__ float mmh_amax_rot(const float * src, const char * rot, const int f16, const int64_t i0,
+        const int64_t k, const int step) {
+    float amax = 0.0f;
+    if (f16) {
+        const half * h = (const half *) rot;
+        for (int64_t i = i0; i < k; i += step) {
+            amax = fmaxf(amax, fabsf(src[i]*__half2float(h[i])));
+        }
+    } else {
+        const float * f = (const float *) rot;
+        for (int64_t i = i0; i < k; i += step) {
+            amax = fmaxf(amax, fabsf(src[i]*f[i]));
+        }
+    }
+    return amax;
+}
+
 static __device__ __forceinline__ float mmh_rot(const char * base, const int f16, const int64_t i) {
     return f16 ? __half2float(((const half *) base)[i]) : ((const float *) base)[i];
 }
@@ -176,9 +239,15 @@ static __device__ __forceinline__ int mmh_uniform(const int v) {
 #endif // defined(GGML_USE_HIP)
 }
 
-// the weight matrix of expert e (wave-uniform)
+// strixllama: per-expert widths: expert e is not in this launch's class (its blocks have nothing to do)
+static __device__ __forceinline__ bool mmh_other_class(const mmh_params & p, const int e) {
+    return p.cmap && (p.cmap[e] >> 24) != p.cls;
+}
+
+// the weight matrix of expert e (wave-uniform); with classes the matrix at e's index in its class
 static __device__ __forceinline__ const char * mmh_weight_matrix(const mmh_params & p, const char * w, const int e) {
-    const uint64_t a = (uint64_t) (uintptr_t) w + (uint64_t) e*p.nb02;
+    const int le = p.cmap ? (p.cmap[e] & 0xFFFFFF) : e;
+    const uint64_t a = (uint64_t) (uintptr_t) w + (uint64_t) le*p.nb02;
 #if defined(GGML_USE_HIP)
     return (const char *) (uintptr_t) (((uint64_t) __builtin_amdgcn_readfirstlane((uint32_t) (a >> 32)) << 32) |
         (uint32_t) __builtin_amdgcn_readfirstlane((uint32_t) a));
@@ -384,10 +453,7 @@ static __global__ void __launch_bounds__(256) mmh_prologue(const mmh_params p, h
 
     float s = 1.0f;
     if constexpr (!frag) {
-        float amax = 0.0f;
-        for (int64_t i = threadIdx.x; i < p.k; i += blockDim.x) {
-            amax = fmaxf(amax, fabsf(src[i]*mmh_rot(rin, p.rin_f16, i)));
-        }
+        float amax = mmh_amax_rot(src, rin, p.rin_f16, threadIdx.x, p.k, blockDim.x);
         amax = mmh_block_max(amax, s_red);
 
         // |H v| <= sqrt(had) * max|v|: with the scale, every value stays below 2^14
@@ -404,10 +470,12 @@ static __global__ void __launch_bounds__(256) mmh_prologue(const mmh_params p, h
 
     for (int64_t c0 = 128*wave; c0 < p.k; c0 += 128*(blockDim.x/32)) {
         float v[4];
+        float rv[4];
+        mmh_rot4(rin, p.rin_f16, c0, lane, 1, rv);
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int64_t c = c0 + 32*j + lane;
-            v[j] = src[c]*mmh_rot(rin, p.rin_f16, c)*s;
+            v[j] = src[c]*rv[j]*s;
         }
         mmh_fwht(v, lane, p.had, p.hscale);
         if constexpr (frag && f16) {
@@ -466,10 +534,7 @@ static __global__ void __launch_bounds__(256) mmh_prologue_wave(const mmh_params
     const float * src = mmh_src_row(p, r);
     const char  * rin = mmh_rot_row(p, p.rot_in, p.rin_nb1, e);
 
-    float amax = 0.0f;
-    for (int64_t i = lane; i < p.k; i += 32) {
-        amax = fmaxf(amax, fabsf(src[i]*mmh_rot(rin, p.rin_f16, i)));
-    }
+    float amax = mmh_amax_rot(src, rin, p.rin_f16, lane, p.k, 32);
 #pragma unroll
     for (int h = 16; h > 0; h >>= 1) {
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, h, 32));
@@ -488,20 +553,133 @@ static __global__ void __launch_bounds__(256) mmh_prologue_wave(const mmh_params
     const int q = p.pos ? p.pos[r] : r;
     for (int64_t c0 = 0; c0 < p.k; c0 += 128) {
         float v[4];
+        float rv[4];
+        mmh_rot4(rin, p.rin_f16, c0, lane, 1, rv);
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int64_t c = c0 + 32*j + lane;
-            v[j] = src[c]*mmh_rot(rin, p.rin_f16, c)*sc;
+            v[j] = src[c]*rv[j]*sc;
         }
         mmh_fwht(v, lane, p.had, p.hscale);
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int64_t c = c0 + 32*j + lane;
-            const int64_t o = p.pos ? mmh_xh_panel(p, q, c) :
+            const int64_t o = (p.pos || p.panel_rows) ? mmh_xh_panel(p, q, c) :
                 tiled ? ((int64_t) (r/128)*(p.k/16) + c/16)*2048 + (r % 128)*16 + c % 16 : p.k*r + c;
             xh[o] = __float2half_rn(v[j]);
         }
     }
+}
+
+// strixllama: the normalized Hadamard of 128 values held four consecutive per lane (value c = 4*lane + j): the
+// butterflies of mmh_fwht in the same order of strides (1 and 2 in registers, then 4 .. 64 across lanes) on the same
+// pairs, so the same results bit for bit; blocks of `had` (32, 64 or 128)
+static __device__ __forceinline__ void mmh_fwht_v4(float v[4], const int lane, const int had, const float scale) {
+#pragma clang fp contract(off)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        v[j] *= scale;
+    }
+    float a = v[0], b = v[1];
+    v[0] = a + b;
+    v[1] = a - b;
+    a = v[2]; b = v[3];
+    v[2] = a + b;
+    v[3] = a - b;
+    a = v[0]; b = v[2];
+    v[0] = a + b;
+    v[2] = a - b;
+    a = v[1]; b = v[3];
+    v[1] = a + b;
+    v[3] = a - b;
+    mmh_fwht_stage<1>(v, lane);
+    mmh_fwht_stage<2>(v, lane);
+    mmh_fwht_stage<4>(v, lane);
+    if (had >= 64) {
+        mmh_fwht_stage<8>(v, lane);
+    }
+    if (had >= 128) {
+        mmh_fwht_stage<16>(v, lane);
+    }
+}
+
+// the rotation values c .. c + 3 (c a multiple of 4) in one load
+static __device__ __forceinline__ void mmh_rot4c(const char * base, const int f16, const int64_t c, float r[4]) {
+    if (f16) {
+        const uint2 w = *(const uint2 *) ((const half *) base + c);
+        const float2 a = __half22float2(mmh_as_half2(w.x));
+        const float2 b = __half22float2(mmh_as_half2(w.y));
+        r[0] = a.x; r[1] = a.y; r[2] = b.x; r[3] = b.y;
+    } else {
+        const float4 f = *(const float4 *) ((const float *) base + c);
+        r[0] = f.x; r[1] = f.y; r[2] = f.z; r[3] = f.w;
+    }
+}
+
+// strixllama: mmh_prologue_wave with four consecutive values per lane: the row and rotation in 16- / 8-byte loads
+// and each lane's four fp16 values in one 8-byte store (mmh_prologue_wave: four 2-byte stores per lane and 128-value
+// chunk; staging the per-expert rows of the converted checkpoints is store-bound). Same values, scales and layouts
+// (mmh_fwht_v4); needs 16-byte aligned rows and 8-byte aligned rotation rows (mmh_pwave4_ok).
+template <bool tiled>
+static __global__ void __launch_bounds__(256) mmh_prologue_wave4(const mmh_params p, half * __restrict__ xh,
+        float * __restrict__ rscale) {
+    const int lane = threadIdx.x % 32;
+    const int r    = blockIdx.x*8 + threadIdx.x/32;
+    if (r >= p.n_rows) {
+        return;
+    }
+    const int e = mmh_expert(p, r);
+    const float * src = mmh_src_row(p, r);
+    const char  * rin = mmh_rot_row(p, p.rot_in, p.rin_nb1, e);
+
+    float amax = 0.0f;
+    for (int64_t c0 = 0; c0 < p.k; c0 += 128) {
+        const int64_t c = c0 + 4*lane;
+        const float4 x4 = *(const float4 *) (src + c);
+        float rv[4];
+        mmh_rot4c(rin, p.rin_f16, c, rv);
+        amax = fmaxf(amax, fabsf(x4.x*rv[0]));
+        amax = fmaxf(amax, fabsf(x4.y*rv[1]));
+        amax = fmaxf(amax, fabsf(x4.z*rv[2]));
+        amax = fmaxf(amax, fabsf(x4.w*rv[3]));
+    }
+#pragma unroll
+    for (int h = 16; h > 0; h >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, h, 32));
+    }
+    float sc = 1.0f;
+    const float bound = amax*sqrtf((float) p.had);
+    if (bound > 0.0f && bound <= FLT_MAX) {
+        int ex;
+        frexpf(bound, &ex);
+        sc = ldexpf(1.0f, max(-100, min(100, 14 - ex)));
+    }
+    if (lane == 0) {
+        rscale[r] = 1.0f/sc;
+    }
+    const int q = p.pos ? p.pos[r] : r;
+    for (int64_t c0 = 0; c0 < p.k; c0 += 128) {
+        const int64_t c = c0 + 4*lane;
+        const float4 x4 = *(const float4 *) (src + c);
+        float rv[4];
+        mmh_rot4c(rin, p.rin_f16, c, rv);
+        float v[4] = { x4.x*rv[0]*sc, x4.y*rv[1]*sc, x4.z*rv[2]*sc, x4.w*rv[3]*sc };
+        mmh_fwht_v4(v, lane, p.had, p.hscale);
+        const int64_t o = (p.pos || p.panel_rows) ? mmh_xh_panel(p, q, c) :
+            tiled ? ((int64_t) (r/128)*(p.k/16) + c/16)*2048 + (r % 128)*16 + c % 16 : p.k*r + c;
+        const half2 h01 = __halves2half2(__float2half_rn(v[0]), __float2half_rn(v[1]));
+        const half2 h23 = __halves2half2(__float2half_rn(v[2]), __float2half_rn(v[3]));
+        *(uint2 *) (xh + o) = make_uint2(mmh_as_u32(h01), mmh_as_u32(h23));
+    }
+}
+
+// strixllama: mmh_prologue_wave4 applies: 16-byte aligned input rows and 8-byte (fp16) / 16-byte (f32) aligned
+// rotation rows; STRIX_MMH_PWAVE4=0 keeps mmh_prologue_wave (bitwise A/B)
+static bool mmh_pwave4_ok(const mmh_params & p) {
+    static const bool env = !getenv("STRIX_MMH_PWAVE4") || atoi(getenv("STRIX_MMH_PWAVE4")) != 0;
+    const uintptr_t ra = p.rin_f16 ? 8 : 16;
+    return env && p.k % 128 == 0 && (uintptr_t) p.x % 16 == 0 && p.nb11 % 16 == 0 && p.nb12 % 16 == 0 &&
+        p.nb13 % 16 == 0 && (uintptr_t) p.rot_in % ra == 0 && (uintptr_t) p.rin_nb1 % ra == 0;
 }
 
 // strixllama: the plain (GEMM) prologue of an op with ids whose input has one row per token (ne11 == 1: the experts'
@@ -539,9 +717,11 @@ static __global__ void __launch_bounds__(256) mmh_prologue_tok(const mmh_params 
         for (int ci = 0; ci < MAXC; ++ci) {
             const int c0 = 128*(wave + 8*ci);
             if (wave + 8*ci < nchunks) {
+                float rv[4];
+                mmh_rot4(rin, p.rin_f16, c0, lane, 1, rv);
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    amax = fmaxf(amax, fabsf(xv[ci][j]*mmh_rot(rin, p.rin_f16, c0 + 32*j + lane)));
+                    amax = fmaxf(amax, fabsf(xv[ci][j]*rv[j]));
                 }
             }
         }
@@ -577,9 +757,11 @@ static __global__ void __launch_bounds__(256) mmh_prologue_tok(const mmh_params 
             const int c0 = 128*(wave + 8*ci);
             if (wave + 8*ci < nchunks) {
                 float v[4];
+                float rv[4];
+                mmh_rot4(rin, p.rin_f16, c0, lane, 1, rv);
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    v[j] = xv[ci][j]*mmh_rot(rin, p.rin_f16, c0 + 32*j + lane)*sc;
+                    v[j] = xv[ci][j]*rv[j]*sc;
                 }
                 mmh_fwht(v, lane, p.had, p.hscale);
 #pragma unroll
@@ -805,6 +987,19 @@ static __device__ __forceinline__ uint32_t mmh_lane_word(const uint32_t v, const
 #define MMH_BUFFER_LOADS
 #endif // ...
 
+// strixllama: weight reads through a global address-space pointer. The weight base is rebuilt from readfirstlane'd
+// integers (mmh_weight_matrix), so clang read it with flat loads, which count in lgkmcnt as well: every wait for an
+// LDS result (ds_bpermute of the coalesced decode, staged rows) then also waited for the weight loads in flight
+#if defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
+#define MMH_GLOBAL __attribute__((address_space(1)))
+#else
+#define MMH_GLOBAL
+#endif // defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
+template <typename T>
+static __device__ __forceinline__ T mmh_ld(const char * p) {
+    return *(const MMH_GLOBAL T *) p;
+}
+
 template <ggml_type type, bool coal = false>
 struct mmh_weight {
     static constexpr int  b2        = mmh_exl3_b2(type);
@@ -855,10 +1050,10 @@ struct mmh_weight {
                 r.v[1] = __builtin_amdgcn_raw_buffer_load_b32(rsrc, 4*(32 + lane % (words - 32)), so, 0);
             }
 #else
-            const uint32_t * t = (const uint32_t *) (group + (int64_t) (8*kt + nt)*mmh_exl3<b2>::tile_bytes);
-            r.v[0] = t[words >= 32 ? lane : lane % words];
+            const char * t = group + (int64_t) (8*kt + nt)*mmh_exl3<b2>::tile_bytes;
+            r.v[0] = mmh_ld<uint32_t>(t + 4*(words >= 32 ? lane : lane % words));
             if constexpr (words > 32) {
-                r.v[1] = t[32 + lane % (words - 32)];
+                r.v[1] = mmh_ld<uint32_t>(t + 4*(32 + lane % (words - 32)));
             }
 #endif // defined(MMH_BUFFER_LOADS)
         } else if constexpr (is_exl3) {
@@ -872,21 +1067,22 @@ struct mmh_weight {
             const char * t = group + (int64_t) (8*kt + nt)*mmh_exl3<b2>::tile_bytes;
 #pragma unroll
             for (int i = 0; i < n_raw; ++i) {
-                r.v[i] = *(const uint32_t *) (t + off[i]);
+                r.v[i] = mmh_ld<uint32_t>(t + off[i]);
             }
 #endif // defined(MMH_BUFFER_LOADS)
         } else if constexpr (type == GGML_TYPE_F16) {
             const char * a = group + 16*nt*nb01 + 32*kt + off[0];
             const char * b = a + 8*nb01;
-            r.v[0] = *(const uint32_t *) a;
-            r.v[1] = *(const uint32_t *) (a + 16);
-            r.v[2] = *(const uint32_t *) b;
-            r.v[3] = *(const uint32_t *) (b + 16);
+            r.v[0] = mmh_ld<uint32_t>(a);
+            r.v[1] = mmh_ld<uint32_t>(a + 16);
+            r.v[2] = mmh_ld<uint32_t>(b);
+            r.v[3] = mmh_ld<uint32_t>(b + 16);
         } else {
             static_assert(type == GGML_TYPE_F32, "unsupported weight type");
             const char * a = group + 16*nt*nb01 + 64*kt + off[0];
             const char * b = a + 8*nb01;
-            const float2 f[4] = { *(const float2 *) a, *(const float2 *) (a + 32), *(const float2 *) b, *(const float2 *) (b + 32) };
+            const float2 f[4] = { make_float2(mmh_ld<float>(a), mmh_ld<float>(a + 4)), make_float2(mmh_ld<float>(a + 32), mmh_ld<float>(a + 36)),
+                                  make_float2(mmh_ld<float>(b), mmh_ld<float>(b + 4)), make_float2(mmh_ld<float>(b + 32), mmh_ld<float>(b + 36)) };
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 r.v[2*i + 0] = __float_as_uint(f[i].x);
@@ -1003,10 +1199,12 @@ static __device__ __forceinline__ void mmh_gemv_pass(const mmh_params & p, const
             const float * src = mmh_src_row(p, rowp[i]) + 16*koff + 128*ch;
             const char  * rc  = rin + (16*koff + 128*ch)*(p.rin_f16 ? 2 : 4);
             float v[4];
+            float rv[4];
+            mmh_rot4(rc, p.rin_f16, 0, lane, 1, rv);
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int c = 32*j + lane;
-                v[j] = src[c]*mmh_rot(rc, p.rin_f16, c);
+                v[j] = src[c]*rv[j];
             }
             mmh_fwht(v, lane, p.had, p.hscale);
             if constexpr (h16) {
@@ -1186,6 +1384,15 @@ static __global__ void __launch_bounds__(1024) mmh_gemv(const mmh_params p, cons
     __shared__ int   s_wcount[32];
     __shared__ int   s_last;
     __shared__ float s_part[4][rows][MMH_NG];
+    const unsigned long long trace_t0 = p.trace ? wall_clock64() : 0;
+    auto trace_end = [&](const int dup) {
+        if (p.trace && threadIdx.x == 0) {
+            const size_t bl = blockIdx.x + gridDim.x*(blockIdx.y + (size_t) gridDim.y*blockIdx.z);
+            p.trace[3*bl + 0] = trace_t0;
+            p.trace[3*bl + 1] = wall_clock64();
+            p.trace[3*bl + 2] = (unsigned long long) __smid() | ((unsigned long long) dup << 16);
+        }
+    };
 
     const int tid  = threadIdx.x;
     const int lane = tid % 32;
@@ -1204,6 +1411,9 @@ static __global__ void __launch_bounds__(1024) mmh_gemv(const mmh_params p, cons
         e    = items[3*blockIdx.y + 0];
         rowp = rows_sorted + items[3*blockIdx.y + 1];
         nr   = items[3*blockIdx.y + 2];
+        if (mmh_other_class(p, e)) {
+            return;
+        }
     } else {
         // n_rows <= MMH_GEMV_LIST here: the expert of every row, once
         for (int r = tid; r < p.n_rows; r += blockDim.x) {
@@ -1218,8 +1428,12 @@ static __global__ void __launch_bounds__(1024) mmh_gemv(const mmh_params p, cons
                 dup = dup || s_eid[r] == e;
             }
             if (__syncthreads_or(dup)) {
+                trace_end(1);
                 return;
             }
+        }
+        if (mmh_other_class(p, e)) {                                  // block-uniform: e is the block's expert
+            return;
         }
         // ordered compaction of the rows of expert e
         int n = 0;
@@ -1277,6 +1491,9 @@ static __global__ void __launch_bounds__(1024) mmh_gemv(const mmh_params p, cons
         xsr      = xsum + (kz*ksplit + ksp);
     }
     const char * rout = mmh_rot_row(p, p.rot_out, p.rout_nb1, e) + (int64_t) g*MMH_NG*p.rout_nb0;
+    // strixllama: the epilogue's rot_out values, loaded before the k loop (not one memory latency after it)
+    float ro[4];
+    mmh_rot4(rout, p.rout_f16, 0, lane, p.rout_nb0/(p.rout_f16 ? 2 : 4), ro);
 
     for (int i0 = 0; i0 < nr; i0 += rows) {
         const int nc = min(rows, nr - i0);
@@ -1341,15 +1558,17 @@ static __global__ void __launch_bounds__(1024) mmh_gemv(const mmh_params p, cons
             }
             mmh_fwht(v, lane, p.had, p.hscale);
             float * out = mmh_dst_row(p, r) + (int64_t) g*MMH_NG;
+            const float rw = mmh_row_w(p, r);
             const float rs = fused ? 1.0f : rscale[r];
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int c = 32*j + lane;
-                mmh_store(p, out, c, v[j]*rs*mmh_rot(rout, p.rout_f16, c*(p.rout_nb0/(p.rout_f16 ? 2 : 4))));
+                mmh_store(p, out, c, v[j]*rs*ro[j]*rw);
             }
         }
         __syncthreads();
     }
+    trace_end(0);
 }
 
 // WMMA GEMM (RDNA4), fp16 input: 8 waves, wave w owns column tile w of the 128-row group; mt rows per block. Per step
@@ -1392,6 +1611,9 @@ static __global__ void __launch_bounds__(256, 2) mmh_gemm(const mmh_params p, co
     const int e     = mmh_uniform(items[3*blockIdx.y + 0]);
     const int start = items[3*blockIdx.y + 1];
     const int cnt   = items[3*blockIdx.y + 2];
+    if (mmh_other_class(p, e)) {
+        return;
+    }
 
     const int tid  = threadIdx.x;
     const int lane = tid % 32;
@@ -1511,16 +1733,19 @@ static __global__ void __launch_bounds__(256, 2) mmh_gemm(const mmh_params p, co
     }
 
     const char * rout = mmh_rot_row(p, p.rot_out, p.rout_nb1, e) + (int64_t) g*MMH_NG*p.rout_nb0;
+    float ro[4];
+    mmh_rot4(rout, p.rout_f16, 0, lane, p.rout_nb0/(p.rout_f16 ? 2 : 4), ro);
     // output Hadamard, rot_out and the row scale of row i of the item
     auto finish = [&](const int i, float v[4]) {
         const int r = rows_sorted[start + i];
         mmh_fwht(v, lane, p.had, p.hscale);
         float * out = mmh_dst_row(p, r) + (int64_t) g*MMH_NG;
+        const float rw = mmh_row_w(p, r);
         const float rs = rscale[r];
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int c = 32*j + lane;
-            mmh_store(p, out, c, v[j]*rs*mmh_rot(rout, p.rout_f16, c*(p.rout_nb0/(p.rout_f16 ? 2 : 4))));
+            mmh_store(p, out, c, v[j]*rs*ro[j]*rw);
         }
     };
 
@@ -1624,6 +1849,9 @@ static __global__ void __launch_bounds__(256, 1) mmh_gemm_wide(const mmh_params 
     const int e     = mmh_uniform(items[3*blockIdx.y + 0]);
     const int start = items[3*blockIdx.y + 1];
     const int cnt   = items[3*blockIdx.y + 2];
+    if (mmh_other_class(p, e)) {
+        return;
+    }
 
     const int tid  = threadIdx.x;
     const int lane = tid % 32;
@@ -1769,13 +1997,16 @@ static __global__ void __launch_bounds__(256, 1) mmh_gemm_wide(const mmh_params 
     auto finish = [&](const int i, const int gg, float v[4]) {
         const int r = rows_sorted[start + i];
         const char * rout = mmh_rot_row(p, p.rot_out, p.rout_nb1, e) + (int64_t) gg*MMH_NG*p.rout_nb0;
+        float ro[4];
+        mmh_rot4(rout, p.rout_f16, 0, lane, p.rout_nb0/(p.rout_f16 ? 2 : 4), ro);
         mmh_fwht(v, lane, p.had, p.hscale);
         float * out = mmh_dst_row(p, r) + (int64_t) gg*MMH_NG;
+        const float rw = mmh_row_w(p, r);
         const float rs = rscale[r];
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int c = 32*j + lane;
-            mmh_store(p, out, c, v[j]*rs*mmh_rot(rout, p.rout_f16, c*(p.rout_nb0/(p.rout_f16 ? 2 : 4))));
+            mmh_store(p, out, c, v[j]*rs*ro[j]*rw);
         }
     };
 
@@ -1963,6 +2194,8 @@ static __global__ void __launch_bounds__(256, 2) mmh_gemm_t(const mmh_params p, 
 
     const int row0 = rb*BM;
     const char * rout = mmh_rot_row(p, p.rot_out, p.rout_nb1, 0) + (int64_t) g*MMH_NG*p.rout_nb0;
+    float ro[4];
+    mmh_rot4(rout, p.rout_f16, 0, lane, p.rout_nb0/(p.rout_f16 ? 2 : 4), ro);
     // accumulator l of a tile holds row 2*l + lane/16, column lane % 16
 #pragma unroll
     for (int e0 = 0; e0 < BM; e0 += ec) {
@@ -1994,11 +2227,12 @@ static __global__ void __launch_bounds__(256, 2) mmh_gemm_t(const mmh_params p, 
             }
             mmh_fwht(v, lane, p.had, p.hscale);
             float * out = mmh_dst_row(p, r) + (int64_t) g*MMH_NG;
+            const float rw = mmh_row_w(p, r);
             const float rs = rscale[r];
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int c = 32*j + lane;
-                mmh_store(p, out, c, v[j]*rs*mmh_rot(rout, p.rout_f16, c*(p.rout_nb0/(p.rout_f16 ? 2 : 4))));
+                mmh_store(p, out, c, v[j]*rs*ro[j]*rw);
             }
         }
     }
@@ -2012,9 +2246,10 @@ static __global__ void __launch_bounds__(256, 2) mmh_gemm_t(const mmh_params p, 
 // and step from all over the staged rows; here the routing pass runs first and the prologue writes each row at its
 // sorted position q (p.pos) in panels of 16 rows (mmh_xh_panel), so that the rows of an item are a few dense chunks. A block owns one item (up to 128 rows of one expert) and one 128-column group: 8 waves as
 // 2 (m) x 4 (n), steps of 16 k through double-buffered LDS (two blocks per CU), wave w decodes n-tile w of the step
-// into the block's weight tile. The WMMAs of 16-row tiles past the item's rows are skipped. The products and their
+// into the block's weight tile. The WMMAs of 16-row tiles past the item's rows are skipped; the two wave rows own the
+// even and the odd 16-row tiles, so that a short item keeps both busy. The products and their
 // order per output are those of mmh_gemm: the same results.
-template <ggml_type type, int BM>
+template <ggml_type type, int BM, int WM>
 static __global__ void __launch_bounds__(256, 2) mmh_gemm_et(const mmh_params p, const char * __restrict__ w,
         const half * __restrict__ xh, const float * __restrict__ rscale, const int * __restrict__ items,
         const int * __restrict__ n_items, const int * __restrict__ rows_sorted) {
@@ -2024,8 +2259,9 @@ static __global__ void __launch_bounds__(256, 2) mmh_gemm_et(const mmh_params p,
     constexpr int ST  = 16 + 8;       // halves per staged row
     constexpr int yst = MMH_NG + 4;   // floats per output row
     constexpr int ec  = 32;           // output rows per pass through LDS
-    constexpr int MTW = BM/32;        // m-tiles per wave
-    constexpr int NTW = 2;            // n-tiles per wave
+    constexpr int MTW = BM/(16*WM);   // m-tiles per wave
+    constexpr int NTW = WM;           // n-tiles per wave: the 8 n-tiles over 8/WM waves
+    static_assert(NTW*(8/WM) == 8 && MTW >= 1, "wave layout");
     constexpr int main_bytes = 2*(BM + MMH_NG)*ST*(int) sizeof(half);
     constexpr int epi_bytes  = ec*yst*(int) sizeof(float);
     __shared__ __align__(16) char smem[main_bytes > epi_bytes ? main_bytes : epi_bytes];
@@ -2039,19 +2275,26 @@ static __global__ void __launch_bounds__(256, 2) mmh_gemm_et(const mmh_params p,
     const int e     = mmh_uniform(items[3*blockIdx.y + 0]);
     const int start = items[3*blockIdx.y + 1];
     const int cnt   = mmh_uniform(items[3*blockIdx.y + 2]);
+    if (mmh_other_class(p, e)) {
+        return;
+    }
 
     const int tid  = threadIdx.x;
     const int lane = tid % 32;
     const int wave = mmh_uniform(tid / 32);
-    const int wn   = wave % 4;
-    const int wm   = wave / 4;
+    const int wn   = wave % (8/WM);
+    const int wm   = wave / (8/WM);
     const int g    = blockIdx.x;
 
     const int nst = (int) (p.k/16);
     // chunk tid of a step: item row tid/2 (sorted position start + tid/2), 8 k at 8*(tid % 2); rows past the item
     // read the next rows (the staged rows have 128 rows of padding), their products are not stored
     const bool aload = tid < 2*BM;   // BM 64: half the threads load the rows
-    const int qa = start + (aload ? tid/2 : 0);
+    int qa = start + (aload ? tid/2 : 0);
+    if (p.tok_rows) {
+        // one staged row per token: the token of the item's row
+        qa = rows_sorted[start + (aload && tid/2 < cnt ? tid/2 : 0)]/p.tok_rows;
+    }
     constexpr int spc = MMH_ET_CW/16;   // steps per chunk
     const half * ag = xh + (int64_t) (qa/16)*(nst/spc)*(16*MMH_ET_CW) + (qa % 16)*MMH_ET_CW + 8*(tid % 2);
     const int d0 = (tid/2)*ST + 8*(tid % 2);
@@ -2102,8 +2345,8 @@ static __global__ void __launch_bounds__(256, 2) mmh_gemm_et(const mmh_params p,
         v8i_t a[MTW];
 #pragma unroll
         for (int i = 0; i < MTW; ++i) {
-            if (16*(MTW*wm + i) < cnt) {
-                a[i] = *(const v8i_t *) (xa + (16*(MTW*wm + i) + lane % 16)*ST);
+            if (16*(WM*i + wm) < cnt) {
+                a[i] = *(const v8i_t *) (xa + (16*(WM*i + wm) + lane % 16)*ST);
             }
         }
 #pragma unroll
@@ -2111,7 +2354,7 @@ static __global__ void __launch_bounds__(256, 2) mmh_gemm_et(const mmh_params p,
             const v8i_t b = *(const v8i_t *) (xb + (16*(NTW*wn + j) + lane % 16)*ST);
 #pragma unroll
             for (int i = 0; i < MTW; ++i) {
-                if (16*(MTW*wm + i) < cnt) {
+                if (16*(WM*i + wm) < cnt) {
                     mmh_wmma_f16(acc[i][j], a[i], b);
                 }
             }
@@ -2126,6 +2369,8 @@ static __global__ void __launch_bounds__(256, 2) mmh_gemm_et(const mmh_params p,
     }
 
     const char * rout = mmh_rot_row(p, p.rot_out, p.rout_nb1, e) + (int64_t) g*MMH_NG*p.rout_nb0;
+    float ro[4];
+    mmh_rot4(rout, p.rout_f16, 0, lane, p.rout_nb0/(p.rout_f16 ? 2 : 4), ro);
     // accumulator l of a tile holds row 2*l + lane/16, column lane % 16
 #pragma unroll
     for (int e0 = 0; e0 < BM; e0 += ec) {
@@ -2135,7 +2380,7 @@ static __global__ void __launch_bounds__(256, 2) mmh_gemm_et(const mmh_params p,
         __syncthreads();
 #pragma unroll
         for (int i = 0; i < MTW; ++i) {
-            const int m = MTW*wm + i;
+            const int m = WM*i + wm;
             if (m < e0/16 || m >= (e0 + ec)/16) {
                 continue;
             }
@@ -2157,11 +2402,12 @@ static __global__ void __launch_bounds__(256, 2) mmh_gemm_et(const mmh_params p,
             }
             mmh_fwht(v, lane, p.had, p.hscale);
             float * out = mmh_dst_row(p, r) + (int64_t) g*MMH_NG;
-            const float rs = rscale[r];
+            const float rw = mmh_row_w(p, r);
+            const float rs = rscale[p.tok_rows ? r/p.tok_rows : r];
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int c = 32*j + lane;
-                mmh_store(p, out, c, v[j]*rs*mmh_rot(rout, p.rout_f16, c*(p.rout_nb0/(p.rout_f16 ? 2 : 4))));
+                mmh_store(p, out, c, v[j]*rs*ro[j]*rw);
             }
         }
     }
@@ -2169,6 +2415,714 @@ static __global__ void __launch_bounds__(256, 2) mmh_gemm_et(const mmh_params p,
     GGML_UNUSED_VARS(p, w, xh, rscale, items, n_items, rows_sorted);
     NO_DEVICE_CODE;
 #endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+}
+
+// strixllama: the expert GEMM, wave layout 4 (m) x 2 (n) over 32-k chunks. A block owns one item (up to 128 rows of one
+// expert) and one 128-column group; wave (wm, wn) owns m-tiles wm and wm + 4 and n-tiles 4*wn .. 4*wn + 3 (2 + 4 fragment
+// reads per 8 WMMAs). The weight tiles of a chunk (2 steps x 8 n-tiles) are decoded by the 8 waves during the chunk
+// before (wave w: n-tile w) into a block-shared buffer; the staged rows come in 32-k chunks two ahead: one barrier per
+// 2 steps. Weights are fetched PFW steps ahead of their decode. The step loop is instantiated per wave by its m-tile
+// count (0, 1 or 2) with the last chunks peeled, so that the steady state has no branches and the fragment loads
+// issue ahead of their WMMAs. The products and their k order per output are those of mmh_gemm_et: the same results.
+template <ggml_type type>
+static __global__ void __launch_bounds__(256, 8) mmh_gemm_et3(const mmh_params p, const char * __restrict__ w,
+        const half * __restrict__ xh, const float * __restrict__ rscale, const int * __restrict__ items,
+        const int * __restrict__ n_items, const int * __restrict__ rows_sorted) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+    typedef float f8_t __attribute__((ext_vector_type(8)));
+    typedef mmh_weight<type, false> wtype;
+    constexpr int BM  = 128;
+    constexpr int CK  = 32;           // k per LDS chunk: 2 steps per barrier
+    constexpr int yst = MMH_NG + 4;   // floats per output row
+    constexpr int ec  = 32;           // output rows per pass through LDS
+    constexpr int PFW = 8;            // weight tiles fetched ahead of their decode (divides the 8 steps of 4 chunks)
+    constexpr int TB  = 16*16;        // halves per weight tile in LDS: 16 n rows of 16 k, the two 16-byte pieces swizzled
+    constexpr int a_halves   = 2*BM*CK;             // [2][BM][CK], the 16-byte pieces of a row swizzled
+    constexpr int b_halves   = 2*2*8*TB;            // [2 chunks][2 steps][8 n-tiles][TB]
+    constexpr int main_bytes = (a_halves + b_halves)*(int) sizeof(half);
+    constexpr int epi_bytes  = ec*yst*(int) sizeof(float);
+    __shared__ __align__(16) char smem[main_bytes > epi_bytes ? main_bytes : epi_bytes];
+    half  * as = (half *) smem;
+    half  * bs = as + a_halves;
+    float * ys = (float *) smem;
+
+    if ((int) blockIdx.y >= *n_items) {
+        return;
+    }
+    const int e     = mmh_uniform(items[3*blockIdx.y + 0]);
+    const int start = items[3*blockIdx.y + 1];
+    const int cnt   = mmh_uniform(items[3*blockIdx.y + 2]);
+    if (mmh_other_class(p, e)) {
+        return;
+    }
+
+    const int tid  = threadIdx.x;
+    const int lane = tid % 32;
+    const int wave = mmh_uniform(tid / 32);
+    const int wm   = wave % 4;        // wave row: m-tiles wm and wm + 4
+    const int wn   = wave / 4;        // wave column: n-tiles 4*wn .. 4*wn + 3
+    const int g    = blockIdx.x;
+
+    const int nst = (int) (p.k/16);   // a multiple of 8 (k % 128 == 0)
+    const int nch = nst/2;            // chunks, a multiple of 4
+    // staged rows: thread tid loads piece tid % 4 (8 halves) of item rows tid/4 and tid/4 + 64 of each chunk; rows past
+    // the item read the next rows (the staged rows have 128 rows of padding), their products are not stored
+    const int ar0 = tid/4;
+    const int ar1 = ar0 + 64;
+    const int apc = tid % 4;
+    int q0 = start + ar0;
+    int q1 = start + ar1;
+    if (p.tok_rows) {
+        // one staged row per token: the token of the item's row
+        q0 = rows_sorted[start + (ar0 < cnt ? ar0 : 0)]/p.tok_rows;
+        q1 = rows_sorted[start + (ar1 < cnt ? ar1 : 0)]/p.tok_rows;
+    }
+    const int kpan = (int) (p.k/MMH_ET_CW);   // 128-k panels per row
+    const half * ag0 = xh + (int64_t) (q0/16)*kpan*(16*MMH_ET_CW) + (q0 % 16)*MMH_ET_CW + 8*apc;
+    const half * ag1 = xh + (int64_t) (q1/16)*kpan*(16*MMH_ET_CW) + (q1 % 16)*MMH_ET_CW + 8*apc;
+    // LDS: row r at r*CK, piece j at 8*(j ^ ((r/2) % 4)): 8 consecutive rows read one piece from 8 different 16-byte
+    // bank groups
+    const int ad0 = ar0*CK + 8*(apc ^ ((ar0/2) % 4));
+    const int ad1 = ar1*CK + 8*(apc ^ ((ar1/2) % 4));
+    struct a_regs { uint4 v[2]; };
+    auto load_a = [&](const int c) {
+        const int o = (c/4)*(16*MMH_ET_CW) + (c % 4)*CK;
+        a_regs r;
+        r.v[0] = *(const uint4 *) (ag0 + o);
+        r.v[1] = *(const uint4 *) (ag1 + o);
+        return r;
+    };
+    auto store_a = [&](const int buf, const a_regs r) {
+        *(uint4 *) (as + buf*BM*CK + ad0) = r.v[0];
+        *(uint4 *) (as + buf*BM*CK + ad1) = r.v[1];
+    };
+
+    // weights: wave w fetches and decodes tile (step, n-tile w). In LDS a tile is 16 n rows of 16 k, piece k/8 of row n
+    // at 8*((k/8) ^ ((n/4) % 2)): 8 consecutive rows read one piece from 8 different bank groups
+    const wtype wl(mmh_weight_matrix(p, w, e) + (int64_t) g*MMH_NG*p.nb01, p.nb01, lane);
+    const int c0  = lane/4;
+    const int r0  = 2*(lane % 4);
+    const int bsw = (c0/4) % 2;       // the same for c0 + 8
+    auto put_w = [&](half * wb, const typename wtype::raw wr) {
+        uint32_t wf[4];
+        uint32_t wlo[4];
+        wl.decode(wr, wf, wlo);
+        *(uint32_t *) (wb + c0*16       + 8*(0 ^ bsw) + r0) = wf[0];
+        *(uint32_t *) (wb + c0*16       + 8*(1 ^ bsw) + r0) = wf[1];
+        *(uint32_t *) (wb + (c0 + 8)*16 + 8*(0 ^ bsw) + r0) = wf[2];
+        *(uint32_t *) (wb + (c0 + 8)*16 + 8*(1 ^ bsw) + r0) = wf[3];
+    };
+    auto btile = [&](const int buf, const int kk, const int nt) {
+        return bs + ((buf*2 + kk)*8 + nt)*TB;
+    };
+    // fragments: A of m-tile mt at step kk of the chunk in buffer buf (row 16*mt + lane % 16, pieces 2*kk, 2*kk + 1),
+    // B of n-tile nt (row lane % 16 of the tile, its two pieces)
+    const int arow = lane % 16;
+    const int asw  = (arow/2) % 4;
+    const int bsr  = (arow/4) % 2;
+    auto get_a = [&](const int buf, const int kk, const int mt) {
+        const half * xr = as + buf*BM*CK + (16*mt + arow)*CK;
+        const uint4 lo = *(const uint4 *) (xr + 8*((2*kk) ^ asw));
+        const uint4 hi = *(const uint4 *) (xr + 8*((2*kk + 1) ^ asw));
+        v8i_t a;
+        a[0] = (int) lo.x; a[1] = (int) lo.y; a[2] = (int) lo.z; a[3] = (int) lo.w;
+        a[4] = (int) hi.x; a[5] = (int) hi.y; a[6] = (int) hi.z; a[7] = (int) hi.w;
+        return a;
+    };
+    auto get_b = [&](const int buf, const int kk, const int nt) {
+        const half * xr = btile(buf, kk, nt) + arow*16;
+        const uint4 lo = *(const uint4 *) (xr + 8*(0 ^ bsr));
+        const uint4 hi = *(const uint4 *) (xr + 8*(1 ^ bsr));
+        v8i_t b;
+        b[0] = (int) lo.x; b[1] = (int) lo.y; b[2] = (int) lo.z; b[3] = (int) lo.w;
+        b[4] = (int) hi.x; b[5] = (int) hi.y; b[6] = (int) hi.z; b[7] = (int) hi.w;
+        return b;
+    };
+    const int mts = (cnt + 15)/16;                    // m-tiles of the item
+    const int ntw = (wm < mts ? 1 : 0) + (wm + 4 < mts ? 1 : 0);   // m-tiles of this wave
+
+    f8_t acc[2][4];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+#pragma unroll
+            for (int l = 0; l < 8; ++l) {
+                acc[i][j][l] = 0.0f;
+            }
+        }
+    }
+
+    // tiles 0 and 1 go straight into chunk 0; tile t >= 2 waits in wr[t % PFW] from its fetch at step t - 2 - PFW
+    // (the prologue fetches 2 .. PFW + 1) to its decode at step t - 2
+    put_w(btile(0, 0, wave), wl.fetch(0, wave));
+    put_w(btile(0, 1, wave), wl.fetch(1, wave));
+    typename wtype::raw wr[PFW];
+#pragma unroll
+    for (int t = 2; t < PFW + 2; ++t) {
+        wr[t % PFW] = wl.fetch(min(t, nst - 1), wave);
+    }
+    a_regs ra[2];
+    ra[0] = load_a(0);
+    ra[1] = load_a(1);
+    store_a(0, ra[0]);
+    mmh_lds_sync();
+
+    // one chunk c = cb + u (cb a multiple of 4): A and B buffers u % 2, ra[u % 2] held the chunk and is free. TAIL: the
+    // last chunks, every prefetch bounds-checked; otherwise all on
+    auto chunk = [&](auto nt_c, auto tail_c, const int c, const int u) {
+        constexpr int  NT   = decltype(nt_c)::value;
+        constexpr bool TAIL = decltype(tail_c)::value;
+        if (!TAIL || c + 2 < nch) {
+            ra[u % 2] = load_a(c + 2);
+        }
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk) {
+            const int s = 2*c + kk;
+            // the tile of step s + 2 (chunk c + 1, step kk) decoded; its ring slot refilled with tile s + 2 + PFW
+            if (!TAIL || s + 2 < nst) {
+                put_w(btile((u + 1) % 2, kk, wave), wr[(2*u + kk + 2) % PFW]);
+            }
+            if (!TAIL || s + 2 + PFW < nst) {
+                wr[(2*u + kk + 2) % PFW] = wl.fetch(s + 2 + PFW, wave);
+            }
+            if constexpr (NT > 0) {
+                v8i_t a[2];
+                v8i_t b[4];
+                a[0] = get_a(u % 2, kk, wm);
+                if constexpr (NT > 1) {
+                    a[1] = get_a(u % 2, kk, wm + 4);
+                }
+                b[0] = get_b(u % 2, kk, 4*wn);
+                b[1] = get_b(u % 2, kk, 4*wn + 1);
+                __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    if (j + 2 < 4) {
+                        b[j + 2] = get_b(u % 2, kk, 4*wn + j + 2);
+                    }
+                    mmh_wmma_f16(acc[0][j], a[0], b[j]);
+                    if constexpr (NT > 1) {
+                        mmh_wmma_f16(acc[1][j], a[1], b[j]);
+                    }
+                    __builtin_amdgcn_sched_barrier(0);
+                }
+            }
+        }
+        if (!TAIL || c + 1 < nch) {
+            store_a((u + 1) % 2, ra[(u + 1) % 2]);   // chunk c + 1, loaded two chunks ago
+        }
+        mmh_lds_sync();
+    };
+    auto run = [&](auto nt_c) {
+        int cb = 0;
+        for (; cb + 8 < nch; cb += 4) {
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                chunk(nt_c, mmh_bc<false>{}, cb + u, u);
+            }
+        }
+        for (; cb < nch; cb += 4) {
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                chunk(nt_c, mmh_bc<true>{}, cb + u, u);
+            }
+        }
+    };
+    if (ntw == 0) {
+        run(mmh_ic<0>{});
+    } else if (ntw == 1) {
+        run(mmh_ic<1>{});
+    } else {
+        run(mmh_ic<2>{});
+    }
+
+    const char * rout = mmh_rot_row(p, p.rot_out, p.rout_nb1, e) + (int64_t) g*MMH_NG*p.rout_nb0;
+    float ro[4];
+    mmh_rot4(rout, p.rout_f16, 0, lane, p.rout_nb0/(p.rout_f16 ? 2 : 4), ro);
+    // accumulator l of a tile holds row 2*l + lane/16, column lane % 16
+#pragma unroll
+    for (int e0 = 0; e0 < BM; e0 += ec) {
+        if (e0 >= cnt) {
+            break;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int m = 4*i + wm;
+            if (m < e0/16 || m >= (e0 + ec)/16) {
+                continue;
+            }
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+#pragma unroll
+                for (int l = 0; l < 8; ++l) {
+                    ys[(16*m - e0 + 2*l + lane/16)*yst + 16*(4*wn + j) + lane % 16] = acc[i][j][l];
+                }
+            }
+        }
+        __syncthreads();
+        for (int i = e0 + wave; i < min(cnt, e0 + ec); i += 8) {
+            const int r = rows_sorted[start + i];
+            float v[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                v[j] = ys[(i - e0)*yst + 32*j + lane];
+            }
+            mmh_fwht(v, lane, p.had, p.hscale);
+            float * out = mmh_dst_row(p, r) + (int64_t) g*MMH_NG;
+            const float rs = rscale[p.tok_rows ? r/p.tok_rows : r];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int c = 32*j + lane;
+                mmh_store(p, out, c, v[j]*rs*ro[j]);
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(p, w, xh, rscale, items, n_items, rows_sorted);
+    NO_DEVICE_CODE;
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+}
+
+// strixllama: the expert GEMM with wave-private weight strips. A block owns one item (up to 128 rows of one expert) and
+// one 128-column group; wave w owns n-tile w (16 columns) and all 8 m-tiles, decodes its own weight tile of each step
+// into a private LDS strip (no block barrier for the weights) and reads the staged rows from a 32-k chunk the block
+// shares (one barrier per 2 steps, half of mmh_gemm_et's). Weights are fetched PFW steps ahead, rows two chunks ahead.
+// The step loop is instantiated per item size (2, 4, 6 or 8 m-tiles) and the last 4 chunks are peeled, so that the
+// steady state has no branches: the fragment loads of a step issue together ahead of its WMMAs.
+// The products and their k order per output are those of mmh_gemm_et: the same results.
+#ifndef MMH_ET2_PFW
+#define MMH_ET2_PFW 4
+#endif
+template <int N> struct mmh_ic { static constexpr int  value = N; };
+template <bool V> struct mmh_bc { static constexpr bool value = V; };
+
+template <ggml_type type>
+static __global__ void __launch_bounds__(256, 8) mmh_gemm_et2(const mmh_params p, const char * __restrict__ w,
+        const half * __restrict__ xh, const float * __restrict__ rscale, const int * __restrict__ items,
+        const int * __restrict__ n_items, const int * __restrict__ rows_sorted) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+    typedef float f8_t __attribute__((ext_vector_type(8)));
+    typedef mmh_weight<type, false> wtype;
+    constexpr int BM  = 128;
+    constexpr int CK  = 32;           // k per LDS chunk of staged rows: 2 steps per barrier
+    constexpr int ST  = 16 + 8;       // halves per row of a private weight strip
+    constexpr int yst = MMH_NG + 4;   // floats per output row
+    constexpr int ec  = 32;           // output rows per pass through LDS
+    constexpr int PFW = MMH_ET2_PFW;  // weight tiles in flight per wave (divides the 8 steps of 4 chunks)
+    constexpr int a_halves   = 2*BM*CK;             // [2][BM][CK], the 16-byte pieces of a row swizzled
+    constexpr int b_halves   = 8*2*16*ST;           // [8 waves][2][16 n][ST]
+    constexpr int main_bytes = (a_halves + b_halves)*(int) sizeof(half);
+    constexpr int epi_bytes  = ec*yst*(int) sizeof(float);
+    __shared__ __align__(16) char smem[main_bytes > epi_bytes ? main_bytes : epi_bytes];
+    half  * as = (half *) smem;
+    half  * bs = as + a_halves;
+    float * ys = (float *) smem;
+
+    if ((int) blockIdx.y >= *n_items) {
+        return;
+    }
+    const int e     = mmh_uniform(items[3*blockIdx.y + 0]);
+    const int start = items[3*blockIdx.y + 1];
+    const int cnt   = mmh_uniform(items[3*blockIdx.y + 2]);
+    if (mmh_other_class(p, e)) {
+        return;
+    }
+
+    const int tid  = threadIdx.x;
+    const int lane = tid % 32;
+    const int wave = mmh_uniform(tid / 32);
+    const int g    = blockIdx.x;
+
+    const int nst = (int) (p.k/16);   // a multiple of 8 (k % 128 == 0)
+    const int nch = nst/2;            // chunks, a multiple of 4
+    // staged rows: thread tid loads piece tid % 4 (8 halves) of item rows tid/4 and tid/4 + 64 of each chunk; rows past
+    // the item read the next rows (the staged rows have 128 rows of padding), their products are not stored
+    const int ar0 = tid/4;
+    const int ar1 = ar0 + 64;
+    const int apc = tid % 4;
+    int q0 = start + ar0;
+    int q1 = start + ar1;
+    if (p.tok_rows) {
+        // one staged row per token: the token of the item's row
+        q0 = rows_sorted[start + (ar0 < cnt ? ar0 : 0)]/p.tok_rows;
+        q1 = rows_sorted[start + (ar1 < cnt ? ar1 : 0)]/p.tok_rows;
+    }
+    const int kpan = (int) (p.k/MMH_ET_CW);   // 128-k panels per row
+    const half * ag0 = xh + (int64_t) (q0/16)*kpan*(16*MMH_ET_CW) + (q0 % 16)*MMH_ET_CW + 8*apc;
+    const half * ag1 = xh + (int64_t) (q1/16)*kpan*(16*MMH_ET_CW) + (q1 % 16)*MMH_ET_CW + 8*apc;
+    // LDS: row r at r*CK, piece j at 8*(j ^ ((r/2) % 4)): 8 consecutive rows read one piece from 8 different 16-byte
+    // bank groups
+    const int ad0 = ar0*CK + 8*(apc ^ ((ar0/2) % 4));
+    const int ad1 = ar1*CK + 8*(apc ^ ((ar1/2) % 4));
+    struct a_regs { uint4 v[2]; };
+    auto load_a = [&](const int c) {
+        const int o = (c/4)*(16*MMH_ET_CW) + (c % 4)*CK;
+        a_regs r;
+        r.v[0] = *(const uint4 *) (ag0 + o);
+        r.v[1] = *(const uint4 *) (ag1 + o);
+        return r;
+    };
+    auto store_a = [&](const int buf, const a_regs r) {
+        *(uint4 *) (as + buf*BM*CK + ad0) = r.v[0];
+        *(uint4 *) (as + buf*BM*CK + ad1) = r.v[1];
+    };
+
+    const wtype wl(mmh_weight_matrix(p, w, e) + (int64_t) g*MMH_NG*p.nb01, p.nb01, lane);
+    const int c0 = lane/4;
+    const int r0 = 2*(lane % 4);
+    half * bw = bs + 2*wave*16*ST;    // this wave's two strips
+    auto put_w = [&](half * wb, const typename wtype::raw wr) {
+        uint32_t wf[4];
+        uint32_t wlo[4];
+        wl.decode(wr, wf, wlo);
+        *(uint32_t *) (wb + c0*ST       + r0)     = wf[0];
+        *(uint32_t *) (wb + c0*ST       + r0 + 8) = wf[1];
+        *(uint32_t *) (wb + (c0 + 8)*ST + r0)     = wf[2];
+        *(uint32_t *) (wb + (c0 + 8)*ST + r0 + 8) = wf[3];
+    };
+    // the A fragment of m-tile mt at step kk of the chunk in buffer buf: row 16*mt + lane % 16, pieces 2*kk, 2*kk + 1
+    const int arow = lane % 16;
+    const int asw  = (arow/2) % 4;
+    auto get_a = [&](const int buf, const int kk, const int mt) {
+        const half * xr = as + buf*BM*CK + (16*mt + arow)*CK;
+        const uint4 lo = *(const uint4 *) (xr + 8*((2*kk) ^ asw));
+        const uint4 hi = *(const uint4 *) (xr + 8*((2*kk + 1) ^ asw));
+        v8i_t a;
+        a[0] = (int) lo.x; a[1] = (int) lo.y; a[2] = (int) lo.z; a[3] = (int) lo.w;
+        a[4] = (int) hi.x; a[5] = (int) hi.y; a[6] = (int) hi.z; a[7] = (int) hi.w;
+        return a;
+    };
+    const int mts = (cnt + 15)/16;    // m-tiles of the item
+
+    f8_t acc[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+#pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            acc[i][l] = 0.0f;
+        }
+    }
+
+    typename wtype::raw wr[PFW];
+#pragma unroll
+    for (int i = 0; i < PFW; ++i) {
+        wr[i] = wl.fetch(i < nst ? i : 0, wave);
+    }
+    a_regs ra[2];
+    ra[0] = load_a(0);
+    ra[1] = load_a(nch > 1 ? 1 : 0);
+    store_a(0, ra[0]);
+    put_w(bw, wr[0]);
+    mmh_lds_sync();
+
+    // one chunk c = cb + u (cb a multiple of 4): A buffer u % 2, ra[u % 2] held it and is free; its steps' tiles are
+    // wr[2*u + kk]. TAIL: the last 4 chunks, every prefetch bounds-checked; otherwise all on
+    auto chunk = [&](auto mt_c, auto tail_c, const int c, const int u) {
+        constexpr int  MT   = decltype(mt_c)::value;
+        constexpr bool TAIL = decltype(tail_c)::value;
+        if (!TAIL || c + 2 < nch) {
+            ra[u % 2] = load_a(c + 2);
+        }
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk) {
+            const int s = 2*c + kk;       // step: its strip is s % 2 = kk
+            if (!TAIL || s + 1 < nst) {
+                put_w(bw + (1 - kk)*16*ST, wr[(2*u + kk + 1) % PFW]);
+            }
+            if (!TAIL || s + PFW < nst) {
+                wr[(2*u + kk) % PFW] = wl.fetch(s + PFW, wave);
+            }
+            const v8i_t b = *(const v8i_t *) (bw + kk*16*ST + arow*ST);
+            // the A fragments two tiles ahead of their WMMA (3 in flight: 24 registers). The scheduling barriers keep
+            // the loads there: left alone, the scheduler sinks each load next to its WMMA and waits for it (lgkmcnt(0))
+            v8i_t a[MT];
+            a[0] = get_a(u % 2, kk, 0);
+            if constexpr (MT > 1) {
+                a[1] = get_a(u % 2, kk, 1);
+            }
+            __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+            for (int mt = 0; mt < MT; ++mt) {
+                if (mt + 2 < MT) {
+                    a[mt + 2] = get_a(u % 2, kk, mt + 2);
+                }
+                mmh_wmma_f16(acc[mt], a[mt], b);
+                __builtin_amdgcn_sched_barrier(0);
+            }
+        }
+        if (!TAIL || c + 1 < nch) {
+            store_a((u + 1) % 2, ra[(u + 1) % 2]);   // chunk c + 1, loaded two chunks ago
+        }
+        mmh_lds_sync();
+    };
+    auto run = [&](auto mt_c) {
+        int cb = 0;
+        for (; cb + 4 < nch; cb += 4) {
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                chunk(mt_c, mmh_bc<false>{}, cb + u, u);
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            chunk(mt_c, mmh_bc<true>{}, cb + u, u);
+        }
+    };
+    if (mts <= 2) {
+        run(mmh_ic<2>{});
+    } else if (mts <= 4) {
+        run(mmh_ic<4>{});
+    } else if (mts <= 6) {
+        run(mmh_ic<6>{});
+    } else {
+        run(mmh_ic<8>{});
+    }
+
+    const char * rout = mmh_rot_row(p, p.rot_out, p.rout_nb1, e) + (int64_t) g*MMH_NG*p.rout_nb0;
+    float ro[4];
+    mmh_rot4(rout, p.rout_f16, 0, lane, p.rout_nb0/(p.rout_f16 ? 2 : 4), ro);
+    // accumulator l of a tile holds row 2*l + lane/16, column lane % 16
+#pragma unroll
+    for (int e0 = 0; e0 < BM; e0 += ec) {
+        if (e0 >= cnt) {
+            break;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            if (m < e0/16 || m >= (e0 + ec)/16) {
+                continue;
+            }
+#pragma unroll
+            for (int l = 0; l < 8; ++l) {
+                ys[(16*m - e0 + 2*l + lane/16)*yst + 16*wave + lane % 16] = acc[m][l];
+            }
+        }
+        __syncthreads();
+        for (int i = e0 + wave; i < min(cnt, e0 + ec); i += 8) {
+            const int r = rows_sorted[start + i];
+            float v[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                v[j] = ys[(i - e0)*yst + 32*j + lane];
+            }
+            mmh_fwht(v, lane, p.had, p.hscale);
+            float * out = mmh_dst_row(p, r) + (int64_t) g*MMH_NG;
+            const float rs = rscale[p.tok_rows ? r/p.tok_rows : r];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int c = 32*j + lane;
+                mmh_store(p, out, c, v[j]*rs*ro[j]);
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(p, w, xh, rscale, items, n_items, rows_sorted);
+    NO_DEVICE_CODE;
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+}
+
+// strixllama: the tiled dense GEMM over 32-k chunks: mmh_gemm_t's block (128 rows x one 128-column group, 8 waves as
+// 2 (m) x 4 (n) of 64 x 32, two blocks per CU, panel block swizzle) with the LDS holding 32 k per chunk (one barrier
+// per 2 steps instead of 1), the 16-byte pieces of a row swizzled instead of padded (16 KB per chunk, 32 KB double-
+// buffered), the global loads two chunks ahead and the last chunks peeled, so that the steady state has no branches.
+// The same products in the same k order per output as mmh_gemm_t: the same results.
+static __global__ void __launch_bounds__(256, 8) mmh_gemm_t2(const mmh_params p, const half * __restrict__ wd,
+        const half * __restrict__ xh, const float * __restrict__ rscale, const int n_rb, const int n_groups) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+    typedef float    f8_t  __attribute__((ext_vector_type(8)));
+    constexpr int BM  = 128;
+    constexpr int CK  = 32;           // k per LDS chunk: 2 steps per barrier
+    constexpr int yst = MMH_NG + 4;   // floats per output row
+    constexpr int ec  = 32;           // output rows per pass through LDS
+    constexpr int MTW = 4;            // m-tiles per wave
+    constexpr int NTW = 2;            // n-tiles per wave
+    constexpr int c_halves   = BM*CK;                           // one chunk of rows (or of columns)
+    constexpr int main_bytes = 4*c_halves*(int) sizeof(half);   // [2 buffers][rows, columns]
+    constexpr int epi_bytes  = ec*yst*(int) sizeof(float);
+    __shared__ __align__(16) char smem[main_bytes > epi_bytes ? main_bytes : epi_bytes];
+    half  * as = (half *) smem;       // [2][BM*CK]
+    half  * bs = as + 2*c_halves;     // [2][128*CK]
+    float * ys = (float *) smem;
+
+    const int tid  = threadIdx.x;
+    const int lane = tid % 32;
+    const int wave = tid / 32;
+    const int wn   = wave % 4;
+    const int wm   = wave / 4;
+
+    constexpr int P = 8;
+    const int bid   = blockIdx.x;
+    const int panel = bid/(P*n_groups);
+    const int pr    = min(P, n_rb - panel*P);
+    const int in    = bid - panel*P*n_groups;
+    const int rb    = panel*P + in % pr;
+    const int g     = in/pr;
+
+    const int nst = (int) (p.k/16);   // a multiple of 8 (k % 128 == 0)
+    const int nch = nst/2;            // chunks, a multiple of 4
+    // the step tiles of a row block / column group: [step][128 rows][16 k]; thread tid takes uint4 tid of each tile
+    // (row tid/2, 8 k at 8*(tid % 2)); a chunk is two consecutive tiles
+    constexpr int TU = BM*16/8;       // uint4 per step tile
+    const uint4 * ag = (const uint4 *) (xh + (int64_t) rb*BM*p.k) + tid;
+    const uint4 * bg = (const uint4 *) (wd + (int64_t) g*MMH_NG*p.k) + tid;
+    // LDS: row r at r*CK, piece j at 8*(j ^ ((r/2) % 4)): 8 consecutive rows read one piece from 8 different 16-byte
+    // bank groups
+    const int lr  = tid/2;
+    const int lp  = tid % 2;
+    const int ld0 = lr*CK + 8*(lp ^ ((lr/2) % 4));
+    const int ld1 = lr*CK + 8*((lp + 2) ^ ((lr/2) % 4));
+    struct regs { uint4 a[2]; uint4 b[2]; };
+    auto load = [&](const int c) {
+        regs r;
+        r.a[0] = ag[(2*c)*TU];
+        r.a[1] = ag[(2*c + 1)*TU];
+        r.b[0] = bg[(2*c)*TU];
+        r.b[1] = bg[(2*c + 1)*TU];
+        return r;
+    };
+    auto store = [&](const int buf, const regs r) {
+        *(uint4 *) (as + buf*c_halves + ld0) = r.a[0];
+        *(uint4 *) (as + buf*c_halves + ld1) = r.a[1];
+        *(uint4 *) (bs + buf*c_halves + ld0) = r.b[0];
+        *(uint4 *) (bs + buf*c_halves + ld1) = r.b[1];
+    };
+    // the fragment of tile t at step kk of a chunk buffer: row 16*t + lane % 16, pieces 2*kk, 2*kk + 1
+    const int frow = lane % 16;
+    const int fsw  = (frow/2) % 4;
+    auto frag = [&](const half * base, const int kk, const int t) {
+        const half * xr = base + (16*t + frow)*CK;
+        const uint4 lo = *(const uint4 *) (xr + 8*((2*kk) ^ fsw));
+        const uint4 hi = *(const uint4 *) (xr + 8*((2*kk + 1) ^ fsw));
+        v8i_t v;
+        v[0] = (int) lo.x; v[1] = (int) lo.y; v[2] = (int) lo.z; v[3] = (int) lo.w;
+        v[4] = (int) hi.x; v[5] = (int) hi.y; v[6] = (int) hi.z; v[7] = (int) hi.w;
+        return v;
+    };
+
+    f8_t acc[MTW][NTW];
+#pragma unroll
+    for (int i = 0; i < MTW; ++i) {
+#pragma unroll
+        for (int j = 0; j < NTW; ++j) {
+#pragma unroll
+            for (int l = 0; l < 8; ++l) {
+                acc[i][j][l] = 0.0f;
+            }
+        }
+    }
+
+    regs rg[2];
+    rg[0] = load(0);
+    rg[1] = load(nch > 1 ? 1 : 0);
+    store(0, rg[0]);
+    mmh_lds_sync();
+
+    // one chunk c = cb + u (cb a multiple of 4): buffer u % 2, rg[u % 2] held it and is free. TAIL: the last 4 chunks,
+    // the loads and stores bounds-checked; otherwise all on
+    auto chunk = [&](auto tail_c, const int c, const int u) {
+        constexpr bool TAIL = decltype(tail_c)::value;
+        if (!TAIL || c + 2 < nch) {
+            rg[u % 2] = load(c + 2);
+        }
+        const half * xa = as + (u % 2)*c_halves;
+        const half * xb = bs + (u % 2)*c_halves;
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk) {
+            v8i_t a[MTW];
+            v8i_t b[NTW];
+#pragma unroll
+            for (int i = 0; i < MTW; ++i) {
+                a[i] = frag(xa, kk, MTW*wm + i);
+            }
+#pragma unroll
+            for (int j = 0; j < NTW; ++j) {
+                b[j] = frag(xb, kk, NTW*wn + j);
+            }
+            __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+            for (int j = 0; j < NTW; ++j) {
+#pragma unroll
+                for (int i = 0; i < MTW; ++i) {
+                    mmh_wmma_f16(acc[i][j], a[i], b[j]);
+                }
+            }
+            __builtin_amdgcn_sched_barrier(0);
+        }
+        if (!TAIL || c + 1 < nch) {
+            store((u + 1) % 2, rg[(u + 1) % 2]);   // chunk c + 1, loaded two chunks ago
+        }
+        mmh_lds_sync();
+    };
+    int cb = 0;
+    for (; cb + 4 < nch; cb += 4) {
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            chunk(mmh_bc<false>{}, cb + u, u);
+        }
+    }
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        chunk(mmh_bc<true>{}, cb + u, u);
+    }
+
+    const int row0 = rb*BM;
+    const char * rout = mmh_rot_row(p, p.rot_out, p.rout_nb1, 0) + (int64_t) g*MMH_NG*p.rout_nb0;
+    float ro[4];
+    mmh_rot4(rout, p.rout_f16, 0, lane, p.rout_nb0/(p.rout_f16 ? 2 : 4), ro);
+    // accumulator l of a tile holds row 2*l + lane/16, column lane % 16
+#pragma unroll
+    for (int e0 = 0; e0 < BM; e0 += ec) {
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < MTW; ++i) {
+            const int m = MTW*wm + i;
+            if (m < e0/16 || m >= (e0 + ec)/16) {
+                continue;
+            }
+#pragma unroll
+            for (int j = 0; j < NTW; ++j) {
+#pragma unroll
+                for (int l = 0; l < 8; ++l) {
+                    ys[(16*m - e0 + 2*l + lane/16)*yst + 16*(NTW*wn + j) + lane % 16] = acc[i][j][l];
+                }
+            }
+        }
+        __syncthreads();
+        for (int i = e0 + wave; i < e0 + ec; i += 8) {
+            const int r = row0 + i;
+            if (r >= p.n_rows) {
+                break;
+            }
+            float v[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                v[j] = ys[(i - e0)*yst + 32*j + lane];
+            }
+            mmh_fwht(v, lane, p.had, p.hscale);
+            float * out = mmh_dst_row(p, r) + (int64_t) g*MMH_NG;
+            const float rs = rscale[r];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int c = 32*j + lane;
+                mmh_store(p, out, c, v[j]*rs*ro[j]);
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(p, wd, xh, rscale, n_rb, n_groups);
+    NO_DEVICE_CODE;
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+}
+
+// strixllama: mmh_gemm_et's wave layout, 4 m x 2 n for items of up to 128 rows (the staged rows read from LDS by 2
+// waves instead of 4: -10% at 5050 tokens), 2 m x 4 n for the 64-row items of small batches (where 4 m-waves would
+// leave half of them without a 16-row tile). STRIX_MMH_ET_WM=2 / 4 forces one (dev A/B; bitwise either way)
+static int mmh_et_wm(const int bm) {
+    static const int wm = getenv("STRIX_MMH_ET_WM") ? atoi(getenv("STRIX_MMH_ET_WM")) : 0;
+    return wm ? wm : bm == 128 ? 4 : 2;
 }
 
 bool ggml_cuda_mul_mat_had_supported(const int device, const ggml_tensor * op) {
@@ -2191,6 +3145,18 @@ bool ggml_cuda_mul_mat_had_supported(const int device, const ggml_tensor * op) {
     if (w->nb[1] % 8 != 0 || w->nb[2] % 8 != 0 || w->ne[2] > MMH_MAX_EXPERTS || ggml_nrows(op) > INT_MAX/2) {
         return false;
     }
+    // strixllama: per-expert widths: every class as the first, the experts counted by the class map
+    if (op->src[5]) {
+        if (op->src[5]->ne[0] > MMH_MAX_EXPERTS || !op->src[2]) {
+            return false;
+        }
+        for (int c = 6; c < 8; ++c) {
+            const ggml_tensor * wc = op->src[c];
+            if (wc && (!ggml_is_exl3(wc->type) || wc->nb[1] % 8 != 0 || wc->nb[2] % 8 != 0)) {
+                return false;
+            }
+        }
+    }
     return true;
 }
 
@@ -2209,6 +3175,25 @@ static bool mmh_input_f16(const ggml_tensor * dst) {
         }
         return prec;
     }();
+    // strixllama (dev): STRIX_MMH_F32_MATCH=a,b,... runs the ops whose weight name contains one of the parts with F32
+    // inputs (which ops' fp16 rounding moves the KLD)
+    static const std::vector<std::string> f32_match = [] {
+        std::vector<std::string> v;
+        const char * e = getenv("STRIX_MMH_F32_MATCH");
+        for (std::string s = e ? e : ""; !s.empty(); ) {
+            const size_t c = s.find(',');
+            if (c != 0) v.push_back(s.substr(0, c));
+            s = c == std::string::npos ? "" : s.substr(c + 1);
+        }
+        return v;
+    }();
+    if (!f32_match.empty() && dst->src[0]) {
+        for (const std::string & m : f32_match) {
+            if (strstr(dst->src[0]->name, m.c_str())) {
+                return false;
+            }
+        }
+    }
     ggml_prec prec = (ggml_prec) ggml_get_op_params_i32(dst, 3);
     if (prec == GGML_PREC_UNDEFINED) {
         prec = env != GGML_PREC_UNDEFINED ? env : MMH_PREC_DEFAULT;
@@ -2313,9 +3298,20 @@ struct mmh_timing {
 };
 static mmh_timing g_mmh_timing;
 
+// strixllama: per-expert widths: the routes and staged rows of an op's first class, reused by its other classes on the
+// expert GEMM path (they do not depend on the weight's type); owned by mmh_run, so its pool memory outlives the
+// launches and is freed after theirs
+struct mmh_et_shared {
+    bool ready = false;
+    ggml_cuda_pool_alloc<int>   route;
+    ggml_cuda_pool_alloc<half>  xh;
+    ggml_cuda_pool_alloc<float> rscale;
+    explicit mmh_et_shared(ggml_cuda_pool & pool) : route(pool), xh(pool), rscale(pool) {}
+};
+
 template <ggml_type type, bool f16>
 static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, const char * w, const int64_t n,
-        const bool inline_rows) {
+        const bool inline_rows, mmh_et_shared * sh = nullptr) {
     cudaStream_t stream = ctx.stream();
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     const int64_t n_groups = n/MMH_NG;
@@ -2342,7 +3338,11 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
         // a block and S/2 blocks (small blocks fill the CUs better than blocks of 4 k splits)
         const int64_t kslices = p.k/16;
         // strixllama (dev): STRIX_MMH_GEMV_WAVES / STRIX_MMH_GEMV_MINK override the k split's targets
-        static const int gemv_waves = getenv("STRIX_MMH_GEMV_WAVES") ? atoi(getenv("STRIX_MMH_GEMV_WAVES")) : MMH_GEMV_WAVES;
+        static const int gemv_waves_env = getenv("STRIX_MMH_GEMV_WAVES") ? atoi(getenv("STRIX_MMH_GEMV_WAVES")) : 0;
+        // strixllama (dev): STRIX_MMH_GEMV_WAVES_1ROW overrides the one-row dense target alone
+        static const int gemv_waves_1row_env = getenv("STRIX_MMH_GEMV_WAVES_1ROW") ? atoi(getenv("STRIX_MMH_GEMV_WAVES_1ROW")) : 0;
+        const int gemv_waves = !p.ids && p.n_rows == 1 && gemv_waves_1row_env ? gemv_waves_1row_env :
+                               gemv_waves_env ? gemv_waves_env : !p.ids && p.n_rows == 1 ? MMH_GEMV_WAVES_1ROW : MMH_GEMV_WAVES;
         static const int gemv_mink  = getenv("STRIX_MMH_GEMV_MINK") ? atoi(getenv("STRIX_MMH_GEMV_MINK")) : MMH_GEMV_MIN_KSLICES;
         const double  want    = (double) gemv_waves/(8.0*(double) (n_groups*used));
         int split = 1;
@@ -2354,7 +3354,8 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
         if (p.ids && p.ne2 > 1 && split < 2 && kslices >= 4*MMH_GEMV_MIN_KSLICES) {
             split = 2;
         }
-        const int ksplit  = split >= 2 ? 2 : 1;
+        static const int ksplit_max = getenv("STRIX_MMH_KSPLIT_MAX") ? atoi(getenv("STRIX_MMH_KSPLIT_MAX")) : 2;
+        const int ksplit  = split >= 4 && ksplit_max >= 4 ? 4 : split >= 2 ? 2 : 1;
         const int kblocks = split/ksplit;
 
         ggml_cuda_pool_alloc<float> part(ctx.pool());
@@ -2405,7 +3406,67 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
         int * tk = fused ? fused_tickets : tickets.ptr;
 
         const bool coal = p.ids != nullptr;
+        // strixllama (dev): STRIX_MMH_PATHLOG=n prints the first n inline GEMV launch choices
+        {
+            static const int plog = getenv("STRIX_MMH_PATHLOG") ? atoi(getenv("STRIX_MMH_PATHLOG")) : 0;
+            static int nlog = 0;
+            if (plog && nlog < plog) {
+                ++nlog;
+                fprintf(stderr, "MMH_PATH k %lld n %lld rows %lld ids %d ne11 %d: fused %d h16 %d coal %d rows_t %d ksplit %d kblocks %d grid %lldx%lld lds %zu/%zu\n",
+                    (long long) p.k, (long long) n, (long long) p.n_rows, p.ids != nullptr, p.ne11, (int) fused, (int) h16, (int) coal,
+                    rows_t, ksplit, kblocks, (long long) n_groups, (long long) n_items, h16 ? lds16 : lds, lds_static);
+            }
+        }
         const dim3 grid(n_groups, n_items, kblocks);
+        // strixllama (dev): STRIX_MMH_TRACE=n prints the block timeline of the first n inline GEMVs
+        static const int trace_env = getenv("STRIX_MMH_TRACE") ? atoi(getenv("STRIX_MMH_TRACE")) : 0;
+        static const int trace_skip = getenv("STRIX_MMH_TRACE_SKIP") ? atoi(getenv("STRIX_MMH_TRACE_SKIP")) : 0;
+        static int traced = 0;
+        if (trace_env && traced++ >= trace_skip && traced <= trace_skip + trace_env) {
+            const size_t nbl = (size_t) grid.x*grid.y*grid.z;
+            unsigned long long * tr = nullptr;
+            CUDA_CHECK(cudaMalloc((void **) &tr, 3*nbl*sizeof(unsigned long long)));
+            CUDA_CHECK(cudaMemsetAsync(tr, 0, 3*nbl*sizeof(unsigned long long), stream));
+            mmh_params pt = p;
+            pt.trace = tr;
+            if (h16) {
+                if constexpr (f16 && mmh_is_exl3(type)) {
+                    mmh_launch_gemv_rows<type, true>(rows_t, fused, coal, grid, ksplit, lds16, stream, pt, w, xh.ptr, xsum.ptr,
+                        rscale.ptr, part.ptr, tk, max_chunks);
+                }
+            } else {
+                mmh_launch_gemv_rows<type, false>(rows_t, fused, coal, grid, ksplit, lds, stream, pt, w, xh.ptr, nullptr, rscale.ptr,
+                    part.ptr, tk, max_chunks);
+            }
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            std::vector<unsigned long long> h(3*nbl);
+            CUDA_CHECK(cudaMemcpy(h.data(), tr, h.size()*sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaFree(tr));
+            int rate_khz = 100000;
+            (void) cudaDeviceGetAttribute(&rate_khz, hipDeviceAttributeWallClockRate, ctx.device);
+            const double us = 1000.0/rate_khz;
+            unsigned long long t0 = ~0ull, t1 = 0, s1 = 0;
+            double dsum = 0, dmax = 0;
+            int nrun = 0;
+            std::map<int, int> per_cu;
+            std::vector<double> starts;
+            for (size_t i = 0; i < nbl; ++i) {
+                if (!h[3*i] || (h[3*i + 2] >> 16)) continue;
+                ++nrun;
+                t0 = std::min(t0, h[3*i]); t1 = std::max(t1, h[3*i + 1]); s1 = std::max(s1, h[3*i]);
+                const double d = (h[3*i + 1] - h[3*i])*us;
+                dsum += d; dmax = std::max(dmax, d);
+                per_cu[(int) (h[3*i + 2] & 0xFFFF)]++;
+                starts.push_back((double) h[3*i]);
+            }
+            int maxcu = 0;
+            for (auto & kv : per_cu) maxcu = std::max(maxcu, kv.second);
+            fprintf(stderr, "MMH_TRACE k %lld n %lld rows %lld grid %ux%ux%u x %d waves: %d blocks ran, span %.1f us, starts over %.1f us, "
+                "block mean %.1f max %.1f us, %zu CU ids, max %d blocks on one\n", (long long) p.k, (long long) n,
+                (long long) p.n_rows, grid.x, grid.y, grid.z, 8*ksplit, nrun, (t1 - t0)*us, (s1 - t0)*us, nrun ? dsum/nrun : 0.0,
+                dmax, per_cu.size(), maxcu);
+            return;
+        }
         if constexpr (f16 && mmh_is_exl3(type)) {
             if (h16) {
                 mmh_launch_gemv_rows<type, true>(rows_t, fused, coal, grid, ksplit, lds16, stream, p, w, xh.ptr, xsum.ptr, rscale.ptr,
@@ -2436,7 +3497,11 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
             rscale.alloc(p.n_rows);
             g_mmh_timing.mark(stream, 0);
             if (pwave_env) {
-                mmh_prologue_wave<true><<<(unsigned) ((p.n_rows + 7)/8), 256, 0, stream>>>(p, xh.get(), rscale.get());
+                if (mmh_pwave4_ok(p)) {
+                    mmh_prologue_wave4<true><<<(unsigned) ((p.n_rows + 7)/8), 256, 0, stream>>>(p, xh.get(), rscale.get());
+                } else {
+                    mmh_prologue_wave<true><<<(unsigned) ((p.n_rows + 7)/8), 256, 0, stream>>>(p, xh.get(), rscale.get());
+                }
             } else {
                 mmh_prologue<false, true, true><<<p.n_rows, 256, 0, stream>>>(p, xh.get(), rscale.get(), nullptr, 0, nullptr, 0, 0);
             }
@@ -2445,7 +3510,13 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
             mmh_decode_t<type><<<dim3((unsigned) n_groups, (unsigned) ((p.k/32 + 7)/8)), 256, 0, stream>>>(p, w, wd.get());
             CUDA_CHECK(cudaGetLastError());
             g_mmh_timing.mark(stream, 2);
-            mmh_gemm_t<<<(unsigned) (n_rb*n_groups), 256, 0, stream>>>(p, wd.get(), xh.get(), rscale.get(), (int) n_rb, (int) n_groups);
+            // strixllama (dev): STRIX_MMH_GT2=1 runs the chunked tiled GEMM (A/B; bitwise)
+            static const bool gt2_env = !getenv("STRIX_MMH_GT2") || atoi(getenv("STRIX_MMH_GT2")) != 0;   // default on
+            if (gt2_env) {
+                mmh_gemm_t2<<<(unsigned) (n_rb*n_groups), 256, 0, stream>>>(p, wd.get(), xh.get(), rscale.get(), (int) n_rb, (int) n_groups);
+            } else {
+                mmh_gemm_t<<<(unsigned) (n_rb*n_groups), 256, 0, stream>>>(p, wd.get(), xh.get(), rscale.get(), (int) n_rb, (int) n_groups);
+            }
             CUDA_CHECK(cudaGetLastError());
             g_mmh_timing.mark(stream, 3);
             g_mmh_timing.done(0);
@@ -2456,23 +3527,35 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
     // strixllama: ops with ids route first and stage their rows in sorted panels for mmh_gemm_et
     if constexpr (mmh_is_exl3(type)) {
         static const bool et_env = !getenv("STRIX_MMH_ET") || atoi(getenv("STRIX_MMH_ET")) != 0;
+        // strixllama (dev): STRIX_MMH_ET2=1 runs mmh_gemm_et2 for the 128-row items (A/B; bitwise)
+        static const int et2_env = getenv("STRIX_MMH_ET2") ? atoi(getenv("STRIX_MMH_ET2")) : 1;   // default: et2
         if (wmma && GGML_CUDA_CC_IS_RDNA3(cc) && et_env && p.ids && p.k % 128 == 0) {
             const int mt_et = per_exp > 64 ? 128 : 64;
             const int64_t max_items = used + p.n_rows/mt_et + 1;
             GGML_ASSERT(max_items <= 65535);
-            ggml_cuda_pool_alloc<int> route(ctx.pool(), 3*p.n_rows + 3*max_items + 1);
+            // strixllama: per-expert widths: the first class routes and stages, the others reuse it (sh->ready)
+            ggml_cuda_pool_alloc<int>   route_own(ctx.pool());
+            ggml_cuda_pool_alloc<int>   & route = sh ? sh->route : route_own;
+            ggml_cuda_pool_alloc<half>  & xhs   = sh ? sh->xh : xh;
+            ggml_cuda_pool_alloc<float> & rss   = sh ? sh->rscale : rscale;
+            const bool reuse = sh && sh->ready;
+            if (!reuse) {
+                route.alloc(3*p.n_rows + 3*max_items + 1);
+            }
             int * eid         = route.get();
             int * pos         = eid + p.n_rows;
             int * rows_sorted = pos + p.n_rows;
             int * items       = rows_sorted + p.n_rows;
             int * n_items     = items + 3*max_items;
             g_mmh_timing.mark(stream, 0);
-            mmh_route<<<1, 1024, 0, stream>>>(p, mt_et, eid, pos, rows_sorted, items, n_items);
-            CUDA_CHECK(cudaGetLastError());
+            if (!reuse) {
+                mmh_route<<<1, 1024, 0, stream>>>(p, mt_et, eid, pos, rows_sorted, items, n_items);
+                CUDA_CHECK(cudaGetLastError());
+            }
             g_mmh_timing.mark(stream, 1);
             // strixllama (dev): STRIX_MMH_ROUTE_STATS=1 prints the rows per expert of the large ops with ids
             static const bool stats_env = getenv("STRIX_MMH_ROUTE_STATS") != nullptr;
-            if (stats_env && p.n_rows >= 4096 && p.k > 1024) {
+            if (stats_env && !reuse && p.n_rows >= 4096 && p.k > 1024) {
                 std::vector<int> h_items(3*max_items);
                 int h_n = 0;
                 CUDA_CHECK(cudaMemcpyAsync(&h_n, n_items, sizeof(int), cudaMemcpyDeviceToHost, stream));
@@ -2498,24 +3581,104 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
 
             mmh_params pp = p;
             pp.pos = pos;
-            // the panels of all rows and of the 128 rows a block of the last item reads past them
-            xh.alloc(((p.n_rows + 128)/16 + 1)*16*p.k);
-            rscale.alloc(p.n_rows);
-            if (pwave_env) {
-                mmh_prologue_wave<false><<<(unsigned) ((p.n_rows + 7)/8), 256, 0, stream>>>(pp, xh.get(), rscale.get());
-            } else if (p.ne11 == 1 && p.ne1 <= 16 && p.k <= 4096) {
-                mmh_prologue_tok<<<p.ne2, 256, 0, stream>>>(pp, xh.get(), rscale.get());
-            } else {
-                mmh_prologue<false, true><<<p.n_rows, 256, 0, stream>>>(pp, xh.get(), rscale.get(), nullptr, 0, nullptr, 0, 0);
+            // strixllama (dev): STRIX_MMH_SHARED_ROT=1 also takes expert 0's rot_in for all (wrong values: the speed of a
+            // file whose experts share their input rotation)
+            // a rot_in shared by all experts (rin_nb1 0) with one input row per token: one staged row per token
+            static const bool shared_env = getenv("STRIX_MMH_SHARED_ROT") && atoi(getenv("STRIX_MMH_SHARED_ROT")) != 0;
+            if ((shared_env || p.rin_nb1 == 0) && p.ne11 == 1) {
+                mmh_params pt = p;
+                pt.ids = nullptr;
+                pt.n_rows = p.ne2;
+                pt.ne1 = 1;
+                pt.bcast = 1 << 30;
+                pt.panel_rows = 1;
+                if (!reuse) {
+                    xhs.alloc(((p.ne2 + 128)/16 + 1)*16*p.k);
+                    rss.alloc(p.ne2);
+                    if (mmh_pwave4_ok(pt)) {
+                        mmh_prologue_wave4<false><<<(unsigned) ((p.ne2 + 7)/8), 256, 0, stream>>>(pt, xhs.get(), rss.get());
+                    } else {
+                        mmh_prologue_wave<false><<<(unsigned) ((p.ne2 + 7)/8), 256, 0, stream>>>(pt, xhs.get(), rss.get());
+                    }
+                    CUDA_CHECK(cudaGetLastError());
+                }
+                if (sh) {
+                    sh->ready = true;
+                }
+                pp.pos = nullptr;
+                pp.tok_rows = p.ne1;
+                g_mmh_timing.mark(stream, 2);
+                if (mt_et == 128 && et2_env == 2) {
+                    mmh_gemm_et3<type><<<dim3((unsigned) n_groups, (unsigned) max_items), 256, 0, stream>>>(pp, w, xhs.get(),
+                        rss.get(), items, n_items, rows_sorted);
+                } else if (mt_et == 128 && et2_env) {
+                    mmh_gemm_et2<type><<<dim3((unsigned) n_groups, (unsigned) max_items), 256, 0, stream>>>(pp, w, xhs.get(),
+                        rss.get(), items, n_items, rows_sorted);
+                } else if (mt_et == 128) {
+                    if (mmh_et_wm(128) == 2) {
+                        mmh_gemm_et<type, 128, 2><<<dim3((unsigned) n_groups, (unsigned) max_items), 256, 0, stream>>>(pp, w, xhs.get(),
+                            rss.get(), items, n_items, rows_sorted);
+                    } else {
+                        mmh_gemm_et<type, 128, 4><<<dim3((unsigned) n_groups, (unsigned) max_items), 256, 0, stream>>>(pp, w, xhs.get(),
+                            rss.get(), items, n_items, rows_sorted);
+                    }
+                } else {
+                    if (mmh_et_wm(64) == 2) {
+                        mmh_gemm_et<type, 64, 2><<<dim3((unsigned) n_groups, (unsigned) max_items), 256, 0, stream>>>(pp, w, xhs.get(),
+                            rss.get(), items, n_items, rows_sorted);
+                    } else {
+                        mmh_gemm_et<type, 64, 4><<<dim3((unsigned) n_groups, (unsigned) max_items), 256, 0, stream>>>(pp, w, xhs.get(),
+                            rss.get(), items, n_items, rows_sorted);
+                    }
+                }
+                CUDA_CHECK(cudaGetLastError());
+                g_mmh_timing.mark(stream, 3);
+                g_mmh_timing.done(p.k <= 1024 ? 2 : 1);
+                return;
             }
-            CUDA_CHECK(cudaGetLastError());
+            // the panels of all rows and of the 128 rows a block of the last item reads past them
+            if (!reuse) {
+                xhs.alloc(((p.n_rows + 128)/16 + 1)*16*p.k);
+                rss.alloc(p.n_rows);
+                if (pwave_env) {
+                    if (mmh_pwave4_ok(pp)) {
+                        mmh_prologue_wave4<false><<<(unsigned) ((p.n_rows + 7)/8), 256, 0, stream>>>(pp, xhs.get(), rss.get());
+                    } else {
+                        mmh_prologue_wave<false><<<(unsigned) ((p.n_rows + 7)/8), 256, 0, stream>>>(pp, xhs.get(), rss.get());
+                    }
+                } else if (p.ne11 == 1 && p.ne1 <= 16 && p.k <= 4096) {
+                    mmh_prologue_tok<<<p.ne2, 256, 0, stream>>>(pp, xhs.get(), rss.get());
+                } else {
+                    mmh_prologue<false, true><<<p.n_rows, 256, 0, stream>>>(pp, xhs.get(), rss.get(), nullptr, 0, nullptr, 0, 0);
+                }
+                CUDA_CHECK(cudaGetLastError());
+            }
+            if (sh) {
+                sh->ready = true;
+            }
             g_mmh_timing.mark(stream, 2);
-            if (mt_et == 128) {
-                mmh_gemm_et<type, 128><<<dim3((unsigned) n_groups, (unsigned) max_items), 256, 0, stream>>>(pp, w, xh.get(),
-                    rscale.get(), items, n_items, rows_sorted);
+            if (mt_et == 128 && et2_env == 2) {
+                mmh_gemm_et3<type><<<dim3((unsigned) n_groups, (unsigned) max_items), 256, 0, stream>>>(pp, w, xhs.get(),
+                    rss.get(), items, n_items, rows_sorted);
+            } else if (mt_et == 128 && et2_env) {
+                mmh_gemm_et2<type><<<dim3((unsigned) n_groups, (unsigned) max_items), 256, 0, stream>>>(pp, w, xhs.get(),
+                    rss.get(), items, n_items, rows_sorted);
+            } else if (mt_et == 128) {
+                if (mmh_et_wm(128) == 2) {
+                    mmh_gemm_et<type, 128, 2><<<dim3((unsigned) n_groups, (unsigned) max_items), 256, 0, stream>>>(pp, w, xhs.get(),
+                        rss.get(), items, n_items, rows_sorted);
+                } else {
+                    mmh_gemm_et<type, 128, 4><<<dim3((unsigned) n_groups, (unsigned) max_items), 256, 0, stream>>>(pp, w, xhs.get(),
+                        rss.get(), items, n_items, rows_sorted);
+                }
             } else {
-                mmh_gemm_et<type, 64><<<dim3((unsigned) n_groups, (unsigned) max_items), 256, 0, stream>>>(pp, w, xh.get(),
-                    rscale.get(), items, n_items, rows_sorted);
+                if (mmh_et_wm(64) == 2) {
+                    mmh_gemm_et<type, 64, 2><<<dim3((unsigned) n_groups, (unsigned) max_items), 256, 0, stream>>>(pp, w, xhs.get(),
+                        rss.get(), items, n_items, rows_sorted);
+                } else {
+                    mmh_gemm_et<type, 64, 4><<<dim3((unsigned) n_groups, (unsigned) max_items), 256, 0, stream>>>(pp, w, xhs.get(),
+                        rss.get(), items, n_items, rows_sorted);
+                }
             }
             CUDA_CHECK(cudaGetLastError());
             g_mmh_timing.mark(stream, 3);
@@ -2612,11 +3775,11 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
 
 template <ggml_type type>
 static void mmh_launch_prec(ggml_backend_cuda_context & ctx, const mmh_params & p, const char * w, const int64_t n,
-        const bool inline_rows, const bool f16) {
+        const bool inline_rows, const bool f16, mmh_et_shared * sh = nullptr) {
     if (f16) {
-        mmh_launch<type, true>(ctx, p, w, n, inline_rows);
+        mmh_launch<type, true>(ctx, p, w, n, inline_rows, sh);
     } else {
-        mmh_launch<type, false>(ctx, p, w, n, inline_rows);
+        mmh_launch<type, false>(ctx, p, w, n, inline_rows, sh);
     }
 }
 
@@ -2625,8 +3788,96 @@ static const char * mmh_data(const ggml_tensor * t) {
     return (const char *) t->data;
 }
 
+// the launch for a weight type
+static void mmh_dispatch(ggml_backend_cuda_context & ctx, const ggml_type wtype, const mmh_params & p, const char * wd,
+        const int64_t n, const bool inline_rows, const bool f16, mmh_et_shared * sh = nullptr) {
+    switch (wtype) {
+        case GGML_TYPE_F32:      mmh_launch<GGML_TYPE_F32, false>(ctx, p, wd, n, inline_rows); break;
+        case GGML_TYPE_F16:      mmh_launch_prec<GGML_TYPE_F16>     (ctx, p, wd, n, inline_rows, f16, sh); break;
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_M1:  mmh_launch_prec<GGML_TYPE_EXL3_M1> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_M2:  mmh_launch_prec<GGML_TYPE_EXL3_M2> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_M3:  mmh_launch_prec<GGML_TYPE_EXL3_M3> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+        case GGML_TYPE_EXL3_M4:  mmh_launch_prec<GGML_TYPE_EXL3_M4> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_M5:  mmh_launch_prec<GGML_TYPE_EXL3_M5> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+        case GGML_TYPE_EXL3_M6:  mmh_launch_prec<GGML_TYPE_EXL3_M6> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_M7:  mmh_launch_prec<GGML_TYPE_EXL3_M7> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_M8:  mmh_launch_prec<GGML_TYPE_EXL3_M8> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_M1H: mmh_launch_prec<GGML_TYPE_EXL3_M1H>(ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_M2H: mmh_launch_prec<GGML_TYPE_EXL3_M2H>(ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_M3H: mmh_launch_prec<GGML_TYPE_EXL3_M3H>(ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_G1:  mmh_launch_prec<GGML_TYPE_EXL3_G1> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_G2:  mmh_launch_prec<GGML_TYPE_EXL3_G2> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_G3:  mmh_launch_prec<GGML_TYPE_EXL3_G3> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_G4:  mmh_launch_prec<GGML_TYPE_EXL3_G4> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_G5:  mmh_launch_prec<GGML_TYPE_EXL3_G5> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_G6:  mmh_launch_prec<GGML_TYPE_EXL3_G6> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_G7:  mmh_launch_prec<GGML_TYPE_EXL3_G7> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_G8:  mmh_launch_prec<GGML_TYPE_EXL3_G8> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_T1:  mmh_launch_prec<GGML_TYPE_EXL3_T1> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_T2:  mmh_launch_prec<GGML_TYPE_EXL3_T2> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_T3:  mmh_launch_prec<GGML_TYPE_EXL3_T3> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_T4:  mmh_launch_prec<GGML_TYPE_EXL3_T4> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_T5:  mmh_launch_prec<GGML_TYPE_EXL3_T5> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_T6:  mmh_launch_prec<GGML_TYPE_EXL3_T6> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_T7:  mmh_launch_prec<GGML_TYPE_EXL3_T7> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+#if !defined(MMH_DEV_FAST)
+        case GGML_TYPE_EXL3_T8:  mmh_launch_prec<GGML_TYPE_EXL3_T8> (ctx, p, wd, n, inline_rows, f16, sh); break;
+#endif
+        default:
+            GGML_ABORT("unsupported MUL_MAT_HAD weight type %s", ggml_type_name(wtype));
+    }
+}
+
 static void mmh_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * glu_dst, const ggml_tensor * glu_other,
-        const int glu) {
+        const int glu, const ggml_tensor * row_mul = nullptr) {
     const ggml_tensor * w       = dst->src[0];
     const ggml_tensor * x       = dst->src[1];
     const ggml_tensor * ids     = dst->src[2];
@@ -2660,10 +3911,10 @@ static void mmh_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const gg
     p.ids_nb1  = ids ? ids->nb[1] : 0;
     p.x        = (const float *) x->data;
     p.rot_in   = mmh_data(rot_in);
-    p.rin_nb1  = rot_in->nb[1];
+    p.rin_nb1  = rot_in->ne[1] == 1 ? 0 : rot_in->nb[1];     // [K, 1]: shared by all matrices
     p.rot_out  = mmh_data(rot_out);
     p.rout_nb0 = rot_out->nb[0];
-    p.rout_nb1 = rot_out->nb[1];
+    p.rout_nb1 = rot_out->ne[1] == 1 ? 0 : rot_out->nb[1];
     p.dst      = (float *) dst->data;
     p.rin_f16  = rot_in->type == GGML_TYPE_F16;
     p.rout_f16 = rot_out->type == GGML_TYPE_F16;
@@ -2671,6 +3922,11 @@ static void mmh_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const gg
     p.hscale   = 1.0f/sqrtf((float) had);
     p.glu_other = glu_other ? (const float *) glu_other->data : nullptr;
     p.pos       = nullptr;
+    p.panel_rows = 0;
+    p.tok_rows   = 0;
+    p.trace      = nullptr;
+    p.cmap       = nullptr;
+    p.cls        = 0;
     p.glu       = glu;
     if (glu) {
         // the GLU output in place of dst: the same shape and strides
@@ -2678,13 +3934,44 @@ static void mmh_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const gg
         GGML_ASSERT(glu_other->nb[1] == dst->nb[1] && glu_other->nb[2] == dst->nb[2] && glu_other->nb[3] == dst->nb[3]);
         p.dst = (float *) glu_dst->data;
     }
+    p.row_w     = nullptr;
+    p.row_w_nb1 = 0;
+    p.row_w_nb2 = 0;
+    if (row_mul) {
+        // the MUL's output in place of dst (the same shape and strides), its weights [1, ne1, ne2]
+        const ggml_tensor * wts = row_mul->src[1];
+        GGML_ASSERT(row_mul->nb[1] == dst->nb[1] && row_mul->nb[2] == dst->nb[2] && row_mul->nb[3] == dst->nb[3]);
+        GGML_ASSERT(wts->type == GGML_TYPE_F32 && wts->ne[0] == 1 && wts->ne[1] == dst->ne[1] && wts->ne[2] == dst->ne[2]);
+        p.dst       = (float *) row_mul->data;
+        p.row_w     = (const float *) wts->data;
+        p.row_w_nb1 = wts->nb[1];
+        p.row_w_nb2 = wts->nb[2];
+    }
 
     if (p.n_rows == 0) {
         return;
     }
 
-    const char * wd = mmh_data(w);
     const int64_t n = w->ne[1];
+
+    // strixllama (dev): STRIX_MMH_SKIP=mask leaves out the decode-size (<= 16 tokens) products of these kinds - wrong
+    // outputs; the generation speed with and without them is what they cost in the real step (graphs on):
+    // 16 routed experts' gate/up, 32 their down, 2 shared expert, 4 output head, 8 the other dense weights
+    {
+        static const int skip = getenv("STRIX_MMH_SKIP") ? atoi(getenv("STRIX_MMH_SKIP")) : 0;
+        if (skip) {
+            const int64_t toks = ids ? dst->ne[2] : p.n_rows;
+            const int kind = ids ? (p.k > 1024 ? 16 : 32) : (n == 640 || p.k == 640) ? 2 : n > 100000 ? 4 : 8;
+            static const int skip_lo = getenv("STRIX_MMH_SKIP_LAYERS") ? atoi(getenv("STRIX_MMH_SKIP_LAYERS")) : 0;
+            static const int skip_hi = getenv("STRIX_MMH_SKIP_LAYERS") && strchr(getenv("STRIX_MMH_SKIP_LAYERS"), '-') ?
+                atoi(strchr(getenv("STRIX_MMH_SKIP_LAYERS"), '-') + 1) : 1 << 20;
+            int layer = -1;
+            sscanf(w->name, "blk.%d.", &layer);
+            if ((skip & kind) && toks <= 16 && (layer < 0 || (layer >= skip_lo && layer <= skip_hi))) {
+                return;
+            }
+        }
+    }
 
     // without a routing pass: few tokens (ids) or few rows per weight matrix; with WMMA a dense matrix of more than
     // one row goes to the GEMM, which stages the rows once per block, unless the GEMV is faster (mmh_dense_gemv)
@@ -2697,89 +3984,27 @@ static void mmh_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const gg
     // F32 weights run only the GEMV, which has no F16 mode
     const bool f16 = w->type != GGML_TYPE_F32 && mmh_input_f16(dst);
 
-    switch (w->type) {
-        case GGML_TYPE_F32:      mmh_launch<GGML_TYPE_F32, false>(ctx, p, wd, n, inline_rows); break;
-        case GGML_TYPE_F16:      mmh_launch_prec<GGML_TYPE_F16>     (ctx, p, wd, n, inline_rows, f16); break;
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_M1:  mmh_launch_prec<GGML_TYPE_EXL3_M1> (ctx, p, wd, n, inline_rows, f16); break;
-#endif
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_M2:  mmh_launch_prec<GGML_TYPE_EXL3_M2> (ctx, p, wd, n, inline_rows, f16); break;
-#endif
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_M3:  mmh_launch_prec<GGML_TYPE_EXL3_M3> (ctx, p, wd, n, inline_rows, f16); break;
-#endif
-        case GGML_TYPE_EXL3_M4:  mmh_launch_prec<GGML_TYPE_EXL3_M4> (ctx, p, wd, n, inline_rows, f16); break;
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_M5:  mmh_launch_prec<GGML_TYPE_EXL3_M5> (ctx, p, wd, n, inline_rows, f16); break;
-#endif
-        case GGML_TYPE_EXL3_M6:  mmh_launch_prec<GGML_TYPE_EXL3_M6> (ctx, p, wd, n, inline_rows, f16); break;
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_M7:  mmh_launch_prec<GGML_TYPE_EXL3_M7> (ctx, p, wd, n, inline_rows, f16); break;
-#endif
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_M8:  mmh_launch_prec<GGML_TYPE_EXL3_M8> (ctx, p, wd, n, inline_rows, f16); break;
-#endif
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_M1H: mmh_launch_prec<GGML_TYPE_EXL3_M1H>(ctx, p, wd, n, inline_rows, f16); break;
-#endif
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_M2H: mmh_launch_prec<GGML_TYPE_EXL3_M2H>(ctx, p, wd, n, inline_rows, f16); break;
-#endif
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_M3H: mmh_launch_prec<GGML_TYPE_EXL3_M3H>(ctx, p, wd, n, inline_rows, f16); break;
-#endif
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_G1:  mmh_launch_prec<GGML_TYPE_EXL3_G1> (ctx, p, wd, n, inline_rows, f16); break;
-#endif
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_G2:  mmh_launch_prec<GGML_TYPE_EXL3_G2> (ctx, p, wd, n, inline_rows, f16); break;
-#endif
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_G3:  mmh_launch_prec<GGML_TYPE_EXL3_G3> (ctx, p, wd, n, inline_rows, f16); break;
-#endif
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_G4:  mmh_launch_prec<GGML_TYPE_EXL3_G4> (ctx, p, wd, n, inline_rows, f16); break;
-#endif
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_G5:  mmh_launch_prec<GGML_TYPE_EXL3_G5> (ctx, p, wd, n, inline_rows, f16); break;
-#endif
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_G6:  mmh_launch_prec<GGML_TYPE_EXL3_G6> (ctx, p, wd, n, inline_rows, f16); break;
-#endif
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_G7:  mmh_launch_prec<GGML_TYPE_EXL3_G7> (ctx, p, wd, n, inline_rows, f16); break;
-#endif
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_G8:  mmh_launch_prec<GGML_TYPE_EXL3_G8> (ctx, p, wd, n, inline_rows, f16); break;
-#endif
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_T1:  mmh_launch_prec<GGML_TYPE_EXL3_T1> (ctx, p, wd, n, inline_rows, f16); break;
-#endif
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_T2:  mmh_launch_prec<GGML_TYPE_EXL3_T2> (ctx, p, wd, n, inline_rows, f16); break;
-#endif
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_T3:  mmh_launch_prec<GGML_TYPE_EXL3_T3> (ctx, p, wd, n, inline_rows, f16); break;
-#endif
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_T4:  mmh_launch_prec<GGML_TYPE_EXL3_T4> (ctx, p, wd, n, inline_rows, f16); break;
-#endif
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_T5:  mmh_launch_prec<GGML_TYPE_EXL3_T5> (ctx, p, wd, n, inline_rows, f16); break;
-#endif
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_T6:  mmh_launch_prec<GGML_TYPE_EXL3_T6> (ctx, p, wd, n, inline_rows, f16); break;
-#endif
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_T7:  mmh_launch_prec<GGML_TYPE_EXL3_T7> (ctx, p, wd, n, inline_rows, f16); break;
-#endif
-#if !defined(MMH_DEV_FAST)
-        case GGML_TYPE_EXL3_T8:  mmh_launch_prec<GGML_TYPE_EXL3_T8> (ctx, p, wd, n, inline_rows, f16); break;
-#endif
-        default:
-            GGML_ABORT("unsupported MUL_MAT_HAD weight type %s", ggml_type_name(w->type));
+    // strixllama: per-expert widths: one launch per class with its weight
+    const ggml_tensor * cmap = dst->src[5];
+    if (cmap) {
+        GGML_ASSERT(ids && cmap->type == GGML_TYPE_I32);
+        p.cmap  = (const int32_t *) cmap->data;
+        p.n_exp = cmap->ne[0];
+        mmh_et_shared sh(ctx.pool());
+        for (int c = 0; c < 3; ++c) {
+            const ggml_tensor * wc = c == 0 ? w : dst->src[5 + c];
+            if (wc == nullptr || wc->ne[2] == 0) {
+                continue;
+            }
+            mmh_params pc = p;
+            pc.cls  = c;
+            pc.nb01 = wc->nb[1];
+            pc.nb02 = wc->nb[2];
+            mmh_dispatch(ctx, wc->type, pc, mmh_data(wc), n, inline_rows, f16, &sh);
+        }
+        return;
     }
+    mmh_dispatch(ctx, w->type, p, mmh_data(w), n, inline_rows, f16);
 }
 
 void ggml_cuda_mul_mat_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -2789,4 +4014,8 @@ void ggml_cuda_mul_mat_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 void ggml_cuda_mul_mat_had_glu(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * other,
         const ggml_tensor * glu, const bool dst_is_gate) {
     mmh_run(ctx, dst, glu, other, dst_is_gate ? 1 : 2);
+}
+
+void ggml_cuda_mul_mat_had_rowmul(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * row_mul) {
+    mmh_run(ctx, dst, nullptr, nullptr, 0, row_mul);
 }

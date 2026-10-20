@@ -3647,22 +3647,24 @@ struct ggml_tensor * ggml_mul_mat_id(
 
 // ggml_mul_mat_had (strixllama: from ranma.cpp, MIT)
 
+// strixllama: [n, n_exp], or [n, 1]: one rotation shared by all weight matrices
 static bool ggml_mul_mat_had_rot(const struct ggml_tensor * rot, int64_t n, int64_t n_exp) {
     return (rot->type == GGML_TYPE_F32 || rot->type == GGML_TYPE_F16) && rot->nb[0] == ggml_type_size(rot->type) &&
-        rot->ne[0] == n && rot->ne[1] == n_exp && rot->ne[2] == 1 && rot->ne[3] == 1;
+        rot->ne[0] == n && (rot->ne[1] == n_exp || rot->ne[1] == 1) && rot->ne[2] == 1 && rot->ne[3] == 1;
 }
 
-struct ggml_tensor * ggml_mul_mat_had(
+// n_exp: the experts the rotations and ids index (a->ne[2], or the classes' total)
+static struct ggml_tensor * ggml_mul_mat_had_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
         struct ggml_tensor  * b,
         struct ggml_tensor  * rot_in,
         struct ggml_tensor  * rot_out,
         struct ggml_tensor  * ids,
-        int                   had) {
+        int                   had,
+        int64_t               n_exp) {
     const int64_t k     = a->ne[0];
     const int64_t n     = a->ne[1];
-    const int64_t n_exp = a->ne[2];
 
     GGML_ASSERT(had >= 2 && had <= 512 && (had & (had - 1)) == 0);
     GGML_ASSERT(k % had == 0 && n % had == 0);
@@ -3698,6 +3700,50 @@ struct ggml_tensor * ggml_mul_mat_had(
     result->src[3] = rot_in;
     result->src[4] = rot_out;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_mul_mat_had(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * rot_in,
+        struct ggml_tensor  * rot_out,
+        struct ggml_tensor  * ids,
+        int                   had) {
+    return ggml_mul_mat_had_impl(ctx, a, b, rot_in, rot_out, ids, had, a->ne[2]);
+}
+
+struct ggml_tensor * ggml_mul_mat_had_classes(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * rot_in,
+        struct ggml_tensor  * rot_out,
+        struct ggml_tensor  * ids,
+        int                   had,
+        struct ggml_tensor  * cmap,
+        struct ggml_tensor  * w1,
+        struct ggml_tensor  * w2) {
+    GGML_ASSERT(ids && cmap && w1 && "per-expert classes need ids, a class map and a second class");
+    GGML_ASSERT(cmap->type == GGML_TYPE_I32 && ggml_is_contiguous(cmap) && cmap->ne[1] == 1 && cmap->ne[2] == 1 && cmap->ne[3] == 1);
+    const int64_t n_exp = cmap->ne[0];
+    int64_t total = 0;
+    struct ggml_tensor * cls[3] = { a, w1, w2 };
+    for (int c = 0; c < 3; ++c) {
+        const struct ggml_tensor * w = cls[c];
+        if (w == NULL) {
+            continue;
+        }
+        GGML_ASSERT(ggml_is_exl3(w->type) && !w->view_src && w->ne[0] == a->ne[0] && w->ne[1] == a->ne[1] && w->ne[3] == 1);
+        GGML_ASSERT(w->nb[1] == ggml_row_size(w->type, w->ne[0]) && w->nb[2] == w->ne[1]*w->nb[1]);
+        total += w->ne[2];
+    }
+    GGML_ASSERT(total == n_exp && n_exp < (1 << 24));
+    struct ggml_tensor * result = ggml_mul_mat_had_impl(ctx, a, b, rot_in, rot_out, ids, had, n_exp);
+    result->src[5] = cmap;
+    result->src[6] = w1;
+    result->src[7] = w2;
     return result;
 }
 

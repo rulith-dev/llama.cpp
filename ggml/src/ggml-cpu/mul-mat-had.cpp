@@ -80,7 +80,7 @@ size_t ggml_cpu_mul_mat_had_wsize(const struct ggml_tensor * node, int n_tasks) 
     const int64_t had    = ggml_get_op_params_i32(node, 0);
     const int64_t k      = node->src[0]->ne[0];
     const int64_t n_rows = ggml_nrows(node);
-    const int64_t n_exp  = node->src[0]->ne[2];
+    const int64_t n_exp  = node->src[5] ? node->src[5]->ne[0] : node->src[0]->ne[2];   // strixllama: classes
     return GGML_PAD((n_exp + 1 + n_rows)*sizeof(int64_t), CACHE_LINE_SIZE) + GGML_PAD(n_rows*k*sizeof(float), CACHE_LINE_SIZE)
          + n_tasks*mmh_thread_size(had, k) + CACHE_LINE_SIZE;
 }
@@ -95,7 +95,10 @@ void ggml_compute_forward_mul_mat_had(const ggml_compute_params * params, ggml_t
     const int64_t had    = ggml_get_op_params_i32(dst, 0);
     const int64_t k      = w->ne[0];
     const int64_t n      = w->ne[1];
-    const int64_t n_exp  = w->ne[2];
+    // strixllama: per-expert widths (ggml_mul_mat_had_classes): expert e lives in class cmap[e] >> 24 at index
+    // cmap[e] & 0xFFFFFF; the rotations stay per global expert
+    const ggml_tensor * cmap = dst->src[5];
+    const int64_t n_exp  = cmap ? cmap->ne[0] : w->ne[2];
     const int64_t n_rows = ggml_nrows(dst);
     const int64_t n_blk  = n / had;
 
@@ -135,7 +138,7 @@ void ggml_compute_forward_mul_mat_had(const ggml_compute_params * params, ggml_t
     for (int64_t r = params->ith; r < n_rows; r += params->nth) {
         const int64_t e   = geo.expert(r);
         const float * src = geo.input(r);
-        const char  * rin = (const char *) rot_in->data + e*rot_in->nb[1];
+        const char  * rin = (const char *) rot_in->data + (rot_in->ne[1] == 1 ? 0 : e)*rot_in->nb[1];
         float * dsth = xh + r*k;
         for (int64_t i = 0; i < k; ++i) {
             dsth[i] = src[i] * mmh_load(rot_in, rin + i*rot_in->nb[0]);
@@ -159,9 +162,17 @@ void ggml_compute_forward_mul_mat_had(const ggml_compute_params * params, ggml_t
             continue;
         }
 
-        const char * wsrc = (const char *) w->data + e*w->nb[2] + blk*had*w->nb[1];
-        if (ggml_is_exl3(w->type)) {
-            ggml_exl3_decode_group(w->type, wsrc, k, wraw);
+        const ggml_tensor * wc = w;
+        int64_t le = e;
+        if (cmap) {
+            const int32_t m = ((const int32_t *) cmap->data)[e];
+            wc = (m >> 24) == 0 ? w : dst->src[5 + (m >> 24)];
+            le = m & 0xFFFFFF;
+            GGML_ASSERT(wc != nullptr && le < wc->ne[2]);
+        }
+        const char * wsrc = (const char *) wc->data + le*wc->nb[2] + blk*had*wc->nb[1];
+        if (ggml_is_exl3(wc->type)) {
+            ggml_exl3_decode_group(wc->type, wsrc, k, wraw);
             ggml_cpu_fp16_to_fp32(wraw, wblk, had*k);
         } else {
             for (int64_t j = 0; j < had; ++j) {
@@ -174,7 +185,7 @@ void ggml_compute_forward_mul_mat_had(const ggml_compute_params * params, ggml_t
             }
         }
 
-        const char * rout = (const char *) rot_out->data + e*rot_out->nb[1] + blk*had*rot_out->nb[0];
+        const char * rout = (const char *) rot_out->data + (rot_out->ne[1] == 1 ? 0 : e)*rot_out->nb[1] + blk*had*rot_out->nb[0];
         for (int64_t ri = offsets[e]; ri < offsets[e + 1]; ++ri) {
             const int64_t r = rows[ri];
             for (int64_t j = 0; j < had; ++j) {

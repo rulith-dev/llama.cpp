@@ -2779,6 +2779,30 @@ static void strix_tl_after(ggml_backend_cuda_context * ctx, const void * graph_k
 }
 
 bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    // strixllama (dev): STRIX_SKIP_NODES="a,b,..." leaves out the decode-size nodes (<= 16 rows) whose op name is one of the
+    // strings or whose first source's name contains one (of more than 3 characters) - wrong outputs; the generation speed with and without them is what they
+    // cost in the real step (graphs on). Fused paths that do not come through here are not affected.
+    {
+        static const std::vector<std::string> skip = [] {
+            std::vector<std::string> v;
+            const char * e = getenv("STRIX_SKIP_NODES");
+            for (std::string s = e ? e : ""; !s.empty(); ) {
+                const size_t c = s.find(',');
+                v.push_back(s.substr(0, c));
+                s = c == std::string::npos ? "" : s.substr(c + 1);
+            }
+            return v;
+        }();
+        if (!skip.empty() && ggml_nrows(dst) <= 16*16 && dst->ne[1] <= 16) {
+            const char * op = ggml_op_name(dst->op);
+            const char * s0 = dst->src[0] ? dst->src[0]->name : "";
+            for (const auto & k : skip) {
+                if (strcmp(op, k.c_str()) == 0 || (k.size() > 3 && strstr(s0, k.c_str()))) {
+                    return true;
+                }
+            }
+        }
+    }
     if (ggml_cuda_mmb_marks_count() > 0 && dst->op != GGML_OP_MUL_MAT && dst->op != GGML_OP_MUL_MAT_ID && dst->op != GGML_OP_VIEW &&
             dst->op != GGML_OP_RESHAPE && dst->op != GGML_OP_PERMUTE && dst->op != GGML_OP_TRANSPOSE && dst->op != GGML_OP_NONE) {
         for (int s = 0; s < GGML_MAX_SRC && dst->src[s]; ++s) {
@@ -5282,6 +5306,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // strixllama: {MUL_MAT_HAD with ids, MUL by the routing weights [1, n_used, T]} (the experts' down and its weighting):
+    // the product writes y*w in its epilogue - one dispatch and one pass over the f32 slots less per layer
+    if (node->op == GGML_OP_MUL_MAT_HAD && node->src[2] && i + 1 < cgraph->n_nodes) {
+        static const bool rw_env = !getenv("STRIX_MMH_ROWMUL") || atoi(getenv("STRIX_MMH_ROWMUL")) != 0;
+        ggml_tensor * mul = cgraph->nodes[i + 1];
+        if (rw_env && mul->op == GGML_OP_MUL && mul->src[0] == node && mul->src[1] && mul->type == GGML_TYPE_F32) {
+            const ggml_tensor * wts = mul->src[1];
+            if (wts->type == GGML_TYPE_F32 && wts->ne[0] == 1 && wts->ne[1] == node->ne[1] && wts->ne[2] == node->ne[2] &&
+                    wts->ne[3] == 1 && node->ne[3] == 1 && ggml_are_same_shape(mul, node) &&
+                    ggml_is_contiguous(node) && ggml_is_contiguous(mul) &&
+                    ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT_HAD, GGML_OP_MUL }, { i + 1 })) {
+                int out_nodes[] = { i + 1 };
+                if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
+                    ggml_cuda_mul_mat_had_rowmul(*cuda_ctx, node, mul);
+                    return 1;
+                }
+            }
+        }
+    }
+
     // strixllama: a decode strip's indexer score (ggml_cuda_match_idx_score_dec): skip the keys' GET_ROWS and its RESHAPE,
     // run the whole score at the MUL_MAT
     if (node->op == GGML_OP_MUL_MAT && g_idx_dec_pending.mm == i && g_idx_dec_pending.a.out) {
@@ -6611,7 +6655,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // STRIX_NODE_TIMING_LIST_T=t picks the graphs whose routed experts see t tokens instead (the first 3)
                 int64_t list_t = -1;
                 for (int k = 0; k < cgraph->n_nodes && list_t < 0; ++k) {
-                    if (cgraph->nodes[k]->op == GGML_OP_MUL_MAT_ID) {
+                    if (cgraph->nodes[k]->op == GGML_OP_MUL_MAT_ID ||
+                        (cgraph->nodes[k]->op == GGML_OP_MUL_MAT_HAD && cgraph->nodes[k]->src[2])) {   // EXL3 experts
                         list_t = cgraph->nodes[k]->ne[2];
                     }
                 }

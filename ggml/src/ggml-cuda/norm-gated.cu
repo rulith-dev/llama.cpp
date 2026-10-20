@@ -78,7 +78,8 @@ int ggml_cuda_norm_gated_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_n
     while (k + 1 < cgraph->n_nodes && k < i + 6) {
         const ggml_op op = cgraph->nodes[k]->op;
         if (op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE) { ++k; continue; }
-        if (op == GGML_OP_MUL_MAT && m.pre < 0) { m.pre = k; ++k; continue; }
+        // strixllama: the gate projection may be an EXL3 product (MUL_MAT_HAD); the call site computes it the generic way
+        if ((op == GGML_OP_MUL_MAT || op == GGML_OP_MUL_MAT_HAD) && m.pre < 0) { m.pre = k; ++k; continue; }
         break;
     }
     if (k + 1 >= cgraph->n_nodes) return 0;

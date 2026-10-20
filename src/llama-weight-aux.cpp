@@ -26,6 +26,16 @@ ggml_tensor * llama_weight_aux_mul_mat(
     ggml_tensor * rot_in  = aux.rot_in;
     ggml_tensor * rot_out = aux.rot_out;
 
+    if (aux.cmap) {                    // strixllama: per-expert widths
+        if (w->view_src || ids == nullptr) {
+            GGML_ABORT("EXL3 weight '%s' has expert classes: only whole expert products with ids", w->name);
+        }
+        if (cur->nb[0] != ggml_element_size(cur)) {
+            cur = ggml_cont(ctx, cur);
+        }
+        return ggml_mul_mat_had_classes(ctx, w, cur, rot_in, rot_out, ids, 128, aux.cmap, aux.wc[0], aux.wc[1]);
+    }
+
     if (w->view_src) {
         // whole 128-row groups of the weight, for one expert or a range of experts
         const size_t  offs = w->view_offs;
@@ -35,8 +45,11 @@ ggml_tensor * llama_weight_aux_mul_mat(
                 (offs % src->nb[2]) % (128*src->nb[1]) != 0 || r0 + w->ne[1] > src->ne[1] || e0 + w->ne[2] > src->ne[2]) {
             GGML_ABORT("view '%s' of EXL3 weight '%s' does not take whole 128-row groups", w->name, src->name);
         }
-        rot_in  = ggml_view_2d(ctx, rot_in,  rot_in->ne[0], w->ne[2], rot_in->nb[1],  e0*rot_in->nb[1]);
-        rot_out = ggml_view_2d(ctx, rot_out, w->ne[1],      w->ne[2], rot_out->nb[1], e0*rot_out->nb[1] + r0*rot_out->nb[0]);
+        // a shared rotation ([n, 1]) stays shared for any range of experts
+        rot_in  = rot_in->ne[1] == 1 ? rot_in :
+            ggml_view_2d(ctx, rot_in,  rot_in->ne[0], w->ne[2], rot_in->nb[1],  e0*rot_in->nb[1]);
+        rot_out = rot_out->ne[1] == 1 ? ggml_view_2d(ctx, rot_out, w->ne[1], 1, rot_out->nb[1], r0*rot_out->nb[0]) :
+            ggml_view_2d(ctx, rot_out, w->ne[1],      w->ne[2], rot_out->nb[1], e0*rot_out->nb[1] + r0*rot_out->nb[0]);
     }
 
     if (cur->nb[0] != ggml_element_size(cur)) {

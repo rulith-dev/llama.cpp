@@ -1567,6 +1567,22 @@ extern "C" {
             struct ggml_tensor  * ids,
             int                   had);
 
+    // strixllama: per-expert widths. The E experts of an EXL3 product with ids are split into up to 3 classes, each a
+    // stacked weight of its own EXL3 type: a = class 0, w1 / w2 = classes 1 / 2 (w2 may be NULL), all [K, N, E_c];
+    // cmap: I32 [E], expert e -> (class << 24) | index in its class; rot_in / rot_out per global expert ([K, E] /
+    // [N, E]) or shared ([K] / [N]). Sources 5, 6, 7 = cmap, w1, w2; the others as ggml_mul_mat_had.
+    GGML_API struct ggml_tensor * ggml_mul_mat_had_classes(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * rot_in,
+            struct ggml_tensor  * rot_out,
+            struct ggml_tensor  * ids,
+            int                   had,
+            struct ggml_tensor  * cmap,
+            struct ggml_tensor  * w1,
+            struct ggml_tensor  * w2);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

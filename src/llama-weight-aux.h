@@ -13,6 +13,10 @@
 struct llama_weight_aux {
     ggml_tensor * rot_in  = nullptr; // [ne0(, ne2)]
     ggml_tensor * rot_out = nullptr; // [ne1(, ne2)]
+    // strixllama: per-expert widths: the weight is class 0 of the experts, wc[0] / wc[1] classes 1 / 2 (<base>.c1/.c2
+    // .weight), cmap I32 [E] (<base>.cmap: class << 24 | index in the class); the rotations are then [.., E]
+    ggml_tensor * cmap  = nullptr;
+    ggml_tensor * wc[2] = { nullptr, nullptr };
 };
 
 // key: the weight tensor of the model
