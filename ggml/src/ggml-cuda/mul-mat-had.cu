@@ -3203,21 +3203,30 @@ static bool mmh_input_f16(const ggml_tensor * dst) {
 
 // with WMMA, whether a dense op of `tokens` tokens runs the GEMV instead of the GEMM: the GEMV decodes every weight
 // once for all its rows, but its cost per weight grows with the rows, while the GEMM tile costs about the same up to
-// 16 rows; with few 128-row groups the GEMM also has few blocks (measured crossovers)
+// 16 rows. strixllama 10-21: since the GEMV's rotation loads, address space and wave interleave work (10-18) it is the
+// faster one up to MMH_GEMV_TOKENS whatever the groups (EXL3 4.05 MTP verify of 4 tokens: qkv 172 -> 117 us, the step
+// 56.6 -> 51.3 ms, one conversation 49.7 -> 52.7 tok/s, two +4.8%, four and eight even; 90,000 ops of an agent run
+// within 0.15% of the GEMM); the old crossovers (2 tokens: <= 64 groups, 3: 48, 4: 32, more: 16 or 2M weights) were
+// measured before that
 static bool mmh_dense_gemv(const int64_t tokens, const int64_t groups, const int64_t weights) {
-    if (tokens <= 1) {
-        return true;
+    // strixllama (dev): STRIX_MMH_DENSE_GEMV=0 takes the crossovers before 10-21
+    static const bool old = getenv("STRIX_MMH_DENSE_GEMV") && atoi(getenv("STRIX_MMH_DENSE_GEMV")) == 0;
+    if (old) {
+        if (tokens <= 1) {
+            return true;
+        }
+        if (tokens <= 2) {
+            return groups <= 64;
+        }
+        if (tokens <= 3) {
+            return groups <= 48;
+        }
+        if (tokens <= 4) {
+            return groups <= 32;
+        }
+        return groups <= 16 || weights <= (1 << 21);
     }
-    if (tokens <= 2) {
-        return groups <= 64;
-    }
-    if (tokens <= 3) {
-        return groups <= 48;
-    }
-    if (tokens <= 4) {
-        return groups <= 32;
-    }
-    return groups <= 16 || weights <= (1 << 21);
+    return tokens <= MMH_GEMV_TOKENS;
 }
 
 // k-split tickets of the fused GEMV, one buffer per device and stream: all zero between ops, as the last block of each
