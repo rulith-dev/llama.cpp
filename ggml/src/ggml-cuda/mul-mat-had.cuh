@@ -15,3 +15,8 @@ void ggml_cuda_mul_mat_had_glu(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
 // strixllama: the product with ids followed by a MUL by the routing weights [1, n_used, T]: y*w written by the epilogue
 void ggml_cuda_mul_mat_had_rowmul(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * row_mul);
+
+// strixllama: an EXL3 gate z with a gated RMS norm out = rms_norm(x)*w*sigmoid(z) in the tiled GEMM's epilogue; false if
+// the op does not take that path (nothing launched)
+bool ggml_cuda_mul_mat_had_gnorm(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * x, const ggml_tensor * w,
+        float eps, ggml_tensor * out);

@@ -5373,6 +5373,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_cuda_mmb_gemm_gnorm(*cuda_ctx, cgraph->nodes[nm.pre], nm.x, nm.w, nm.eps, nm.dst)) {
                 return sk;
             }
+            // strixllama: an EXL3 gate in the tiled GEMM's epilogue (mul-mat-had.cu)
+            if (nm.pre >= 0 && cgraph->nodes[nm.pre]->op == GGML_OP_MUL_MAT_HAD && ggml_node_has_n_uses(cgraph, nm.pre, 1) &&
+                    (nm.z == cgraph->nodes[nm.pre] || nm.z->view_src == cgraph->nodes[nm.pre]) &&
+                    ggml_cuda_mul_mat_had_gnorm(*cuda_ctx, cgraph->nodes[nm.pre], nm.x, nm.w, nm.eps, nm.dst)) {
+                return sk;
+            }
             if (nm.pre >= 0) { if (!ggml_cuda_compute_forward(*cuda_ctx, cgraph->nodes[nm.pre])) { GGML_ABORT("norm-gated: gate MUL_MAT dispatch failed"); } }
             ggml_cuda_op_norm_gated(*cuda_ctx, nm); return sk;
         }

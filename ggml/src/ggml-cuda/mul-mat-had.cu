@@ -128,6 +128,16 @@ struct mmh_params {
     // n_exp stay global
     const int32_t * cmap;
     int cls;
+
+    // strixllama: gated RMS norm epilogue (ggml_cuda_mul_mat_had_gnorm, mmh_gemm_t2 only): this product is the gate z of
+    // dst = rms_norm(x)*w*sigmoid(z) over rows of MMH_NG values (column group g of row r: head g of token r), x row at
+    // gn_x + r*gn_tok + g*gn_head floats, the norm weight gn_w [MMH_NG]; z itself is not stored
+    const float * gn_x;
+    const float * gn_w;
+    int64_t gn_tok;
+    int64_t gn_head;
+    float gn_eps;
+    int gn_ncols;    // MMH_NG, at run time as rms_rows_f32 has it (a constant divisor would be folded differently)
 };
 
 static __device__ __forceinline__ int mmh_expert(const mmh_params & p, const int r) {
@@ -620,7 +630,10 @@ static __device__ __forceinline__ void mmh_rot4c(const char * base, const int f1
 // and each lane's four fp16 values in one 8-byte store (mmh_prologue_wave: four 2-byte stores per lane and 128-value
 // chunk; staging the per-expert rows of the converted checkpoints is store-bound). Same values, scales and layouts
 // (mmh_fwht_v4); needs 16-byte aligned rows and 8-byte aligned rotation rows (mmh_pwave4_ok).
-template <bool tiled>
+#ifndef MMH_PW_NC
+#define MMH_PW_NC 20   // one-pass prologue: rows of up to 128*MMH_PW_NC values (2560: every dense input of the model but 6144)
+#endif
+template <bool tiled, bool one = false>
 static __global__ void __launch_bounds__(256) mmh_prologue_wave4(const mmh_params p, half * __restrict__ xh,
         float * __restrict__ rscale) {
     const int lane = threadIdx.x % 32;
@@ -631,6 +644,55 @@ static __global__ void __launch_bounds__(256) mmh_prologue_wave4(const mmh_param
     const int e = mmh_expert(p, r);
     const float * src = mmh_src_row(p, r);
     const char  * rin = mmh_rot_row(p, p.rot_in, p.rin_nb1, e);
+
+    if constexpr (one) {
+        // the rotated row in registers: x*rot is formed once, for the maximum and for the values
+        float4 xr[MMH_PW_NC];
+        float amax = 0.0f;
+#pragma unroll
+        for (int i = 0; i < MMH_PW_NC; ++i) {
+            const int64_t c = 128*i + 4*lane;
+            if (128*i < p.k) {
+                const float4 x4 = *(const float4 *) (src + c);
+                float rv[4];
+                mmh_rot4c(rin, p.rin_f16, c, rv);
+                xr[i] = make_float4(x4.x*rv[0], x4.y*rv[1], x4.z*rv[2], x4.w*rv[3]);
+                amax = fmaxf(amax, fabsf(xr[i].x));
+                amax = fmaxf(amax, fabsf(xr[i].y));
+                amax = fmaxf(amax, fabsf(xr[i].z));
+                amax = fmaxf(amax, fabsf(xr[i].w));
+            }
+        }
+#pragma unroll
+        for (int h = 16; h > 0; h >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, h, 32));
+        }
+        float sc = 1.0f;
+        const float bound = amax*sqrtf((float) p.had);
+        if (bound > 0.0f && bound <= FLT_MAX) {
+            int ex;
+            frexpf(bound, &ex);
+            sc = ldexpf(1.0f, max(-100, min(100, 14 - ex)));
+        }
+        if (lane == 0) {
+            rscale[r] = 1.0f/sc;
+        }
+        const int q = p.pos ? p.pos[r] : r;
+#pragma unroll
+        for (int i = 0; i < MMH_PW_NC; ++i) {
+            const int64_t c = 128*i + 4*lane;
+            if (128*i < p.k) {
+                float v[4] = { xr[i].x*sc, xr[i].y*sc, xr[i].z*sc, xr[i].w*sc };
+                mmh_fwht_v4(v, lane, p.had, p.hscale);
+                const int64_t o = (p.pos || p.panel_rows) ? mmh_xh_panel(p, q, c) :
+                    tiled ? ((int64_t) (r/128)*(p.k/16) + c/16)*2048 + (r % 128)*16 + c % 16 : p.k*r + c;
+                const half2 h01 = __halves2half2(__float2half_rn(v[0]), __float2half_rn(v[1]));
+                const half2 h23 = __halves2half2(__float2half_rn(v[2]), __float2half_rn(v[3]));
+                *(uint2 *) (xh + o) = make_uint2(mmh_as_u32(h01), mmh_as_u32(h23));
+            }
+        }
+        return;
+    }
 
     float amax = 0.0f;
     for (int64_t c0 = 0; c0 < p.k; c0 += 128) {
@@ -671,6 +733,13 @@ static __global__ void __launch_bounds__(256) mmh_prologue_wave4(const mmh_param
         const half2 h23 = __halves2half2(__float2half_rn(v[2]), __float2half_rn(v[3]));
         *(uint2 *) (xh + o) = make_uint2(mmh_as_u32(h01), mmh_as_u32(h23));
     }
+}
+
+// strixllama: mmh_prologue_wave4's one-pass form: rows of up to 128*MMH_PW_NC values; STRIX_MMH_PWAVE1=0 keeps two
+// passes (bitwise A/B)
+static bool mmh_pwave1_ok(const mmh_params & p) {
+    static const bool env = !getenv("STRIX_MMH_PWAVE1") || atoi(getenv("STRIX_MMH_PWAVE1")) != 0;
+    return env && p.k <= 128*MMH_PW_NC;
 }
 
 // strixllama: mmh_prologue_wave4 applies: 16-byte aligned input rows and 8-byte (fp16) / 16-byte (f32) aligned
@@ -3075,6 +3144,19 @@ static __global__ void __launch_bounds__(256, 8) mmh_gemm_t2(const mmh_params p,
     // accumulator l of a tile holds row 2*l + lane/16, column lane % 16
 #pragma unroll
     for (int e0 = 0; e0 < BM; e0 += ec) {
+        // gated norm: the x rows of this wave's rows of the pass, ahead of the barrier
+        float xpf[ec/8][4];
+        if (p.gn_x) {
+#pragma unroll
+            for (int q = 0; q < ec/8; ++q) {
+                const int r = min(row0 + e0 + wave + 8*q, (int) p.n_rows - 1);
+                const float * xr = p.gn_x + (int64_t) r*p.gn_tok + (int64_t) g*p.gn_head;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    xpf[q][j] = xr[32*j + lane];
+                }
+            }
+        }
         __syncthreads();
 #pragma unroll
         for (int i = 0; i < MTW; ++i) {
@@ -3091,7 +3173,9 @@ static __global__ void __launch_bounds__(256, 8) mmh_gemm_t2(const mmh_params p,
             }
         }
         __syncthreads();
-        for (int i = e0 + wave; i < e0 + ec; i += 8) {
+#pragma unroll
+        for (int q = 0; q < ec/8; ++q) {
+            const int i = e0 + wave + 8*q;
             const int r = row0 + i;
             if (r >= p.n_rows) {
                 break;
@@ -3104,6 +3188,52 @@ static __global__ void __launch_bounds__(256, 8) mmh_gemm_t2(const mmh_params p,
             mmh_fwht(v, lane, p.had, p.hscale);
             float * out = mmh_dst_row(p, r) + (int64_t) g*MMH_NG;
             const float rs = rscale[r];
+            if (p.gn_x) {
+                // rms_rows_f32<true> on head g of token r: the same values in the same order (xor trees over the 32
+                // lanes of each 32 columns, then over the 8 partials of which 4 are zero), the square not contracted
+                float xv[4];
+                float part[8];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    xv[j] = xpf[q][j];
+                    float sq;
+                    asm volatile("v_mul_f32 %0, %1, %2" : "=v"(sq) : "v"(xv[j]), "v"(xv[j]));
+#pragma unroll
+                    for (int off = 16; off > 0; off >>= 1) {
+                        sq += __shfl_xor(sq, off);
+                    }
+                    part[j] = sq;
+                }
+#pragma unroll
+                for (int j = 4; j < 8; ++j) {
+                    float sq = 0.0f;
+#pragma unroll
+                    for (int off = 16; off > 0; off >>= 1) {
+                        sq += __shfl_xor(sq, off);
+                    }
+                    part[j] = sq;
+                }
+                float sel = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    sel = lane == j ? part[j] : sel;
+                }
+#pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    sel += __shfl_xor(sel, off);
+                }
+                const float mean  = sel / p.gn_ncols;
+                const float scale = rsqrtf(mean + p.gn_eps);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const int c = 32*j + lane;
+                    const float z = v[j]*rs*ro[j];
+                    const float t = scale * xv[j] * p.gn_w[c];
+                    const float sg = 1.0f / (1.0f + expf(-z));
+                    out[c] = t * sg;
+                }
+                continue;
+            }
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int c = 32*j + lane;
@@ -3507,7 +3637,11 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
             g_mmh_timing.mark(stream, 0);
             if (pwave_env) {
                 if (mmh_pwave4_ok(p)) {
-                    mmh_prologue_wave4<true><<<(unsigned) ((p.n_rows + 7)/8), 256, 0, stream>>>(p, xh.get(), rscale.get());
+                    if (mmh_pwave1_ok(p)) {
+                        mmh_prologue_wave4<true, true><<<(unsigned) ((p.n_rows + 7)/8), 256, 0, stream>>>(p, xh.get(), rscale.get());
+                    } else {
+                        mmh_prologue_wave4<true><<<(unsigned) ((p.n_rows + 7)/8), 256, 0, stream>>>(p, xh.get(), rscale.get());
+                    }
                 } else {
                     mmh_prologue_wave<true><<<(unsigned) ((p.n_rows + 7)/8), 256, 0, stream>>>(p, xh.get(), rscale.get());
                 }
@@ -3521,7 +3655,7 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
             g_mmh_timing.mark(stream, 2);
             // strixllama (dev): STRIX_MMH_GT2=1 runs the chunked tiled GEMM (A/B; bitwise)
             static const bool gt2_env = !getenv("STRIX_MMH_GT2") || atoi(getenv("STRIX_MMH_GT2")) != 0;   // default on
-            if (gt2_env) {
+            if (gt2_env || p.gn_x) {
                 mmh_gemm_t2<<<(unsigned) (n_rb*n_groups), 256, 0, stream>>>(p, wd.get(), xh.get(), rscale.get(), (int) n_rb, (int) n_groups);
             } else {
                 mmh_gemm_t<<<(unsigned) (n_rb*n_groups), 256, 0, stream>>>(p, wd.get(), xh.get(), rscale.get(), (int) n_rb, (int) n_groups);
@@ -3532,6 +3666,7 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
             return;
         }
     }
+    GGML_ASSERT(!p.gn_x && "the gated norm epilogue is only in mmh_gemm_t2");
 
     // strixllama: ops with ids route first and stage their rows in sorted panels for mmh_gemm_et
     if constexpr (mmh_is_exl3(type)) {
@@ -3605,7 +3740,11 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
                     xhs.alloc(((p.ne2 + 128)/16 + 1)*16*p.k);
                     rss.alloc(p.ne2);
                     if (mmh_pwave4_ok(pt)) {
-                        mmh_prologue_wave4<false><<<(unsigned) ((p.ne2 + 7)/8), 256, 0, stream>>>(pt, xhs.get(), rss.get());
+                        if (mmh_pwave1_ok(p)) {
+                            mmh_prologue_wave4<false, true><<<(unsigned) ((p.ne2 + 7)/8), 256, 0, stream>>>(pt, xhs.get(), rss.get());
+                        } else {
+                            mmh_prologue_wave4<false><<<(unsigned) ((p.ne2 + 7)/8), 256, 0, stream>>>(pt, xhs.get(), rss.get());
+                        }
                     } else {
                         mmh_prologue_wave<false><<<(unsigned) ((p.ne2 + 7)/8), 256, 0, stream>>>(pt, xhs.get(), rss.get());
                     }
@@ -3651,7 +3790,11 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
                 rss.alloc(p.n_rows);
                 if (pwave_env) {
                     if (mmh_pwave4_ok(pp)) {
-                        mmh_prologue_wave4<false><<<(unsigned) ((p.n_rows + 7)/8), 256, 0, stream>>>(pp, xhs.get(), rss.get());
+                        if (mmh_pwave1_ok(p)) {
+                            mmh_prologue_wave4<false, true><<<(unsigned) ((p.n_rows + 7)/8), 256, 0, stream>>>(pp, xhs.get(), rss.get());
+                        } else {
+                            mmh_prologue_wave4<false><<<(unsigned) ((p.n_rows + 7)/8), 256, 0, stream>>>(pp, xhs.get(), rss.get());
+                        }
                     } else {
                         mmh_prologue_wave<false><<<(unsigned) ((p.n_rows + 7)/8), 256, 0, stream>>>(pp, xhs.get(), rss.get());
                     }
@@ -3886,7 +4029,7 @@ static void mmh_dispatch(ggml_backend_cuda_context & ctx, const ggml_type wtype,
 }
 
 static void mmh_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * glu_dst, const ggml_tensor * glu_other,
-        const int glu, const ggml_tensor * row_mul = nullptr) {
+        const int glu, const ggml_tensor * row_mul = nullptr, const ggml_tensor * gn = nullptr) {
     const ggml_tensor * w       = dst->src[0];
     const ggml_tensor * x       = dst->src[1];
     const ggml_tensor * ids     = dst->src[2];
@@ -3936,6 +4079,20 @@ static void mmh_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const gg
     p.trace      = nullptr;
     p.cmap       = nullptr;
     p.cls        = 0;
+    p.gn_x       = nullptr;
+    p.gn_w       = nullptr;
+    p.gn_tok     = 0;
+    p.gn_head    = 0;
+    p.gn_eps     = 0.0f;
+    p.gn_ncols   = MMH_NG;
+    if (gn) {
+        p.gn_x    = (const float *) gn->src[0]->data;
+        p.gn_w    = (const float *) gn->src[1]->data;
+        p.gn_head = gn->src[0]->nb[1]/sizeof(float);
+        p.gn_tok  = gn->src[0]->nb[2]/sizeof(float);
+        memcpy(&p.gn_eps, gn->op_params, sizeof(float));
+        p.dst     = (float *) gn->data;
+    }
     p.glu       = glu;
     if (glu) {
         // the GLU output in place of dst: the same shape and strides
@@ -4027,4 +4184,37 @@ void ggml_cuda_mul_mat_had_glu(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
 void ggml_cuda_mul_mat_had_rowmul(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * row_mul) {
     mmh_run(ctx, dst, nullptr, nullptr, 0, row_mul);
+}
+
+// strixllama: the gate z = dst of a gated RMS norm out = rms_norm(x)*w*sigmoid(z) over rows of MMH_NG values, computed in
+// the tiled GEMM's epilogue (z not stored) - false, without a launch, when the op would not take mmh_gemm_t2
+bool ggml_cuda_mul_mat_had_gnorm(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * x, const ggml_tensor * w,
+        const float eps, ggml_tensor * out) {
+    static const bool env = !getenv("STRIX_MMH_GNORM") || atoi(getenv("STRIX_MMH_GNORM")) != 0;
+    const ggml_tensor * wt = dst->src[0];
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    static const bool tiled_env = !getenv("STRIX_MMH_TILED") || atoi(getenv("STRIX_MMH_TILED")) != 0;
+    static const bool nosplit_env = getenv("STRIX_MMH_T_NOSPLIT") && atoi(getenv("STRIX_MMH_T_NOSPLIT")) != 0;
+    if (!env || !tiled_env || !mmh_is_exl3(wt->type) || dst->src[2] || dst->src[5] || !GGML_CUDA_CC_IS_RDNA3(cc) ||
+            !mmh_input_f16(dst) || wt->ne[2] != 1) {
+        return false;
+    }
+    const int64_t n = wt->ne[1], k = wt->ne[0], n_rows = ggml_nrows(dst);
+    const bool split_below = (n/MMH_NG)*((n_rows + 127)/128) < 256 && k/32 >= 32;
+    if (n_rows < MMH_T_MIN_ROWS || n*k*(int64_t) sizeof(half) > MMH_T_MAX_WBYTES || k % 128 != 0 || (nosplit_env && split_below)) {
+        return false;
+    }
+    // x [MMH_NG, heads, tokens] (rows of a head contiguous), w [MMH_NG], out contiguous in z's layout [heads*MMH_NG, tokens]
+    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || out->type != GGML_TYPE_F32 || x->ne[0] != MMH_NG ||
+            x->nb[0] != sizeof(float) || x->ne[1]*MMH_NG != n || x->ne[2] != n_rows || x->ne[3] != 1 || ggml_nelements(w) != MMH_NG ||
+            !ggml_is_contiguous(w) || !ggml_is_contiguous(out) || ggml_nelements(out) != n*n_rows || !ggml_is_contiguous(dst) || eps < 0.0f) {
+        return false;
+    }
+    // the norm's operands in a tensor of its own: src[0] = x, src[1] = w, op_params = eps, data = out
+    ggml_tensor gn = *out;
+    gn.src[0] = const_cast<ggml_tensor *>(x);
+    gn.src[1] = const_cast<ggml_tensor *>(w);
+    memcpy(gn.op_params, &eps, sizeof(float));
+    mmh_run(ctx, dst, nullptr, nullptr, 0, nullptr, &gn);
+    return true;
 }
