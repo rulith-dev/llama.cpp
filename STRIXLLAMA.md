@@ -1,12 +1,12 @@
-# Strix Llama branch
+# Rulith branch
 
-This branch is `pwilkin/llama.cpp` at `f5daaa3` plus the Strix Llama patch set: 51 files (47 modified, 4 added) that make Qwen3.8-Flash-Next fast on one AMD Strix Halo machine (Ryzen AI Max+ 395, Radeon 8060S / gfx1151) on Windows, built with HIP against TheRock ROCm 10.1.
+This branch is upstream [llama.cpp](https://github.com/ggml-org/llama.cpp), merged in (most recently `19ab5a5` of 2026-10-22), plus the changes of [Rulith Inference](https://github.com/rulith-dev/rulith-inference): 159 files (119 modified, 40 added) that make Qwen3.8-Flash-Next fast on one AMD Strix Halo machine (Ryzen AI Max+ 395, Radeon 8060S / gfx1151) on Windows, built with HIP against TheRock ROCm 10.2. Up to 0.6.4 the base was `pwilkin/llama.cpp` at `f5daaa3`.
 
-Each release adds one commit, so the delta can be read either whole or a step at a time. The patches themselves, the build (`bootstrap/bootstrap.py`), a replay that rebuilds this exact tree from clean upstream and checks every file by hash, the manager, the desktop app, and the measurements live in the main repository:
+The recipe that rebuilds this tree from clean upstream (`bootstrap/bootstrap.py`, a script per area plus whole files, regenerated from the two commits by `tools/make_recipe.py` whenever upstream is merged), a replay that checks every file by hash, the manager, the desktop app, and the measurements live in the main repository:
 
-https://github.com/rulith-dev/strixllama
+https://github.com/rulith-dev/rulith-inference
 
-What the delta does, in one line each (details in that repository's `patches/MANIFEST.md`):
+What the delta does, in one line each (the reasons, change by change, in that repository's `patches/history/`):
 
 - sparse-attention (QSA) block-key cache (a rebuild scores with the keys as the cache stores them, as every later graph does), decode-time gather, compact metadata, an image guard for M-RoPE cells
 - mixed-sequence batches stay on the sparse path, so several conversations at depth share a step instead of falling back to dense attention over the whole pool
