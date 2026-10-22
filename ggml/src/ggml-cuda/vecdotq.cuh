@@ -360,10 +360,17 @@ static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
 
     return sum;
 }
+#if defined(GGML_USE_HIP)
 #define VDR_Q2_K_Q8_1_MMVQ 1
+#else
+#define VDR_Q2_K_Q8_1_MMVQ 2
+#endif
 #define VDR_Q2_K_Q8_1_MMQ  4
 
 // contiguous v/x values
+// strixllama: on HIP the VDR 1 form of 0.6.x (bitwise with it); upstream's VDR 2 form (#30517) for the other
+// backends, until it is measured on gfx1151
+#if defined(GGML_USE_HIP)
 static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmvq(
     const int & v, const int * __restrict__ u, const uint8_t * __restrict__ scales,
     const half2 & dm2, const float * __restrict__ d8) {
@@ -390,6 +397,37 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmvq(
 
     return dm2f.x*sumf_d - dm2f.y*sumf_m;
 }
+#else
+static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmvq(
+    const int * __restrict__ v, const int * __restrict__ u, const int * __restrict__ scales,
+    const half2 & dm2, const float * __restrict__ d8) {
+
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR2_K; ++i) {
+        const int sc = scales[i/2] >> (16*(i%2));
+
+        int sumi_d = 0;
+        int sumi_m = 0;
+#pragma unroll
+        for (int j = 0; j < VDR_Q2_K_Q8_1_MMVQ; ++j) {
+            const int vi = (v[j] >> (2*i)) & 0x03030303;
+
+            sumi_d = ggml_cuda_dp4a(vi,         u[VDR_Q2_K_Q8_1_MMVQ*i + j], sumi_d); // SIMD dot product
+            sumi_m = ggml_cuda_dp4a(0x01010101, u[VDR_Q2_K_Q8_1_MMVQ*i + j], sumi_m); // sum of q8_1 values
+        }
+
+        sumf_d += d8[i] * (sumi_d * (sc & 0xF));
+        sumf_m += d8[i] * (sumi_m * ((sc >> 4) & 0xF)); // multiply constant q2_K part with sum of q8_1 values
+    }
+
+    const float2 dm2f = __half22float2(dm2);
+
+    return dm2f.x*sumf_d - dm2f.y*sumf_m;
+}
+#endif // defined(GGML_USE_HIP)
 
 // contiguous v/x + u/y values
 template <int ns8>
@@ -443,10 +481,17 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmq(
     return sumf + d8*sumf_d8;
 }
 
+#if defined(GGML_USE_HIP)
 #define VDR_Q3_K_Q8_1_MMVQ 1
+#else
+#define VDR_Q3_K_Q8_1_MMVQ 2
+#endif
 #define VDR_Q3_K_Q8_1_MMQ  2
 
 // contiguous v/x values
+// strixllama: on HIP the VDR 1 form of 0.6.x (bitwise with it); upstream's VDR 2 form (#30517) for the other
+// backends, until it is measured on gfx1151
+#if defined(GGML_USE_HIP)
 static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
     const int & vl, const int & vh, const int * __restrict__ u, const uint8_t * __restrict__ scales,
     const int & scale_offset, const float & d3, const float * __restrict__ d8) {
@@ -478,6 +523,37 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
 
     return d3 * sumf;
 }
+#else
+static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
+    const int * __restrict__ vl, const int * __restrict__ vh, const int * __restrict__ u, const int * __restrict__ scales,
+    const float & d3, const float * __restrict__ d8) {
+
+    float sumf = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR3_K; ++i) {
+        // 4 low bits from scales[0..7], 2 high bits from scales[8..11]
+        const int sc_low  = (scales[i/2] >> (16*(i%2))) & 0x0F;
+        const int sc_high = (scales[2] >> (16*(i%2) + 2*(i/2))) & 0x03;
+        const int sc = (sc_low | (sc_high << 4)) - 32;
+
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < VDR_Q3_K_Q8_1_MMVQ; ++j) {
+            const int vil = (vl[j] >> (2*i)) & 0x03030303;
+            const int vih = ((vh[j] >> i) << 2) & 0x04040404;
+
+            // (vil | vih) - 4 for each byte, the - 4 is done by the second dp4a
+            sumi = ggml_cuda_dp4a(vil | vih,  u[VDR_Q3_K_Q8_1_MMVQ*i + j], sumi); // SIMD dot product
+            sumi = ggml_cuda_dp4a(0xFCFCFCFC, u[VDR_Q3_K_Q8_1_MMVQ*i + j], sumi);
+        }
+
+        sumf += d8[i] * (sumi * sc);
+    }
+
+    return d3 * sumf;
+}
+#endif // defined(GGML_USE_HIP)
 
 // contiguous v/x + u/y values
 static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmq(
@@ -620,10 +696,17 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
     return dm4f.x*sumf_d - dm4f.y*sumf_m;
 }
 
+#if defined(GGML_USE_HIP)
 #define VDR_Q6_K_Q8_1_MMVQ 1
+#else
+#define VDR_Q6_K_Q8_1_MMVQ 2
+#endif
 #define VDR_Q6_K_Q8_1_MMQ  8
 
 // contiguous v/x values
+// strixllama: on HIP the VDR 1 form of 0.6.x (bitwise with it); upstream's VDR 2 form (#30517) for the other
+// backends, until it is measured on gfx1151
+#if defined(GGML_USE_HIP)
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
     const int & vl, const int & vh, const int * __restrict__ u, const int8_t * __restrict__ scales,
     const float & d, const float * __restrict__ d8) {
@@ -645,6 +728,34 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
 
     return d*sumf;
 }
+#else
+static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
+    const int * __restrict__ vl, const int * __restrict__ vh, const int * __restrict__ u, const int8_t * __restrict__ scales,
+    const float & d, const float * __restrict__ d8) {
+
+    float sumf = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        const int sc = scales[4*i];
+
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < VDR_Q6_K_Q8_1_MMVQ; ++j) {
+            const int vil = (vl[j] >> (4*i)) & 0x0F0F0F0F;
+            const int vih = ((vh[j] >> (4*i)) << 4) & 0x30303030;
+
+            // (vil | vih) - 32 for each byte, the - 32 is done by the second dp4a
+            sumi = ggml_cuda_dp4a(vil | vih,  u[VDR_Q6_K_Q8_1_MMVQ*i + j], sumi); // SIMD dot product
+            sumi = ggml_cuda_dp4a(0xE0E0E0E0, u[VDR_Q6_K_Q8_1_MMVQ*i + j], sumi);
+        }
+
+        sumf += d8[i] * (sumi * sc);
+    }
+
+    return d*sumf;
+}
+#endif // defined(GGML_USE_HIP)
 
 // contiguous v/x + u/y values
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
@@ -700,6 +811,25 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
         const int u2 = get_int_b4(bq8_1_chunk->qs, j*4+2);
         const int u3 = get_int_b4(bq8_1_chunk->qs, j*4+3);
 
+#if defined(GGML_USE_HIP)
+        const uint32_t q_bits = (uint16_t) q;
+
+        // Expand each group of four Q1_0 bits into byte selectors for v_perm_b32.
+        const uint32_t q0_bits = q_bits >>  0;
+        const uint32_t q1_bits = q_bits >>  4;
+        const uint32_t q2_bits = q_bits >>  8;
+        const uint32_t q3_bits = q_bits >> 12;
+
+        const uint32_t q0_indices = (q0_bits & 0x01) | ((q0_bits & 0x02) << 7) | ((q0_bits & 0x04) << 14) | ((q0_bits & 0x08) << 21);
+        const uint32_t q1_indices = (q1_bits & 0x01) | ((q1_bits & 0x02) << 7) | ((q1_bits & 0x04) << 14) | ((q1_bits & 0x08) << 21);
+        const uint32_t q2_indices = (q2_bits & 0x01) | ((q2_bits & 0x02) << 7) | ((q2_bits & 0x04) << 14) | ((q2_bits & 0x08) << 21);
+        const uint32_t q3_indices = (q3_bits & 0x01) | ((q3_bits & 0x02) << 7) | ((q3_bits & 0x04) << 14) | ((q3_bits & 0x08) << 21);
+
+        const int v0 = __builtin_amdgcn_perm(0x000001FF, 0x000001FF, q0_indices);
+        const int v1 = __builtin_amdgcn_perm(0x000001FF, 0x000001FF, q1_indices);
+        const int v2 = __builtin_amdgcn_perm(0x000001FF, 0x000001FF, q2_indices);
+        const int v3 = __builtin_amdgcn_perm(0x000001FF, 0x000001FF, q3_indices);
+#else
         // unpack crumbs into nibble indices
         const int n0 = __byte_perm(0x11100100, 0x11100100, q >> 0); // [0, 1, 4, 5] [ 8,  9, 12, 13]
         const int n1 = __byte_perm(0x11100100, 0x11100100, q >> 2); // [2, 3, 6, 7] [10, 11, 14, 15]
@@ -713,6 +843,7 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
         const int v1 = __byte_perm(s0, s1, 0x7632);
         const int v2 = __byte_perm(s2, s3, 0x5410);
         const int v3 = __byte_perm(s2, s3, 0x7632);
+#endif // defined(GGML_USE_HIP)
 
         sumi = ggml_cuda_dp4a(v0, u0, sumi);
         sumi = ggml_cuda_dp4a(v1, u1, sumi);
@@ -865,6 +996,9 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
     return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, bq8_0->d, __low2half(bq8_1->ds));
 }
 
+// strixllama: on HIP the VDR 1 form of 0.6.x (bitwise with it); upstream's VDR 2 form (#30517) for the other
+// backends, until it is measured on gfx1151
+#if defined(GGML_USE_HIP)
 static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -887,7 +1021,47 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
 
     return vec_dot_q2_K_q8_1_impl_mmvq(v, u, scales, bq2_K->dm, d8);
 }
+#else
+static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
+    const block_q2_K * bq2_K = (const block_q2_K *) vbq + kbx;
+
+    // iqs is in 0,2..14, each 32 bytes of qs hold 4 q8_1 blocks (one per 2 bit shift)
+    const int bq8_offset = QR2_K * (iqs / QI8_1);
+    const int iqs8 = iqs % QI8_1;
+
+    int v[VDR_Q2_K_Q8_1_MMVQ];
+#pragma unroll
+    for (int j = 0; j < VDR_Q2_K_Q8_1_MMVQ; ++j) {
+        v[j] = get_int_b4(bq2_K->qs, iqs + j);
+    }
+
+    // scale of shift i is byte 2*i + (iqs8 >= QI8_1/2) of the 8 bytes for this half
+    const int sc_shift = 8 * (iqs8 / (QI8_1/2));
+    int scales[2];
+    scales[0] = get_int_b4(bq2_K->scales, 2*(iqs / QI8_1) + 0) >> sc_shift;
+    scales[1] = get_int_b4(bq2_K->scales, 2*(iqs / QI8_1) + 1) >> sc_shift;
+
+    int    u[VDR_Q2_K_Q8_1_MMVQ*QR2_K];
+    float d8[QR2_K];
+
+#pragma unroll
+    for (int i = 0; i < QR2_K; ++i) {
+#pragma unroll
+        for (int j = 0; j < VDR_Q2_K_Q8_1_MMVQ; ++j) {
+            u[VDR_Q2_K_Q8_1_MMVQ*i + j] = get_int_b4(bq8_1[bq8_offset + i].qs, iqs8 + j);
+        }
+        d8[i] = __low2float(bq8_1[bq8_offset + i].ds);
+    }
+
+    return vec_dot_q2_K_q8_1_impl_mmvq(v, u, scales, bq2_K->dm, d8);
+}
+#endif // defined(GGML_USE_HIP)
+
+// strixllama: on HIP the VDR 1 form of 0.6.x (bitwise with it); upstream's VDR 2 form (#30517) for the other
+// backends, until it is measured on gfx1151
+#if defined(GGML_USE_HIP)
 static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -914,6 +1088,50 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
 
     return vec_dot_q3_K_q8_1_impl_mmvq(vl, vh, u, bq3_K->scales, scale_offset, d, d8);
 }
+#else
+static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q3_K * bq3_K = (const block_q3_K *) vbq + kbx;
+
+    // iqs is in 0,2..14, each 32 bytes of qs hold 4 q8_1 blocks (one per 2 bit shift)
+    const int bq8_offset = QR3_K * (iqs / (QI3_K/2));
+    const int iqs8 = iqs % QI8_1;
+
+    const float d = bq3_K->d;
+
+    int vl[VDR_Q3_K_Q8_1_MMVQ];
+    int vh[VDR_Q3_K_Q8_1_MMVQ];
+#pragma unroll
+    for (int j = 0; j < VDR_Q3_K_Q8_1_MMVQ; ++j) {
+        vl[j] = get_int_b2(bq3_K->qs, iqs + j);
+        vh[j] = get_int_b2(bq3_K->hmask, iqs8 + j) >> bq8_offset;
+    }
+
+    // sub-block 8*(iqs/8) + 2*i + (iqs8 >= QI8_1/2) for shift i:
+    // 4 low bits in nibble iqs/8 of bytes, 2 high bits at bit 4*(iqs/8) + 2*(i/2) of bytes 8..11
+    const int sc_shift = 8 * (iqs8 / (QI8_1/2)) + 4 * (iqs / (QI3_K/2));
+    int scales[3];
+#pragma unroll
+    for (int l = 0; l < 3; ++l) {
+        scales[l] = get_int_b2(bq3_K->scales, l) >> sc_shift;
+    }
+
+    int    u[VDR_Q3_K_Q8_1_MMVQ*QR3_K];
+    float d8[QR3_K];
+
+#pragma unroll
+    for (int i = 0; i < QR3_K; ++i) {
+#pragma unroll
+        for (int j = 0; j < VDR_Q3_K_Q8_1_MMVQ; ++j) {
+            u[VDR_Q3_K_Q8_1_MMVQ*i + j] = get_int_b4(bq8_1[bq8_offset + i].qs, iqs8 + j);
+        }
+        d8[i] = __low2float(bq8_1[bq8_offset + i].ds);
+    }
+
+    return vec_dot_q3_K_q8_1_impl_mmvq(vl, vh, u, scales, d, d8);
+}
+#endif // defined(GGML_USE_HIP)
 
 static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
@@ -1016,6 +1234,9 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
 }
 
+// strixllama: on HIP the VDR 1 form of 0.6.x (bitwise with it); upstream's VDR 2 form (#30517) for the other
+// backends, until it is measured on gfx1151
+#if defined(GGML_USE_HIP)
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -1041,6 +1262,41 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
 
     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
 }
+#else
+static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q6_K * bq6_K = (const block_q6_K *) vbq + kbx;
+
+    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
+    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
+    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+
+    int vl[VDR_Q6_K_Q8_1_MMVQ];
+    int vh[VDR_Q6_K_Q8_1_MMVQ];
+#pragma unroll
+    for (int j = 0; j < VDR_Q6_K_Q8_1_MMVQ; ++j) {
+        vl[j] = get_int_b2(bq6_K->ql, iqs + j);
+        vh[j] = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4) + j) >> vh_shift;
+    }
+
+    const int8_t * scales = bq6_K->scales + scale_offset;
+
+    int    u[VDR_Q6_K_Q8_1_MMVQ*QR6_K];
+    float d8[QR6_K];
+
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+#pragma unroll
+        for (int j = 0; j < VDR_Q6_K_Q8_1_MMVQ; ++j) {
+            u[VDR_Q6_K_Q8_1_MMVQ*i + j] = get_int_b4(bq8_1[bq8_offset + 2*i].qs, iqs % QI8_1 + j);
+        }
+        d8[i] = __low2float(bq8_1[bq8_offset + 2*i].ds);
+    }
+
+    return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+}
+#endif // defined(GGML_USE_HIP)
 
 #define VDR_IQ2_XXS_Q8_1_MMVQ 2
 #define VDR_IQ2_XXS_Q8_1_MMQ  2

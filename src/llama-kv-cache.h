@@ -171,6 +171,7 @@ public:
     //
 
     uint32_t get_size()     const;
+    uint32_t get_n_seq_max() const;
     uint32_t get_n_stream() const;
 
     bool get_has_shift() const;
@@ -220,6 +221,8 @@ private:
     bool seq_row_cells(llama_seq_id seq_id, llama_pos p0, uint32_t n, bool own, std::vector<std::pair<uint32_t, uint32_t>> & runs) const;
 
 public:
+    // The stream holding seq_id's cells.
+    uint32_t get_stream(llama_seq_id seq_id) const;
 
     // state_read, plus the cells the restored tokens were placed in
     // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
@@ -252,6 +255,8 @@ public:
     bool   seq_alloc(llama_seq_id seq_id, const llama_token * tokens, uint32_t n, uint32_t n_pos, const slot_info * sinfo_in,
                      slot_info * sinfo_out);
     uint32_t n_pos_per_embd() const;
+    // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
+    void state_clear(llama_seq_id seq_id);
 
     //
     // graph_build API
@@ -351,8 +356,8 @@ private:
     const uint32_t n_swa = 0;
 
     // env: LLAMA_ATTN_ROT_DISABLE
-    bool attn_rot_k = false;
-    bool attn_rot_v = false;
+    uint32_t n_rot_k = 0;
+    uint32_t n_rot_v = 0;
 
     // if all layers participating in the cache have constant head size, the value is stored here
     // otherwise the value is -1
@@ -454,6 +459,8 @@ private:
     // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
+
+    void state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {

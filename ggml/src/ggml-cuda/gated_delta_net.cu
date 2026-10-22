@@ -1,4 +1,5 @@
 #include "gated_delta_net.cuh"
+#include "gated-delta-net-mma.cuh"
 #include "common.cuh"
 
 #if defined(GGML_USE_HIP) && (defined(RDNA3) || defined(RDNA4))
@@ -752,6 +753,44 @@ void ggml_cuda_gdn_qk_from(const ggml_tensor * gdn, const float * q, const float
     g_gdn_qk.push_back({gdn, gdn->data, q, k, s1, s2, s3});
 }
 
+static ggml_cuda_gdn_mma_args ggml_cuda_gdn_mma_args_from_tensor(const ggml_tensor * dst) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * g     = dst->src[3];
+    const ggml_tensor * beta  = dst->src[4];
+    const ggml_tensor * state = dst->src[5];
+
+    const int64_t S_v = v->ne[0];
+    const int64_t H   = v->ne[1];
+    return {
+        (const float *) q->data,
+        (const float *) k->data,
+        (const float *) v->data,
+        (const float *) g->data,
+        (const float *) beta->data,
+        (const float *) state->data,
+        (float *) dst->data,
+        nullptr,
+        H,
+        q->ne[1],
+        v->ne[2],
+        v->ne[3],
+        v->ne[3] / q->ne[3],
+        (int64_t) (q->nb[1] / sizeof(float)),
+        (int64_t) (q->nb[2] / sizeof(float)),
+        (int64_t) (q->nb[3] / sizeof(float)),
+        (int64_t) (v->nb[1] / sizeof(float)),
+        (int64_t) (v->nb[2] / sizeof(float)),
+        (int64_t) (v->nb[3] / sizeof(float)),
+        (int64_t) (beta->nb[1] / sizeof(float)),
+        (int64_t) (beta->nb[2] / sizeof(float)),
+        (int64_t) (beta->nb[3] / sizeof(float)),
+        1.0f / sqrtf((float) S_v),
+        g->ne[0] == 1 && ggml_get_op_params_i32(dst, 0) < v->ne[2] && S_v == 128 && q->ne[0] == 128,
+    };
+}
+
 static void ggml_cuda_op_gated_delta_net_impl(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache) {
     ggml_tensor * src_q     = dst->src[0];
@@ -809,6 +848,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
     int64_t sq1 = nbq1 / sizeof(float);
     int64_t sq2 = nbq2 / sizeof(float);
     int64_t sq3 = nbq3 / sizeof(float);
+    const bool qk_redirected = qk != nullptr;
     if (qk != nullptr) {   // ggml_cuda_gdn_qk_from: once
         q_d = qk->q; k_d = qk->k; sq1 = qk->s1; sq2 = qk->s2; sq3 = qk->s3;
         g_gdn_qk.erase(g_gdn_qk.begin() + (qk - g_gdn_qk.data()));
@@ -837,6 +877,21 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_slot_stride = cache->slot_stride;
     }
 
+    // strixllama: upstream's chunked MMA kernel takes q, k and the states from the tensors - not when they come from
+    // elsewhere (ggml_cuda_gdn_qk_from, the cache rows) - and on HIP only with STRIX_GDN_MMA=1 until it is measured
+    // against the r16 prefill kernel on gfx1151
+#ifdef GGML_USE_HIP
+    static const bool gdn_mma = getenv("STRIX_GDN_MMA") != nullptr && atoi(getenv("STRIX_GDN_MMA")) != 0;
+#else
+    static const bool gdn_mma = true;
+#endif
+    if (gdn_mma && !qk_redirected && state_rows == nullptr) {
+        ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
+        args.state_out = state_d;
+        if (ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {
+            return;
+        }
+    }
     if (kda) {
         if (keep_rs) {
             launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,

@@ -627,7 +627,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     graph(model, params, no_build_t{}) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN4EXP MTP requires n_layer_nextn > 0");
     GGML_ASSERT(hparams.n_layer_nextn == 1 && "QWEN4EXP MTP currently only supports a single MTP block");
-    GGML_ASSERT(ubatch.token && "QWEN4EXP MTP requires token input");
+    // a prompt's image rows come as embeddings (upstream's draft-mtp adds them with their rows since #30397)
 
     const int64_t hc     = hparams.dsv4_hc_mult;
     const int64_t hc_dim = hc * n_embd;
@@ -644,12 +644,13 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
-    auto inp = std::make_unique<llm_graph_input_embd_h>(hc_dim);
+    // the h rows come as the batch's state rows (llama_batch_ext's embd_state), the image rows as its embeddings
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_inp(), hc_dim);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);
 
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, n_tokens);
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
     ggml_set_input(inp->embd);
 
     inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, n_tokens);
@@ -660,7 +661,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     if (tok_embd_w == nullptr) {
         tok_embd_w = qwen4exp_shared_model(cparams, model, "token_embd.weight").tok_embd;
     }
-    ggml_tensor * tok_embd   = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+    ggml_tensor * tok_embd   = ubatch.token ? ggml_get_rows(ctx0, tok_embd_w, inp->tokens) : inp->embd;
     cb(tok_embd, "mtp_tok_embd", il);
 
     ggml_tensor * h_state = ggml_reshape_3d(ctx0, inp->h, n_embd, hc, n_tokens);
@@ -994,7 +995,8 @@ static bool qwen4exp_use_block_selection(bool blk_bias, int64_t n_stream, int64_
 // the mrope sections make every ubatch "2-D" (n_pos > 1); text has all rows equal, images do not
 static bool qwen4exp_pos_scalar(const llama_ubatch & ubatch) {
     if (!ubatch.pos || ubatch.n_tokens == 0) { return false; }
-    for (uint32_t axis = 1; axis < ubatch.n_pos; ++axis) {
+    // a text token comes as [p, p, p, 0] since llama_batch_ext (the fourth section is unused here): three decide
+    for (uint32_t axis = 1; axis < std::min<uint32_t>(ubatch.n_pos, 3); ++axis) {
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             if (ubatch.pos[i + axis*ubatch.n_tokens] != ubatch.pos[i]) { return false; }
         }

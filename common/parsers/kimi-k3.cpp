@@ -64,10 +64,10 @@ common_chat_params common_chat_params_init_kimi_k3(const common_chat_template & 
             data.generation_prompt += THINK_END + RESP_START + msg.render_content();
         }
 
-        data.prompt += data.generation_prompt;
+        data.prompt.append(data.generation_prompt);
     }
 
-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+    data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto end = p.end();
 
         auto start = p.optional(p.literal(MSG_START));
@@ -96,10 +96,10 @@ common_chat_params common_chat_params_init_kimi_k3(const common_chat_template & 
         }
 
         auto tool_choices = p.choice();
-        foreach_function(inputs.tools, [&](const json & tool) {
+        foreach_function(inputs.tools, [&](size_t tool_index, const json & tool) {
             const auto & function = tool.at("function");
             std::string  name     = function.at("name");
-            const json   schema   = common_tool_parameters_flatten(function.contains("parameters") ? function.at("parameters") : json::object());
+            const json   schema   = common_tool_parameters_flatten(common_chat_tool_parameters(function));
 
             // arguments come one tag per key, with the JSON type in a type="..."
             // attribute. the type is taken from the tool schema instead, as it tells
@@ -107,6 +107,7 @@ common_chat_params common_chat_params_init_kimi_k3(const common_chat_template & 
             auto args = p.eps();
             if (schema.contains("properties") && !schema.at("properties").empty()) {
                 auto arg_choices = p.choice();
+                size_t param_index = 0;
                 for (const auto & prop : schema.at("properties").items()) {
                     const std::string & key = prop.key();
 
@@ -120,7 +121,7 @@ common_chat_params common_chat_params_init_kimi_k3(const common_chat_template & 
                                                     p.tool_arg_value(p.until(ARG_END));
 
                     // skip the trailing type="..." attribute: anything up to <|sep|>
-                    arg_choices |= p.rule("kimi-k3-arg-" + name + "-" + key,
+                    arg_choices |= p.rule("kimi-k3-arg-" + std::to_string(tool_index) + "-" + std::to_string(param_index++),
                                           p.tool_arg(p.tool_arg_open(p.literal(ARG_START)) +
                                                      p.tool_arg_name(p.literal(key)) + p.literal("\"") +
                                                      p.until(SEP) + p.literal(SEP) + value +
@@ -134,7 +135,7 @@ common_chat_params common_chat_params_init_kimi_k3(const common_chat_template & 
                                            p.until(SEP) + p.literal(SEP)) +
                                p.tool_args(args) + p.tool_close(p.literal(CALL_END)));
 
-            tool_choices |= p.rule("kimi-k3-tool-" + name, call);
+            tool_choices |= p.rule("kimi-k3-tool-" + std::to_string(tool_index), call);
         });
 
         // all calls go inside one tools section, then the message is closed. the
@@ -151,19 +152,10 @@ common_chat_params common_chat_params_init_kimi_k3(const common_chat_template & 
         return start + reasoning + response + tools + trailer + end;
     });
 
-    data.parser = parser.save();
-
     if (include_grammar) {
         data.grammar_lazy = inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED;
         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
-            foreach_function(inputs.tools, [&](const json & tool) {
-                const auto & function = tool.at("function");
-                if (function.contains("parameters")) {
-                    auto schema = function.at("parameters");
-                    builder.resolve_refs(schema);
-                }
-            });
-            parser.build_grammar(builder, data.grammar_lazy);
+            data.parser.build_grammar(builder, data.grammar_lazy);
         });
 
         data.grammar_triggers = {

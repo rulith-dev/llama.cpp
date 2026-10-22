@@ -131,7 +131,8 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         }
         return name;
     };
-    // a tool output as chat content: a string as it is, input_text parts as text parts, anything else described
+    // a tool output as chat content: a string as it is, input_text parts as text parts, input_image parts with an
+    // image_url as image_url parts, anything else described
     auto tool_output_content = [](const json & output) -> json {
         if (output.is_string()) {
             return output;
@@ -142,9 +143,19 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         json parts = json::array();
         for (const auto & part : output) {
             const std::string type = json_value(part, "type", std::string());
+            // image_url is a string in /v1/responses, an object with a url in chat completions
+            json image_url;
+            if (type == "input_image" && part.contains("image_url")) {
+                image_url = part.at("image_url");
+                if (image_url.is_string()) {
+                    image_url = json { {"url", image_url} };
+                }
+            }
             if ((type == "input_text" || type == "output_text" || type == "text") && part.contains("text") &&
                     part.at("text").is_string()) {
                 parts.push_back(json { {"text", part.at("text")}, {"type", "text"} });
+            } else if (image_url.is_object() && image_url.contains("url") && image_url.at("url").is_string()) {
+                parts.push_back(json { {"image_url", image_url}, {"type", "image_url"} });
             } else if (type == "input_image" || type == "input_file") {
                 SRV_WRN("a %s part of a tool output is not supported; the model is told it was left out\n", type.c_str());
                 parts.push_back(json { {"text", "[" + type + " left out]"}, {"type", "text"} });
@@ -352,7 +363,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 item.at("type") == "function_call_output"
             ) {
                 // #responses_create-input-input_item_list-item-function_tool_call_output
-                // strixllama: text parts as text, other parts described instead of failing the request
+                // strixllama: text parts as text, images as images, other parts described instead of failing the request
                 chatcmpl_messages.push_back(json {
                     {"content",      tool_output_content(item.at("output"))},
                     {"role",         "tool"},
@@ -734,7 +745,7 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
     }
 
     // Pass through common params
-    for (const auto & key : {"temperature", "top_p", "top_k", "stream", "chat_template_kwargs"}) {
+    for (const auto & key : {"temperature", "top_p", "top_k", "stream", "chat_template_kwargs", "id_slot"}) {
         if (body.contains(key)) {
             oai_body[key] = body.at(key);
         }
@@ -759,6 +770,13 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
         std::string user_id = json_value(metadata, "user_id", std::string());
         if (!user_id.empty()) {
             oai_body["__metadata_user_id"] = user_id;
+        }
+    }
+
+    // llama.cpp params (e.g. seed, min_p) go under extra_params and are merged into the converted body
+    if (body.contains("extra_params") && body.at("extra_params").is_object()) {
+        for (const auto & [key, value] : body.at("extra_params").items()) {
+            oai_body[key] = value;
         }
     }
 

@@ -44,10 +44,10 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
             data.generation_prompt += "\n</think>\n\n" + msg.render_content();
         }
 
-        data.prompt += data.generation_prompt;
+        data.prompt.append(data.generation_prompt);
     }
 
-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+    data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto generation_prompt = p.literal("<|im_start|>assistant\n");
 
         auto reasoning = p.eps();
@@ -69,35 +69,30 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
             });
 
             auto tool_choice = p.choice();
-            foreach_function(inputs.tools, [&](const json & tool) {
+            foreach_function(inputs.tools, [&](size_t tool_index, const json & tool) {
                 const auto &      function = tool.at("function");
                 const std::string name     = function.at("name");
-                auto              params   = common_tool_parameters_flatten(function.contains("parameters") ? function.at("parameters") : json::object());
+
+                std::vector<common_peg_parser> arg_rules;
+                foreach_parameter(function, [&](size_t param_index, const common_chat_schema_property & prop, const common_chat_schema_document_ptr & doc) {
+                    auto value_parser = p.eps();
+                    if (prop.schema->may_be_string()) {
+                        value_parser = string_value;
+                    } else {
+                        value_parser = p.tool_arg_json_value(
+                                p.schema(p.json(), "tool-" + std::to_string(tool_index) + "-arg-" + std::to_string(param_index) + "-schema", doc, *prop.schema)
+                            ) + p.tool_arg_close(p.literal("</param>"));
+                    }
+
+                    arg_rules.push_back(p.tool_arg(
+                        p.tool_arg_open(p.literal("<param name=\"") + p.tool_arg_name(p.literal(prop.name)) + p.literal("\">")) +
+                        value_parser
+                    ));
+                });
 
                 auto args = p.eps();
-                if (params.contains("properties") && params.at("properties").is_object() && !params.at("properties").empty()) {
-                    auto schema_info = common_schema_info();
-                    schema_info.resolve_refs(params);
-
-                    auto arg_choice = p.choice();
-                    for (const auto & [prop_name, prop_schema] : params.at("properties").items()) {
-                        auto value_parser = p.eps();
-                        if (schema_info.resolves_to_string(prop_schema)) {
-                            value_parser = string_value;
-                        } else {
-                            value_parser = p.tool_arg_json_value(
-                                    p.schema(p.json(), "tool-" + name + "-arg-" + prop_name + "-schema", prop_schema, false)
-                                ) + p.tool_arg_close(p.literal("</param>"));
-                        }
-
-                        auto arg_rule = p.tool_arg(
-                            p.tool_arg_open(p.literal("<param name=\"") + p.tool_arg_name(p.literal(prop_name)) + p.literal("\">")) +
-                            value_parser
-                        );
-
-                        arg_choice |= arg_rule;
-                    }
-                    args = p.zero_or_more(arg_choice + p.space());
+                if (!arg_rules.empty()) {
+                    args = p.zero_or_more(p.choice(arg_rules) + p.space());
                 }
 
                 auto tool_parser = p.tool(
@@ -105,7 +100,7 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
                     << p.tool_args(args)
                     << p.tool_close(p.literal("</function>")));
 
-                tool_choice |= p.rule("tool-" + name, tool_parser);
+                tool_choice |= p.rule("tool-" + std::to_string(tool_index), tool_parser);
             });
 
             auto max_calls  = inputs.parallel_tool_calls ? -1 : 1;
@@ -119,21 +114,10 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
         return generation_prompt + reasoning + p.content(p.rest()) + p.end();
     });
 
-    data.parser = parser.save();
-
     if (include_grammar) {
         data.grammar_lazy = !(has_response_format || (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
-            foreach_function(inputs.tools, [&](const json & tool) {
-                const auto & function = tool.at("function");
-                auto         schema   = function.contains("parameters") ? function.at("parameters") : json::object();
-                builder.resolve_refs(schema);
-            });
-            if (has_response_format) {
-                auto schema = inputs.json_schema;
-                builder.resolve_refs(schema);
-            }
-            parser.build_grammar(builder, data.grammar_lazy);
+            data.parser.build_grammar(builder, data.grammar_lazy);
         });
 
         data.grammar_triggers = {

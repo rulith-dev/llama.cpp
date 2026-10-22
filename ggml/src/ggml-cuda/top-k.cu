@@ -4,15 +4,50 @@
 #if defined(GGML_USE_HIP)
 #include <hip/hip_version.h>
 #endif
+// Adjusted implementation thresholds from #28547, can be overridden at build time
+#ifndef GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC
+#    if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+// not measured on HIP/MUSA, keep the old split
+#        define GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC 1024
+#    else
+#        define GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC 512
+#    endif
+#endif // GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC
+
+#ifndef GGML_CUDA_TOP_K_NCOLS_THRESHOLD_ARGSORT
+#    define GGML_CUDA_TOP_K_NCOLS_THRESHOLD_ARGSORT 4096
+#endif // GGML_CUDA_TOP_K_NCOLS_THRESHOLD_ARGSORT
+
+// bitonic up to this width while nrows fits in one wave of SMs, 0 disables
+#ifndef GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC_FEW_ROWS
+#    if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#        define GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC_FEW_ROWS 0
+#    else
+#        define GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC_FEW_ROWS 1024
+#    endif
+#endif // GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC_FEW_ROWS
 
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
-#    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2)
+// DeviceTopK has a race condition before CCCL 3.4.3.
+// https://github.com/NVIDIA/cccl/pull/10627
+#    if (CCCL_MAJOR_VERSION > 3 || \
+         (CCCL_MAJOR_VERSION == 3 && CCCL_MINOR_VERSION > 4) || \
+         (CCCL_MAJOR_VERSION == 3 && CCCL_MINOR_VERSION == 4 && CCCL_PATCH_VERSION >= 3))
 #        define CUB_TOP_K_AVAILABLE
 #        include <cuda/iterator>
 using namespace cub;
-#    endif  // CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2
+#    endif  // CCCL >= 3.4.3
 #endif      // GGML_CUDA_USE_CUB
+
+// max rows for the per-row DeviceTopK / CUB argsort path before switching to radix / bitonic
+#ifndef GGML_CUDA_TOP_K_NROWS_THRESHOLD
+#    ifdef CUB_TOP_K_AVAILABLE
+#        define GGML_CUDA_TOP_K_NROWS_THRESHOLD 2
+#    else
+#        define GGML_CUDA_TOP_K_NROWS_THRESHOLD 1
+#    endif
+#endif // GGML_CUDA_TOP_K_NROWS_THRESHOLD
 
 #ifdef CUB_TOP_K_AVAILABLE
 
@@ -40,7 +75,7 @@ static void top_k_cub(ggml_cuda_pool & pool,
                          ncols, k, env));
 }
 
-#elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
+#endif                            // CUB_TOP_K_AVAILABLE
 
 static int next_power_of_2(int x) {
     int n = 1;
@@ -49,8 +84,6 @@ static int next_power_of_2(int x) {
     }
     return n;
 }
-
-#endif                            // CUB_TOP_K_AVAILABLE
 
 #if defined(GGML_USE_HIP)
 
@@ -903,7 +936,7 @@ static __global__ void top_k_parallel_radix_gather(
     int * row_dst = dst + (size_t) row * k;
     top_k_parallel_radix_state * state = &states[row];
 
-    for (int col = row_block * BLOCK_SIZE + tid;
+    for (int64_t col = row_block * BLOCK_SIZE + tid;
          col < ncols;
          col += blocks_per_row * BLOCK_SIZE) {
         const uint32_t key = top_k_float_to_ordered(row_src[col]);
@@ -925,11 +958,14 @@ static __global__ void top_k_parallel_radix_gather_equal(
 
 static void top_k_parallel_radix_cuda(
         ggml_cuda_pool & pool,
-        const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
+        const float * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream) {
     constexpr int BLOCK_SIZE = 256;
     constexpr int RADIX_BITS = 8;
     constexpr int NBINS = 1 << RADIX_BITS;
-    const int blocks_per_row = std::min((ncols + 1023) / 1024, 64);
+    const int blocks_per_row = (int) std::min<int64_t>(((int64_t) ncols + 1023) / 1024, 64);
+
+    // chunk the rows to bound the histogram memory to 64 MB
+    const int64_t chunk_nrows = ggml_cuda_chunk_nrows((size_t) blocks_per_row * NBINS * sizeof(int), nrows);
 
     ggml_cuda_pool_alloc<top_k_parallel_radix_state> states_alloc(pool, nrows);
     ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * blocks_per_row * NBINS);
