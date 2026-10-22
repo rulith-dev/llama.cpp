@@ -1531,6 +1531,28 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
 };
 
+#if defined(GGML_USE_HIP)
+// strixllama: an F32 product of one column without rocBLAS, which faults in host code on those (see
+// ggml_cuda_mul_mat_cublas): a warp a row, rows of any length, src0 broadcast over dims 2 and 3 as the GEMMs do
+static __global__ void ggml_cuda_mul_mat_f32_one_col(const float * x, const float * y, float * dst, const int64_t ne00,
+        const int64_t s01, const int64_t s02, const int64_t s03, const int64_t s12, const int64_t s13,
+        const int64_t r2, const int64_t r3, const int64_t sd2, const int64_t sd3) {
+    const int64_t row = blockIdx.x;
+    const int64_t i12 = blockIdx.y;
+    const int64_t i13 = blockIdx.z;
+    const float * xr = x + (i13/r3)*s03 + (i12/r2)*s02 + row*s01;
+    const float * yc = y + i13*s13 + i12*s12;
+    float sum = 0.0f;
+    for (int64_t k = threadIdx.x; k < ne00; k += WARP_SIZE) {
+        sum += xr[k]*yc[k];
+    }
+    sum = warp_reduce_sum(sum);
+    if (threadIdx.x == 0) {
+        dst[i13*sd3 + i12*sd2 + row] = sum;
+    }
+}
+#endif // defined(GGML_USE_HIP)
+
 template<ggml_type compute_type>
 static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     using traits = batched_mul_mat_traits<compute_type>;
@@ -1663,6 +1685,18 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const int64_t r2 = ne12/ne02;
     const int64_t r3 = ne13/ne03;
 
+#if defined(GGML_USE_HIP)
+    if constexpr (compute_type == GGML_TYPE_F32) {
+        if (ne11 == 1) {
+            const dim3 grid(ne01, ne12, ne13);
+            ggml_cuda_mul_mat_f32_one_col<<<grid, WARP_SIZE, 0, main_stream>>>((const float *) src0_ptr, (const float *) src1_ptr,
+                (float *) dst_ptr, ne10, s01, s02, s03, s12, s13, r2, r3, nbd2/sizeof(float), nbd3/sizeof(float));
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
+#endif // defined(GGML_USE_HIP)
+
     // Theoretically cublasGemmStridedBatchedEx would always work, even for a single matrix.
     // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
     //     probably because the internal kernel selection logic is suboptimal.
@@ -1784,6 +1818,38 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
             GGML_LOG_WARN("%s: unknown value for GGML_CUDA_CUBLAS_COMPUTE_TYPE: %s", __func__, env_cpp.c_str());
         }
     }
+
+#if defined(GGML_USE_HIP)
+    // strixllama: rocBLAS (TheRock 10.2 nightly, Windows) faults in host code on an F32 GEMM of one column - sgemm and
+    // GemmEx and the batched forms alike (test-backend-ops MUL_MAT f32 x bf16, n = 1, as ggml_conv_1d_dw emits it). One
+    // column of an F32 / F16 / BF16 weight takes the vector kernel instead, a non-F32 column widened to F32 first; what
+    // the vector kernel does not take (an odd row length) goes through ggml_cuda_mul_mat_f32_one_col in the F32 impl
+    if (src1->ne[1] == 1 && compute_type == GGML_TYPE_BF16) {
+        compute_type = GGML_TYPE_F32;
+    }
+    if (compute_type == GGML_TYPE_F32 && src1->ne[1] == 1 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) &&
+            (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
+            ggml_cuda_should_use_mmvf(src0->type, cc, ggml_cuda_info().devices[ctx.device].warp_size, src0->ne, src0->nb, 1)) {
+        if (src1->type == GGML_TYPE_F32) {
+            ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+            return;
+        }
+        const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(src1->type);
+        if (to_fp32 != nullptr) {
+            ggml_cuda_pool_alloc<float> src1_f32(ctx.pool(), ggml_nelements(src1));
+            to_fp32(src1->data, src1_f32.get(), ggml_nelements(src1), ctx.stream());
+            ggml_tensor src1_col = *src1;
+            src1_col.type  = GGML_TYPE_F32;
+            src1_col.data  = src1_f32.get();
+            src1_col.nb[0] = sizeof(float);
+            for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+                src1_col.nb[i] = src1_col.nb[i - 1]*src1_col.ne[i - 1];
+            }
+            ggml_cuda_mul_mat_vec_f(ctx, src0, &src1_col, nullptr, dst);
+            return;
+        }
+    }
+#endif // defined(GGML_USE_HIP)
 
     constexpr size_t max_src0_convert_size = 512ull * 1024 * 1024;
     const size_t src0_f32_size = ggml_nelements(src0) * sizeof(float);

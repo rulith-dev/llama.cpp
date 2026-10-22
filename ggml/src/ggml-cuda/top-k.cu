@@ -150,8 +150,10 @@ static __global__ void top_k_nary_search_cuda(
             constexpr int radix_size = 1 << radix_bits;
             int shift = 32 - radix_bits;
             uint32_t mask = ((1U << radix_bits) - 1) << shift;
+            // strixllama: keys in [range_min, range_max), the bound 64-bit: +inf's key is 0xff800000 (a bound of that
+            // left +inf uncounted and the selection took a wrong set when one was there), the top bucket's end 2^32
             uint32_t range_min = 0;
-            uint32_t range_max = 0xff800000U;
+            uint64_t range_max = 0xff800001ULL;
             uint32_t total = 0;
 
             while (mask != 0) {
@@ -200,7 +202,7 @@ static __global__ void top_k_nary_search_cuda(
 
                 const uint32_t bucket = selected_bucket;
                 total = selected_total;
-                range_max = range_min + ((bucket + 1) << shift);
+                range_max = range_min + ((uint64_t) (bucket + 1) << shift);
                 range_min = range_min + (bucket << shift);
                 if (total == (uint32_t) limit) {
                     break;

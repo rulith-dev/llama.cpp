@@ -24,6 +24,30 @@ static __global__ void k_compute_out_prod_ptrs(
     ptrs_c[idx] = dst_d  +  i3      *s3  +  i2      *s2;
 }
 
+#if defined(GGML_USE_HIP)
+// strixllama: a product of one column without rocBLAS, which faults in host code on an F32 GEMM of one column (see
+// ggml_cuda_mul_mat_cublas): dst[i0] = sum_k src0[i0 + k*lda] * src1[k*sk1], a thread an element
+static __global__ void k_out_prod_one_col(
+        const float * src0_d, const float * src1_d, float * dst_d,
+        const int64_t ne0, const int64_t ne01, const int64_t lda, const int64_t sk1,
+        const int64_t dps2, const int64_t dps3,
+        const size_t s02, const size_t s03, const size_t s12, const size_t s13, const size_t s2, const size_t s3) {
+    const int64_t i0 = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t i2 = blockIdx.y;
+    const int64_t i3 = blockIdx.z;
+    if (i0 >= ne0) {
+        return;
+    }
+    const float * a = src0_d + (i3/dps3)*s03 + (i2/dps2)*s02 + i0;
+    const float * b = src1_d +  i3      *s13 +  i2      *s12;
+    float sum = 0.0f;
+    for (int64_t k = 0; k < ne01; ++k) {
+        sum += a[k*lda]*b[k*sk1];
+    }
+    dst_d[i3*s3 + i2*s2 + i0] = sum;
+}
+#endif // defined(GGML_USE_HIP)
+
 void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -73,6 +97,16 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // dps == dst per src0, used for group query attention
     const int64_t dps2 = ne2 / ne02;
     const int64_t dps3 = ne3 / ne03;
+
+#if defined(GGML_USE_HIP)
+    if (ne1 == 1) {
+        const dim3 grid((ne0 + 255)/256, ne2, ne3);
+        k_out_prod_one_col<<<grid, 256, 0, stream>>>(src0_d, src1_d, dst_d, ne0, ne01, lda, src1_T ? 1 : ldb,
+            dps2, dps3, s02, s03, s12, s13, s2, s3);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
 
     if (dps2 == 1 && ne2 > 1) {
         // src0 has uniform stride s02 along dim 2; batch the inner loop with a strided GEMM

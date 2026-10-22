@@ -12841,8 +12841,59 @@ struct test_norm_gated : public test_case {
     }
 };
 
+// strixllama: RMS_NORM times a weight row (a model's attn/ffn norm), the fused rms_norm + mul kernel
+struct test_strix_rms_mul : public test_case {
+    const std::array<int64_t, 4> ne;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    test_strix_rms_mul(std::array<int64_t, 4> ne) : ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(a, "a");
+        ggml_set_name(w, "w");
+        return ggml_mul(ctx, ggml_rms_norm(ctx, a, 1e-6f), w);
+    }
+};
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // strixllama: the upstream kernels the merge keeps off on HIP (STRIX_RMS_VEC, STRIX_GDN_MMA), at this model's
+    // shapes (Qwen3.8-Flash-Next: n_embd 2560; the delta net 16 q/k heads, 48 v heads of 128). STRIX_SYNC_PERF=1
+    if (getenv("STRIX_SYNC_PERF")) {
+        for (int64_t n : {1, 8, 2048, 8192}) {
+            test_cases.emplace_back(new test_strix_rms_mul({2560, n, 1, 1}));
+            test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {2560, n, 1, 1}));
+        }
+        for (int64_t n : {2048, 4096, 8192}) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n, 1, 3));
+        }
+        return test_cases;
+    }
+    // strixllama: the Q2_K / Q3_K / Q6_K MMVQ dot products (VDR 1 of 0.6.x vs upstream's VDR 2, a build define) at decode
+    // batches: the UD-IQ4_XS head (Q6_K 2560 -> 248320) and a dense 27B's projections. STRIX_VDR_PERF=1
+    if (getenv("STRIX_VDR_PERF")) {
+        for (int64_t n : {1, 2, 3, 4, 8}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, n, 2560, {1, 1}, {1, 1}));
+            for (ggml_type t : {GGML_TYPE_Q6_K, GGML_TYPE_Q3_K, GGML_TYPE_Q2_K}) {
+                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 5120, n, 17408, {1, 1}, {1, 1}));
+            }
+        }
+        return test_cases;
+    }
 
     // strixllama MOE_GLU_KQ: the narrow-row norms of a prompt's pass, one case a shape. The delta net
     // norms q and k as 16 groups x T rows of 128, and its output norm as 48 of 128 (inner_size 6144).

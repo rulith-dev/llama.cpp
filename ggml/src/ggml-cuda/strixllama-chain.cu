@@ -230,6 +230,9 @@ int ggml_cuda_strixllama_chain_try(ggml_backend_cuda_context & ctx, const ggml_c
     const ggml_tensor * prev = first;
     int prev_idx = i;
     int last_idx = i;
+    // a RESHAPE between chain nodes that changes the shape: the kernel splits the output's index by the output's shape,
+    // which reads by ne and nb (broadcasts) laid out in an earlier shape do not follow - see the check after the loop
+    bool reshaped = false;
 
     for (int j = i + 1; j < cgraph->n_nodes && n_steps < STRIX_CHAIN_MAX; ++j) {
         const ggml_tensor * node = cgraph->nodes[j];
@@ -288,6 +291,9 @@ int ggml_cuda_strixllama_chain_try(ggml_backend_cuda_context & ctx, const ggml_c
         // shapes may only grow by broadcasting along the chain
         if (!ggml_can_repeat(link, node)) {
             break;
+        }
+        if (!ggml_are_same_shape(link, prev)) {
+            reshaped = true;
         }
         const ggml_tensor * other = via0 ? node->src[1] : node->src[0];
         if (other && !ggml_can_repeat(fc_fold(other), node)) {
@@ -373,6 +379,16 @@ int ggml_cuda_strixllama_chain_try(ggml_backend_cuda_context & ctx, const ggml_c
         strixllama_chain_step & st = p.steps[k];
         st.kind = st.op >= FC_ADD ? kind_of(st.one, st.onb) : FC_READ_GENERAL;
         p.need_idx = p.need_idx || (st.op >= FC_ADD && st.kind == FC_READ_GENERAL);
+    }
+    // e.g. a MoE router's weight normalisation, CLAMP [1, T] -> DIV [n_used, T] -> RESHAPE [1, n_used, T] -> SCALE: the sum
+    // and the weights were read at the reshaped output's indices (test-backend-ops TOPK_MOE with norm and scale)
+    if (reshaped && p.need_idx) {
+        static unsigned refused = 0;
+        if (getenv("LLAMA_GRAPH_TRACE") && refused++ < 12) {
+            fprintf(stderr, "CHAIN_FUSE: refused [%s '%s' .. %s '%s']: reshaped with reads by index\n",
+                    ggml_op_name(first->op), first->name, ggml_op_name(out->op), out->name);
+        }
+        return 0;
     }
 
     // bisection aid: STRIX_CHAIN_ONLY=FIRSTOP-LASTOP fuses only chains with that signature

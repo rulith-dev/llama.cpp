@@ -247,6 +247,34 @@ static void solve_tri_f32_cuda(const float * A,
     }
 }
 
+#if defined(GGML_USE_HIP)
+// strixllama: forward substitution, a thread a column, for what the fast kernel does not take - rocBLAS' trsm (TheRock
+// 10.2 nightly, Windows) faults in host code, as its F32 GEMMs of one column do (see ggml_cuda_mul_mat_cublas)
+static __global__ void solve_tri_f32_columns(const float * A, const float * B, float * X, const uint3 ne02,
+                                             const size_t nb02, const size_t nb03, const size_t nb12, const size_t nb13,
+                                             const size_t nb2, const size_t nb3, const int n, const int k) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= k) {
+        return;
+    }
+    const uint2   i02_i03 = fast_div_modulo(blockIdx.y, ne02);
+    const int64_t i02     = i02_i03.y;
+    const int64_t i03     = i02_i03.x;
+
+    const float * A_batch = A + i02 * nb02 + i03 * nb03;
+    const float * B_batch = B + i02 * nb12 + i03 * nb13;
+    float *       X_batch = X + i02 * nb2 + i03 * nb3;
+
+    for (int row = 0; row < n; ++row) {
+        float sum = 0.0f;
+        for (int j = 0; j < row; ++j) {
+            sum += A_batch[(int64_t) row * n + j] * X_batch[(int64_t) j * k + col];
+        }
+        X_batch[(int64_t) row * k + col] = (B_batch[(int64_t) row * k + col] - sum) / A_batch[(int64_t) row * n + row];
+    }
+}
+#endif // defined(GGML_USE_HIP)
+
 void ggml_cuda_op_solve_tri(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];  // A (n×n, lower triangular)
     const ggml_tensor * src1 = dst->src[1];  // B (n×k)
@@ -265,6 +293,15 @@ void ggml_cuda_op_solve_tri(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                            src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float), dst->nb[2] / sizeof(float),
                            dst->nb[3] / sizeof(float), ctx.stream());
     } else {
+#if defined(GGML_USE_HIP)
+        const dim3 grid((k + 63) / 64, ne02 * ne03);
+        solve_tri_f32_columns<<<grid, 64, 0, ctx.stream()>>>((const float *) src0->data, (const float *) src1->data,
+            (float *) dst->data, init_fastdiv_values((uint32_t) ne02), src0->nb[2] / sizeof(float), src0->nb[3] / sizeof(float),
+            src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float), dst->nb[2] / sizeof(float), dst->nb[3] / sizeof(float),
+            (int) n, (int) k);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+#endif // defined(GGML_USE_HIP)
         solve_tri_f32_cublas(ctx, (const float *) src0->data, (const float *) src1->data, (float *) dst->data, n, k,
                              ne02, ne03, src0->nb[2] / sizeof(float), src0->nb[3] / sizeof(float),
                              src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float), dst->nb[2] / sizeof(float),
