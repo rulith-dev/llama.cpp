@@ -79,6 +79,21 @@ static strixllama_spec_timing g_spec_timing;
 #if defined(_WIN32)
 #include <new.h>
 static int strixllama_new_handler(size_t size) {
+    // the stacks of the first few failures, then one line every 10 s with the count (issue #22: a retry that failed at
+    // every step printed a 48-frame stack each time)
+    static std::atomic<uint32_t> n_failed{0};
+    static std::atomic<uint64_t> t_last{0};
+    const uint32_t k   = ++n_failed;
+    const uint64_t now = GetTickCount64();
+    if (k > 4) {
+        uint64_t last = t_last.load();
+        if (now - last >= 10000 && t_last.compare_exchange_strong(last, now)) {
+            fprintf(stderr, "NEW_FAILED size=%zu (0x%zx), %u failed allocations so far\n", size, size, (unsigned) k);
+            fflush(stderr);
+        }
+        return 0;
+    }
+    t_last = now;
     void * frames[48];
     const USHORT n = CaptureStackBackTrace(1, 48, frames, nullptr);
     fprintf(stderr, "NEW_FAILED size=%zu (0x%zx)\n", size, size);
@@ -510,6 +525,11 @@ struct server_slot {
     // slot takes another conversation, cut when this one is rewound.
     mutable server_prompt_cache::disk_runs_state runs;
 
+    // strixllama: when a run of this conversation last failed to gather (no memory, or the cache refused its rows);
+    // the next try waits GATHER_RETRY_US (see persist_runs)
+    mutable int64_t t_gather_failed_us = 0;
+    static constexpr int64_t GATHER_RETRY_US = 30 * 1000000LL;
+
     void runs_truncate(llama_pos p) const {
         for (auto * v : { &runs.tgt, &runs.dft }) {
             while (!v->empty() && v->back().pos0 >= p) {
@@ -585,11 +605,21 @@ struct server_slot {
         auto new_tgt = runs.tgt;
         auto new_dft = runs.dft;
         std::vector<std::pair<std::pair<uint64_t, uint64_t>, std::vector<uint8_t>>> data;
+        // strixllama (issue #22): a run gathered while the writer was busy was dropped again, and gathered again at the
+        // next step, ~120 MB off the device each time; after a failed gather every step tried again and logged it, and
+        // with the commit limit reached that wrote the log full. A save that neither waits nor leaves now holds its
+        // runs back while the writer is busy, and for GATHER_RETRY_US after a failure
+        bool held = false;
         auto gather = [&](llama_context * ctx, uint64_t row, std::vector<server_prompt_cache::disk_run_ref> & v, int64_t end) {
             for (int64_t p = cover(v); p < end; ) {
                 const int64_t len = std::min<int64_t>(cache.disk_run, end - p);
                 if (len < cache.disk_run && !leaving) {
                     break;                          // a run that is not full waits, unless the conversation leaves
+                }
+                if (!wait && !leaving && (cache.disk_busy() ||
+                        (t_gather_failed_us != 0 && ggml_time_us() - t_gather_failed_us < GATHER_RETRY_US))) {
+                    held = true;
+                    return false;
                 }
                 std::vector<uint8_t> rows((size_t) (len * (int64_t) row));
                 if (!llama_strix_kv_get_rows(ctx, id, (llama_pos) p, (int32_t) len, rows.data(), rows.size())) {
@@ -604,13 +634,18 @@ struct server_slot {
         };
         try {
             if (!gather(ctx_tgt, row_tgt, new_tgt, end_tgt) || (ctx_dft && !gather(ctx_dft, row_dft, new_dft, end_dft))) {
-                SLT_WRN(*this, "%s", "disk cache: the cache would not give up its rows; not writing them\n");
+                if (!held) {
+                    t_gather_failed_us = ggml_time_us();
+                    SLT_WRN(*this, "%s", "disk cache: the cache would not give up its rows; not writing them (again in 30 s)\n");
+                }
                 return false;
             }
         } catch (const std::bad_alloc &) {
-            SLT_WRN(*this, "%s", "disk cache: not enough memory to gather a run; trying again later\n");
+            t_gather_failed_us = ggml_time_us();
+            SLT_WRN(*this, "%s", "disk cache: not enough memory to gather a run; trying again in 30 s\n");
             return false;
         }
+        t_gather_failed_us = 0;
         const int64_t n_entry = cover(new_tgt);
         if (n_entry == 0 || (data.empty() && !leaving)) {
             return true;

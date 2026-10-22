@@ -14,6 +14,7 @@
 #include "log.h"
 
 #include <atomic>
+#include <chrono>
 #include <clocale>
 #include <exception>
 #include <signal.h>
@@ -35,6 +36,47 @@ static inline void signal_handler(int signal) {
     }
 
     shutdown_handler(signal);
+}
+
+// strixllama: STRIX_LOG_MAX_MB - the console log (the manager points stdout and stderr at one file) is cut back to what
+// the load wrote whenever it grows past this many MB, so a server that runs for days cannot fill the disk with it.
+// Checked every 10 s; a console, a pipe or the variable unset change nothing.
+static void strix_log_cap_start() {
+#if defined(_WIN32)
+    const char * m = getenv("STRIX_LOG_MAX_MB");
+    if (!m || atoi(m) <= 0) {
+        return;
+    }
+    HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+    if (h == INVALID_HANDLE_VALUE || h == nullptr || GetFileType(h) != FILE_TYPE_DISK) {
+        return;
+    }
+    const int64_t cap = (int64_t) atoi(m) << 20;
+    std::thread([h, cap]() {
+        // the load's last lines go through the log thread: give them a moment before taking the size they end at
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        fflush(stdout);
+        fflush(stderr);
+        LARGE_INTEGER head;
+        if (!GetFileSizeEx(h, &head)) {
+            return;
+        }
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            LARGE_INTEGER size;
+            if (!GetFileSizeEx(h, &size) || size.QuadPart <= cap) {
+                continue;
+            }
+            fflush(stdout);
+            fflush(stderr);
+            // stdout and stderr are one handle here, so the writing of every thread goes on from the cut
+            if (SetFilePointerEx(h, head, nullptr, FILE_BEGIN) && SetEndOfFile(h)) {
+                fprintf(stderr, "[strixllama] the log passed %lld MB: everything after the load was cut (STRIX_LOG_MAX_MB)\n",
+                        (long long) (cap >> 20));
+            }
+        }
+    }).detach();
+#endif
 }
 
 // satisfies -Wmissing-declarations (used by llama command)
@@ -552,6 +594,7 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     for (const auto & address : ctx_http.listening_addresses) {
         SRV_INF("listening on %s\n", address.c_str());
     }
+    strix_log_cap_start();
 
     // spawn only once listening, so the port is bound and the child startup health check reaches us. the destructor stops it
     server_connect connect_proc;

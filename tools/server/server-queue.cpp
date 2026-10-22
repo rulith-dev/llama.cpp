@@ -671,7 +671,7 @@ void server_response_reader::stop() {
 // tools, the grammar - are written in full once per file as {"hash": h, "value": v} and afterwards as {"same_as": h},
 // so a long agent session costs its new content, not its whole history on every call, and every line can still be
 // rebuilt from its file. A file over STRIX_REQUEST_LOG_MAX_MB (default 1024) is closed and the next one is <file>.2,
-// <file>.3, ...: nothing is deleted or overwritten.
+// <file>.3, ...; with STRIX_REQUEST_LOG_KEEP=n only the newest n of them are kept (default: all).
 
 namespace {
 struct strix_request_log {
@@ -682,6 +682,7 @@ struct strix_request_log {
     size_t      bytes     = 0;
     size_t      max_bytes = (size_t) 1024 << 20;
     int         part      = 1;
+    int         keep      = 0;                      // files kept, 0 = all
     std::unordered_set<std::string> seen;   // hashes written in full in the current file
 
     strix_request_log() {
@@ -692,6 +693,10 @@ struct strix_request_log {
         const char * m = getenv("STRIX_REQUEST_LOG_MAX_MB");
         if (m && atoi(m) > 0) {
             max_bytes = (size_t) atoi(m) << 20;
+        }
+        const char * k = getenv("STRIX_REQUEST_LOG_KEEP");
+        if (k && atoi(k) > 0) {
+            keep = atoi(k);
         }
     }
 
@@ -758,6 +763,10 @@ struct strix_request_log {
             f = nullptr;
             seen.clear();
             path = base + "." + std::to_string(++part);
+            if (keep > 0 && part - keep >= 1) {
+                const int old = part - keep;
+                std::remove((old == 1 ? base : base + "." + std::to_string(old)).c_str());
+            }
         }
     }
 };
