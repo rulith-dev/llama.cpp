@@ -1709,7 +1709,8 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
-    cur = build_hadamard_input(w, cur);
+    // a Hadamard-folded weight reads the transformed input; a LoRA delta lives in the primal basis and reads `cur`
+    ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     // strixllama: decode-sized batches read the Q6_K twin of a Q8_0 trunk weight when one was built
     // (LLAMA_TRUNK_DECODE_Q6K); larger batches, and the LoRA lookup below, keep the original
     ggml_tensor * w_mm = w;
@@ -1726,9 +1727,9 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     }
     // strixllama: an EXL3 weight is a product between its Hadamard rotations (llama-weight-aux.h); a draft's borrowed
     // target weight has its rotations in the target's map
-    ggml_tensor * res = llama_weight_aux_mul_mat(ctx0, waux_for(w), w, cur, nullptr);
+    ggml_tensor * res = llama_weight_aux_mul_mat(ctx0, waux_for(w), w, cur_mm, nullptr);
     if (res == nullptr) {
-        res = ggml_mul_mat(ctx0, w_mm, cur);
+        res = ggml_mul_mat(ctx0, w_mm, cur_mm);
     }
 
     if (prec_policy) {
@@ -1815,14 +1816,15 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s,
           ggml_tensor * slots) const {
-    cur = build_hadamard_input(w, cur);
+    // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
+    ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     // strixllama: an EXL3 weight is a product between its Hadamard rotations (llama-weight-aux.h)
-    ggml_tensor * res = slots == nullptr ? llama_weight_aux_mul_mat(ctx0, waux_for(w), w, cur, ids) : nullptr;
+    ggml_tensor * res = slots == nullptr ? llama_weight_aux_mul_mat(ctx0, waux_for(w), w, cur_mm, ids) : nullptr;
     if (res == nullptr) {
         // the experts in the MoE cache are selected by their slots
         res = slots == nullptr ?
-            ggml_mul_mat_id(ctx0, w, cur, ids) :
-            ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur, slots);
+            ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
+            ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur_mm, slots);
     }
 
     if (prec_policy) {
