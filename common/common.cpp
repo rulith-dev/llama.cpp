@@ -2243,6 +2243,15 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
     llama_batch_ext * res = batch.get();
     llama_batch_ext_clear(res);
 
+    // strixllama: state rows that are one block, in entry order, go in as it (llama_batch_ext_set_state_rows), read in
+    // place - an MTP catch-up's rows for a prompt chunk are the target's own rows (see the draft-mtp process())
+    bool state_block = n > 0 && tokens[off].state.data != nullptr && tokens[off].state.n_rows == 1;
+    for (int32_t i = off + 1; state_block && i < off + n; ++i) {
+        const llama_embd & s = tokens[i].state;
+        state_block = s.n_rows == 1 && s.n_embd == tokens[off].state.n_embd &&
+            s.data == tokens[off].state.data + (size_t) (i - off)*tokens[off].state.n_embd;
+    }
+
     for (int32_t i = off; i < off + n; ++i) {
         const token & t = tokens[i];
 
@@ -2273,12 +2282,15 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
         if (t.output) {
             llama_batch_ext_set_output_logits(res, idx, true);
         }
-        if (t.state.data) {
+        if (t.state.data && !state_block) {
             llama_batch_ext_set_embd_state(res, idx, t.state); // contexts without a state input ignore it
         }
         if (t.decision_order != 0) {
             llama_batch_ext_set_decision_order(res, idx, (llama_decision_order) t.decision_order);
         }
+    }
+    if (state_block) {
+        llama_batch_ext_set_state_rows(res, tokens[off].state.data); // contexts without a state input ignore it
     }
 
     return res;

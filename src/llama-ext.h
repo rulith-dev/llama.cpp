@@ -129,6 +129,11 @@ enum llama_decision_order {
 // The embeddings output has one value per entry: row i is the score of option i
 LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch, int32_t idx, enum llama_decision_order order);
 
+// strixllama: the state embedding of every entry at once, read in place: n_embd_state floats an entry, in entry order,
+// valid until the batch is processed. Instead of llama_batch_ext_set_embd_state on each entry (which copies), after
+// the entries are added; false when an entry has a state already or the context takes none
+LLAMA_API bool llama_batch_ext_set_state_rows(struct llama_batch_ext * batch, const float * rows);
+
 // Label of option i of a decision model ("<arch>.decision.labels"), nullptr past the last one
 LLAMA_API const char * llama_model_decision_label(const struct llama_model * model, uint32_t i);
 

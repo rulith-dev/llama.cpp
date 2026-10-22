@@ -142,6 +142,10 @@ struct llama_batch_ext {
     std::vector<float> embd;
     std::vector<float> state;
 
+    // strixllama: the state rows read where they are (llama_batch_ext_set_state_rows): n_embd_state floats an entry, in
+    // entry order, valid until the batch is processed; null: the rows are in `state`
+    const float * state_rows = nullptr;
+
     llama_batch_ext(llama_context * ctx);
 
     // build without a llama_context, used by tests
@@ -259,6 +263,7 @@ private:
     std::vector<float>          embd_vec;     // owned embeddings built from llama_batch_ext
     std::vector<int8_t>         is_embd_vec;  // mixed batch only (= 1 if embd, 0 if text token)
     std::vector<float>          state_vec;    // owned state embeddings built from llama_batch_ext, llama_batch has no slot for them
+    const float *               state_ptr = nullptr;   // strixllama: state_vec, or the batch's rows read in place
     std::vector<llama_seq_id>   seq_id_data;  // flat storage for seq_id pointers below
 
     std::vector<llama_pos>      pos;

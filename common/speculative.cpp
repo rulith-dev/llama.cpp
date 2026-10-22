@@ -1644,9 +1644,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
-            // strixllama: upstream's batch takes the rows as views and copies them when it is rendered, so the
-            // in-place lead row of 0.3.x-0.6.x (no shifted copy of a prompt batch's rows) has no equivalent here yet
             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+
+            // strixllama: a batch of one sequence (a prompt chunk, one conversation's verify) pairs its tokens with the
+            // target's own rows shifted by one, the carried row put in the spare row output_reserve keeps in front of
+            // them: one block of rows, which the batch reads in place (common_batch -> llama_batch_ext_set_state_rows)
+            // instead of copying 40 KB a token three times (~3% of an MTP prefill)
+            float * lead = n_tokens > 1 ? llama_get_embeddings_nextn_lead(ctx_tgt) : nullptr;
+            if (lead && lead + n_embd != h_tgt) {
+                lead = nullptr;
+            }
+            for (int k = 1; lead && k < n_tokens; ++k) {
+                if (batch_in.tokens[k].seq_id != batch_in.tokens[0].seq_id) {
+                    lead = nullptr;
+                }
+            }
             pt[2] = ggml_time_us();
             pt[3] = pt[2];
 
@@ -1668,6 +1680,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         h_row = pending_h[seq_id].data();
                     } else {
                         h_row = zero_row();
+                    }
+                    if (lead) {
+                        std::memcpy(lead, h_row, row_bytes);
+                        h_row = lead;
                     }
                 }
 
