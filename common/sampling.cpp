@@ -938,9 +938,40 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
 
+    // strixllama (dev): STRIX_SAMPLE_DUMP=1 prints each verified row's top logits, its draft token and the sample
+    static const bool dump = getenv("STRIX_SAMPLE_DUMP") && atoi(getenv("STRIX_SAMPLE_DUMP")) != 0;
+    auto dump_row = [&](const size_t r, const llama_token id) {
+        if (!dump) {
+            return;
+        }
+        const float * lg = llama_get_logits_ith(ctx, idxs[r]);
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+        std::vector<std::pair<float, int>> top;
+        for (int t = 0; t < n_vocab; ++t) {
+            if (top.size() < 6 || lg[t] > top.back().first) {
+                top.emplace_back(lg[t], t);
+                std::sort(top.begin(), top.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+                if (top.size() > 6) {
+                    top.pop_back();
+                }
+            }
+        }
+        double s = 0.0;
+        for (int t = 0; t < n_vocab; ++t) {
+            s += lg[t];
+        }
+        fprintf(stderr, "SAMPLE_DUMP rows %zu r %zu idx %d draft %d sampled %d (logit %.3f) mean %.4f top", idxs.size(), r, idxs[r],
+                r < draft.size() ? draft[r] : -1, id, lg[id], s / n_vocab);
+        for (const auto & p : top) {
+            fprintf(stderr, " %d:%.3f", p.second, p.first);
+        }
+        fprintf(stderr, "\n");
+    };
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        dump_row(i, id);
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -955,6 +986,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
     if (i == draft.size()) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        dump_row(i, id);
 
         common_sampler_accept(gsmpl, id, true);
 
