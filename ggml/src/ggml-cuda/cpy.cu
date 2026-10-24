@@ -495,6 +495,13 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
             CUDA_CHECK(mudnnMemcpyAsync(ctx, src1, src0));
         } else
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
+        // strixllama: an F32 source in pinned host memory (an integrated GPU's graph input, e.g. qwen4exp's PLE rows)
+        // is read by the copy kernel: as a memcpy node the 20 KB took ~250 us of every decode step on gfx1151, the
+        // kernel reads it like any other host input. The same bytes. STRIX_CPY_HOST_KERNEL=0: the memcpy
+        static const bool host_kernel = !getenv("STRIX_CPY_HOST_KERNEL") || atoi(getenv("STRIX_CPY_HOST_KERNEL")) != 0;
+        if (host_kernel && src0->type == GGML_TYPE_F32 && src0->buffer && ggml_backend_buffer_is_host(src0->buffer)) {
+            ggml_cpy_scalar_contiguous_cuda<float, float>(src0_ddc, src1_ddc, ne, main_stream);
+        } else
         {
             CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, ggml_nbytes(src0), cudaMemcpyDeviceToDevice, main_stream));
         }

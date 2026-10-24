@@ -2934,6 +2934,11 @@ static std::string strix_tl_class(const ggml_cgraph * cgraph, int i, int skip) {
         const size_t n = strlen(key);
         snprintf(key + n, sizeof(key) - n, "%s", ops.c_str());
     }
+    static const bool names = getenv("STRIX_GPU_TIMELINE_NAMES") != nullptr;   // DEV: the first node's name too
+    if (names) {
+        const size_t n = strlen(key);
+        snprintf(key + n, sizeof(key) - n, " {%s}", first->name);
+    }
     if ((first->op == GGML_OP_MUL_MAT || first->op == GGML_OP_MUL_MAT_ID) && first->src[1]) {
         const ggml_tensor * b = first->src[1];
         const size_t n = strlen(key);
@@ -5719,8 +5724,132 @@ struct ggml_cuda_mmh_moe_pending {
     const ggml_tensor *    down = nullptr;   // the routed down product, whose buffer holds the sorted rows
     int                    device = -1;
     ggml_cuda_mmh_moe_args a;
+    // a decode block's shared expert folded into the pipeline (ggml_cuda_mmh_moe_match_shexp): its products' nodes are
+    // skipped, the sum's nodes too (the reduce runs at fold_mul, after the gate's nodes, which run without fusions)
+    const ggml_tensor *    fold_skip[6] = {};
+    const ggml_tensor *    fold_gin = nullptr, * fold_sig = nullptr, * fold_mul = nullptr, * fold_add = nullptr;
+    bool                   fold_sum_seen = false;
 };
 static ggml_cuda_mmh_moe_pending g_mmh_moe;
+
+// strixllama: a node whose product the decode pipeline already made (the folded shared expert's)
+static bool ggml_cuda_mmh_moe_fold_skip(const ggml_tensor * node) {
+    if (!g_mmh_moe.fold_mul) {
+        return false;
+    }
+    for (const ggml_tensor * t : g_mmh_moe.fold_skip) {
+        if (t == node) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// strixllama: the shared expert after a decode block's weighted sum (graph order of qwen4exp for batches under 512
+// tokens): {MUL_MAT_HAD, MUL_MAT_HAD} of the block's input x, GLU swiglu of the two, MUL_MAT_HAD down, the gate {MUL_MAT
+// of x, SIGMOID}, then {MUL(down, gate), ADD(sum, that)}; nothing else in between, every product read only by the next
+struct ggml_cuda_mmh_moe_fold_match {
+    const ggml_tensor * gate = nullptr, * up = nullptr, * glu = nullptr, * down = nullptr, * gin = nullptr, * sig = nullptr;
+    ggml_tensor *       mul = nullptr, * add = nullptr;
+    int                 bits = 0, I = 0;
+};
+
+static const char * ggml_cuda_mmh_moe_match_shexp(const ggml_cgraph * cgraph, const int last, const ggml_tensor * x,
+        const ggml_tensor * sum, const int H, const int T, ggml_cuda_mmh_moe_fold_match & f) {
+    auto is_x = [&](const ggml_tensor * t) {
+        return t && t->data == x->data && t->type == GGML_TYPE_F32 && t->ne[0] == H && t->ne[1] == T && t->ne[2] == 1 &&
+            t->ne[3] == 1 && t->nb[0] == sizeof(float) && t->nb[1] == x->nb[2];
+    };
+    const ggml_tensor * prod[2] = {};
+    int n_prod = 0, k_mul = -1, k_prod[2] = { -1, -1 }, k_glu = -1, k_down = -1, k_gin = -1, k_sig = -1;
+    for (int k = last + 1; k < std::min(cgraph->n_nodes, last + 24) && k_mul < 0; ++k) {
+        ggml_tensor * n = cgraph->nodes[k];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            const ggml_tensor * v = n->view_src ? n->view_src : n->src[0];
+            if (v && (v == prod[0] || v == prod[1] || v == f.glu || v == f.down || v == f.gin || v == f.sig)) {
+                return "a view of a shared expert product";
+            }
+            continue;
+        }
+        if (n->op == GGML_OP_MUL_MAT_HAD && !n->src[2] && !f.glu && n_prod < 2 && is_x(n->src[1])) {
+            k_prod[n_prod] = k;
+            prod[n_prod++] = n;
+        } else if (n->op == GGML_OP_GLU && n_prod == 2 && !f.glu) {
+            f.glu = n;  k_glu = k;
+        } else if (n->op == GGML_OP_MUL_MAT_HAD && !n->src[2] && f.glu && !f.down && n->src[1] == f.glu) {
+            f.down = n;  k_down = k;
+        } else if (n->op == GGML_OP_MUL_MAT && !f.gin && is_x(n->src[1])) {
+            f.gin = n;  k_gin = k;
+        } else if (n->op == GGML_OP_UNARY && ggml_get_unary_op(n) == GGML_UNARY_OP_SIGMOID && f.gin && !f.sig && n->src[0] == f.gin) {
+            f.sig = n;  k_sig = k;
+        } else if (n->op == GGML_OP_MUL && f.down && f.sig) {
+            k_mul = k;
+        } else {
+            return "another node between the sum and the shared expert's tail";
+        }
+    }
+    if (k_mul < 0 || k_mul + 1 >= cgraph->n_nodes) {
+        return "no shared expert tail";
+    }
+    const ggml_tensor * glu = f.glu;
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || !glu->src[1] || ggml_get_op_params_i32(glu, 1) != 0 ||
+            !((glu->src[0] == prod[0] && glu->src[1] == prod[1]) || (glu->src[0] == prod[1] && glu->src[1] == prod[0]))) {
+        return "shared GLU";
+    }
+    f.gate = glu->src[0];
+    f.up   = glu->src[1];
+    const ggml_tensor * wg = f.gate->src[0], * wu = f.up->src[0], * wd = f.down->src[0];
+    auto bits_of = [](const ggml_type t) { return t >= GGML_TYPE_EXL3_M1 && t <= GGML_TYPE_EXL3_M8 ? 1 + (int) (t - GGML_TYPE_EXL3_M1) : 0; };
+    f.bits = bits_of(wg->type);
+    f.I    = (int) wg->ne[1];
+    if (!f.bits || wu->type != wg->type || wd->type != wg->type || wg->ne[0] != H || wu->ne[0] != H || wu->ne[1] != f.I ||
+            wd->ne[0] != f.I || wd->ne[1] != H) {
+        return "shared weight types or shapes";
+    }
+    for (const ggml_tensor * w : { wg, wu, wd }) {
+        if (w->ne[2] != 1 || w->ne[3] != 1 || w->nb[1] != ggml_row_size(w->type, w->ne[0]) || ((uintptr_t) w->data) % 16 != 0) {
+            return "shared weight layout";
+        }
+    }
+    for (const ggml_tensor * n : { f.gate, f.up, f.down }) {
+        if (ggml_get_op_params_i32(n, 0) != 128 || n->src[5]) {
+            return "shared product kind";
+        }
+        const ggml_tensor * ri = n->src[3], * ro = n->src[4];
+        for (const ggml_tensor * r : { ri, ro }) {
+            if (!r || r->type != GGML_TYPE_F16 || !ggml_is_contiguous(r) || r->ne[1] != 1 || ((uintptr_t) r->data) % 8 != 0) {
+                return "shared rotations";
+            }
+        }
+        if (ri->ne[0] != n->src[0]->ne[0] || ro->ne[0] != n->src[0]->ne[1]) {
+            return "shared rotation lengths";
+        }
+    }
+    f.mul = cgraph->nodes[k_mul];
+    f.add = cgraph->nodes[k_mul + 1];
+    const ggml_tensor * mul = f.mul;
+    const ggml_tensor * add = f.add;
+    if (!((mul->src[0] == f.down && mul->src[1] == f.sig) || (mul->src[1] == f.down && mul->src[0] == f.sig)) ||
+            add->op != GGML_OP_ADD || !((add->src[0] == sum && add->src[1] == mul) || (add->src[1] == sum && add->src[0] == mul))) {
+        return "shared tail";
+    }
+    if (f.sig->type != GGML_TYPE_F32 || !ggml_is_contiguous(f.sig) || f.sig->ne[0] != 1 || f.sig->ne[1] != T ||
+            ggml_nelements(f.sig) != T || mul->type != GGML_TYPE_F32 || !ggml_are_same_shape(mul, f.down) ||
+            add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) || add->ne[0] != H || add->ne[1] != T ||
+            ggml_nelements(add) != (int64_t) H * T) {
+        return "shared tail shapes";
+    }
+    // every product read only by the next step (the sum, node `last`, only by the ADD)
+    if (cgraph->nodes[last] != sum) {
+        return "the sum is not the block's last node";
+    }
+    for (const int k : { k_prod[0], k_prod[1], k_glu, k_down, k_gin, k_sig, k_mul, last }) {
+        if (!ggml_node_has_n_uses(cgraph, k, 1)) {
+            return "a shared product has other users";
+        }
+    }
+    return nullptr;
+}
 
 static void * ggml_cuda_mmh_moe_persist(const int device, const size_t bytes, cudaStream_t stream) {
     static void * buf[GGML_CUDA_MAX_DEVICES] = {};
@@ -5749,9 +5878,29 @@ static void * ggml_cuda_mmh_moe_persist(const int device, const size_t bytes, cu
     return buf[device];
 }
 
+// strixllama: the decode pipeline's scratch (ggml_cuda_mmh_moe_run_dec): one buffer a device, allocated once and never
+// moved, because decode runs inside captured graphs that keep its address. The first allocation may happen while a
+// graph is being captured (relaxed capture mode; no free and no sync is needed for it)
+static void * ggml_cuda_mmh_moe_dec_buf(const int device, const size_t bytes) {
+    static void * buf[GGML_CUDA_MAX_DEVICES] = {};
+    static size_t size[GGML_CUDA_MAX_DEVICES] = {};
+    if (!buf[device]) {
+        if (cudaMalloc(&buf[device], bytes) != cudaSuccess) {
+            (void) cudaGetLastError();
+            buf[device] = nullptr;
+            return nullptr;
+        }
+        size[device] = bytes;
+    }
+    return size[device] >= bytes ? buf[device] : nullptr;
+}
+
 static int ggml_cuda_try_mmh_moe(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i) {
 #if defined(GGML_USE_HIP)
     static const int moe_min = getenv("STRIX_MMH_MOE") ? atoi(getenv("STRIX_MMH_MOE")) : 32;
+    // blocks of STRIX_MMH_MOE_DEC_MIN .. GGML_CUDA_MMH_MOE_DEC_MAX_T tokens (decode, MTP verification) take the decode
+    // pipeline; STRIX_MMH_MOE_DEC=0 keeps the GEMVs
+    static const bool moe_dec = !getenv("STRIX_MMH_MOE_DEC") || atoi(getenv("STRIX_MMH_MOE_DEC")) != 0;
     static const bool moe_dbg = getenv("STRIX_MMH_MOE_DEBUG") && atoi(getenv("STRIX_MMH_MOE_DEBUG"));
 #define MOE_REFUSE(why) do { if (moe_dbg) { fprintf(stderr, "MMH_MOE refused at node %d (%s): %s\n", i, cgraph->nodes[i]->name, why); } return 0; } while (0)
     if (moe_min <= 0 || i + 5 >= cgraph->n_nodes || !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc)) {
@@ -5777,7 +5926,11 @@ static int ggml_cuda_try_mmh_moe(ggml_backend_cuda_context & ctx, ggml_cgraph * 
         MOE_REFUSE("classes or ids layout");
     }
     const int n_used = (int) ids->ne[0], T = (int) ids->ne[1];
-    if (T < moe_min) {
+    // STRIX_MMH_MOE_DEC_MIN: the fewest tokens it takes. One token too since the stream ring runs the jobs (+2% decode;
+    // the fused GEMV launch had measured 2% slower than the GEMVs there)
+    static const int dec_min = getenv("STRIX_MMH_MOE_DEC_MIN") ? atoi(getenv("STRIX_MMH_MOE_DEC_MIN")) : 1;
+    const bool dec = moe_dec && T >= dec_min && T <= GGML_CUDA_MMH_MOE_DEC_MAX_T && n_used <= 16;
+    if (!dec && T < moe_min) {
         return 0;
     }
     if (g_mmh_moe.down) {
@@ -5794,6 +5947,9 @@ static int ggml_cuda_try_mmh_moe(ggml_backend_cuda_context & ctx, ggml_cgraph * 
     if (wu->type != wg->type || wu->ne[0] != H || wu->ne[1] != I || wu->ne[2] != E || wd->ne[0] != I || wd->ne[1] != H || wd->ne[2] != E ||
             x->ne[0] != H || !ggml_cuda_mmh_moe_supported(H, I, n_used, bits_gu, bits_d)) {
         MOE_REFUSE("weight types or shapes");
+    }
+    if (dec && bits_gu != bits_d) {
+        MOE_REFUSE("decode: the gate / up and down widths differ");
     }
     for (const ggml_tensor * w : { wg, wu, wd }) {
         if (w->nb[1] != ggml_row_size(w->type, w->ne[0]) || w->nb[2] != w->ne[1] * w->nb[1]) {
@@ -5857,6 +6013,30 @@ static int ggml_cuda_try_mmh_moe(ggml_backend_cuda_context & ctx, ggml_cgraph * 
             }
         }
     }
+    // strixllama: a decode block's shared expert as one more job of the pipeline (an expert's shape: one I x H gate, up
+    // and down). Its products' nodes and the sum are skipped, its gate runs as nodes, and the reduce at the gate's MUL
+    // adds its rows times the gate and writes the ADD. STRIX_MMH_MOE_SHEXP=0: its own GEMVs as before
+    static const int fold_env = getenv("STRIX_MMH_MOE_SHEXP") ? atoi(getenv("STRIX_MMH_MOE_SHEXP")) : 1;   // DEV -1: the STRIX_AB side
+    const bool fold_on = fold_env < 0 ? ggml_cuda_strix_ab() != 0 : fold_env != 0;
+    ggml_cuda_mmh_moe_fold_match fold;
+    bool folded = false;
+    if (dec && fold_on && !sx) {
+        const char * why = ggml_cuda_mmh_moe_match_shexp(cgraph, last, x, m.dst, H, T, fold);
+        if (!why && !ggml_cuda_mmh_moe_dec_shexp_ok(T, n_used, I, bits_gu, fold.I, fold.bits)) {
+            why = "the shared expert's width or rows";
+        }
+        if (!why && ggml_cuda_mmb_is_bf16_only(fold.add)) {
+            why = "the shared tail's output";
+        }
+        if (why) {
+            if (moe_dbg) {
+                fprintf(stderr, "MMH_MOE shared expert not folded at node %d: %s\n", i, why);
+            }
+        } else {
+            folded = true;
+            out = fold.add;
+        }
+    }
     if (out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out) || out->ne[0] != H || out->ne[1] != T || ggml_cuda_mmb_is_bf16_only(out)) {
         MOE_REFUSE("output");
     }
@@ -5866,7 +6046,7 @@ static int ggml_cuda_try_mmh_moe(ggml_backend_cuda_context & ctx, ggml_cgraph * 
         return a && b && (const char *) a < (const char *) b + nb && (const char *) b < (const char *) a + na;
     };
     const size_t bytes_gu = (size_t) T * n_used * I * sizeof(float), bytes_had = (size_t) T * n_used * H * sizeof(float);
-    if (ggml_nbytes(down) < bytes_had || ggml_nbytes(gate) < bytes_gu || ggml_nbytes(up) < bytes_gu) {
+    if (ggml_nbytes(down) < bytes_had || (!dec && (ggml_nbytes(gate) < bytes_gu || ggml_nbytes(up) < bytes_gu))) {
         MOE_REFUSE("product buffers too small");
     }
     void * buf_had = down->data;
@@ -5876,8 +6056,22 @@ static int ggml_cuda_try_mmh_moe(ggml_backend_cuda_context & ctx, ggml_cgraph * 
             MOE_REFUSE("the down product's buffer overlaps a live tensor");
         }
     }
+    if (folded) {
+        // the shared gate's nodes write after the sum's last read: not into what the reduce still reads
+        for (const ggml_tensor * k : { fold.gin, fold.sig }) {
+            if (overlaps(buf_had, bytes_had, k->data, ggml_nbytes(k)) || overlaps(m.weights->data, ggml_nbytes(m.weights), k->data, ggml_nbytes(k))) {
+                MOE_REFUSE("the shared gate overlaps what the reduce reads");
+            }
+        }
+        if (overlaps(out->data, ggml_nbytes(out), fold.sig->data, ggml_nbytes(fold.sig))) {
+            MOE_REFUSE("the output overlaps the shared gate");
+        }
+    }
     void * buf_gu = nullptr;
     for (ggml_tensor * cand : { gate, up }) {
+        if (dec) {
+            break;   // the decode pipeline keeps the gate / up products in its own scratch
+        }
         bool ok = !overlaps(cand->data, bytes_gu, buf_had, bytes_had);
         for (const ggml_tensor * k : { x, ids }) {
             ok = ok && !overlaps(cand->data, bytes_gu, k->data, ggml_nbytes(k));
@@ -5887,12 +6081,19 @@ static int ggml_cuda_try_mmh_moe(ggml_backend_cuda_context & ctx, ggml_cgraph * 
             break;
         }
     }
-    if (!buf_gu) {
+    if (!buf_gu && !dec) {
         MOE_REFUSE("the gate and up products' buffers overlap live tensors");
     }
+    void * dec_scratch = nullptr;
+    if (dec) {
+        dec_scratch = ggml_cuda_mmh_moe_dec_buf(ctx.device, ggml_cuda_mmh_moe_dec_scratch_bytes(E, H, I));
+        if (!dec_scratch) {
+            MOE_REFUSE("decode scratch");
+        }
+    }
     const ggml_cuda_mmh_moe_scratch s = ggml_cuda_mmh_moe_scratch_size(T, n_used, E);
-    void * persist = ggml_cuda_mmh_moe_persist(ctx.device, s.persist_bytes, ctx.stream());
-    if (!persist) {
+    void * persist = dec ? nullptr : ggml_cuda_mmh_moe_persist(ctx.device, s.persist_bytes, ctx.stream());
+    if (!persist && !dec) {
         MOE_REFUSE("graph capture");
     }
 
@@ -5907,17 +6108,62 @@ static int ggml_cuda_try_mmh_moe(ggml_backend_cuda_context & ctx, ggml_cgraph * 
     a.rs_in_g = rs[0];  a.rs_out_g = rs[1];  a.rs_in_u = rs[2];  a.rs_out_u = rs[3];  a.rs_in_d = rs[4];  a.rs_out_d = rs[5];
     a.sx = sx ? (const float *) sx->data : nullptr;  a.sg = sg ? (const float *) sg->data : nullptr;
     a.out = (float *) out->data;  a.buf_gu = buf_gu;  a.buf_had = buf_had;
-    ggml_cuda_pool_alloc<char> temp(ctx.pool(), s.temp_bytes);
-    ggml_cuda_mmh_moe_scratch_carve(a, persist, temp.get());
-    ggml_cuda_mmh_moe_run_main(a, ctx.stream());
+    if (folded) {
+        a.s_w_gate = fold.gate->src[0]->data;  a.s_w_up = fold.up->src[0]->data;  a.s_w_down = fold.down->src[0]->data;
+        a.s_rin_g = fold.gate->src[3]->data;  a.s_rout_g = fold.gate->src[4]->data;
+        a.s_rin_u = fold.up->src[3]->data;    a.s_rout_u = fold.up->src[4]->data;
+        a.s_rin_d = fold.down->src[3]->data;  a.s_rout_d = fold.down->src[4]->data;
+        a.bits_s = fold.bits;
+        a.sg = (const float *) fold.sig->data;
+        // an F32 gate weight: the prep launch makes the gate (sigmoid of its dot with x), and its nodes are skipped too
+        const ggml_tensor * gw = fold.gin->src[0];
+        static const bool gate_in = !getenv("STRIX_MMH_MOE_SHEXP_GATE") || atoi(getenv("STRIX_MMH_MOE_SHEXP_GATE")) != 0;   // DEV
+        if (gate_in && (gw->type == GGML_TYPE_F32 || gw->type == GGML_TYPE_BF16) && ggml_is_contiguous(gw) && gw->ne[0] == H &&
+                ggml_nelements(gw) == H && fold.gin->src[1]->nb[1] % 16 == 0 && ((uintptr_t) gw->data) % 16 == 0 && H % 4 == 0) {
+            a.s_gin_w    = gw->data;
+            a.s_gin_bf16 = gw->type == GGML_TYPE_BF16;
+        } else if (moe_dbg) {
+            fprintf(stderr, "MMH_MOE shared gate stays nodes: type %d ne %lld %lld nb1 %zu align %d\n", (int) gw->type,
+                    (long long) gw->ne[0], (long long) gw->ne[1], fold.gin->src[1]->nb[1], (int) (((uintptr_t) gw->data) % 16));
+        }
+    }
+    if (dec) {
+        ggml_cuda_mmh_moe_dec_carve(a, dec_scratch);
+        if (a.s_gin_w) {
+            a.sg = a.s_gate;
+        }
+        ggml_cuda_mmh_moe_run_dec(a, ctx.stream());
+    } else {
+        ggml_cuda_pool_alloc<char> temp(ctx.pool(), s.temp_bytes);
+        ggml_cuda_mmh_moe_scratch_carve(a, persist, temp.get());
+        ggml_cuda_mmh_moe_run_main(a, ctx.stream());
+    }
     CUDA_CHECK(cudaGetLastError());
     g_mmh_moe.down   = down;
     g_mmh_moe.device = ctx.device;
     g_mmh_moe.a      = a;
-    static unsigned hits = 0;
-    if (hits++ == 0) {
+    g_mmh_moe.fold_sum_seen = false;
+    if (folded) {
+        g_mmh_moe.fold_skip[0] = fold.gate;  g_mmh_moe.fold_skip[1] = fold.up;
+        g_mmh_moe.fold_skip[2] = fold.glu;   g_mmh_moe.fold_skip[3] = fold.down;
+        g_mmh_moe.fold_skip[4] = a.s_gin_w ? fold.gin : nullptr;
+        g_mmh_moe.fold_skip[5] = a.s_gin_w ? fold.sig : nullptr;
+        g_mmh_moe.fold_gin = fold.gin;  g_mmh_moe.fold_sig = fold.sig;
+        g_mmh_moe.fold_mul = fold.mul;  g_mmh_moe.fold_add = fold.add;
+    } else {
+        g_mmh_moe.fold_mul = nullptr;
+    }
+    static unsigned hits = 0, dec_hits = 0, fold_hits = 0;
+    if (folded && fold_hits++ == 0) {
+        fprintf(stderr, "MMH_MOE decode pipeline: the shared expert (bits %d, I %d) as one more job\n", fold.bits, fold.I);
+    }
+    if (!dec && hits++ == 0) {
         fprintf(stderr, "MMH_MOE grouped expert pipeline: T=%d E=%d H=%d I=%d picks=%d bits=%d/%d shexp=%d sum %d nodes on\n", T, E, H, I,
                 n_used, bits_gu, bits_d, int(sx != nullptr), j - i);
+    }
+    if (dec && dec_hits++ == 0) {
+        fprintf(stderr, "MMH_MOE decode pipeline: T=%d E=%d H=%d I=%d picks=%d bits=%d shexp=%d sum %d nodes on\n", T, E, H, I, n_used,
+                bits_gu, int(sx != nullptr), j - i);
     }
     return 3;
 #undef MOE_REFUSE
@@ -5932,6 +6178,17 @@ static int ggml_cuda_try_mmh_moe(ggml_backend_cuda_context & ctx, ggml_cgraph * 
 static int ggml_cuda_mmh_moe_reduce(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i) {
 #if defined(GGML_USE_HIP)
     ggml_tensor * node = cgraph->nodes[i];
+    if (g_mmh_moe.fold_mul && node == g_mmh_moe.fold_mul) {
+        // the folded shared expert's MUL: the sum plus its rows times the gate, written as the ADD
+        GGML_ASSERT(g_mmh_moe.device == ctx.device && g_mmh_moe.fold_sum_seen && i + 1 < cgraph->n_nodes &&
+                    cgraph->nodes[i + 1] == g_mmh_moe.fold_add && g_mmh_moe.fold_add->data == g_mmh_moe.a.out &&
+                    "MMH_MOE: the folded shared expert's tail is not where the gate node saw it");
+        ggml_cuda_mmh_moe_run_reduce(g_mmh_moe.a, ctx.stream());
+        CUDA_CHECK(cudaGetLastError());
+        g_mmh_moe.down = nullptr;
+        g_mmh_moe.fold_mul = nullptr;
+        return 1;
+    }
     if (!g_mmh_moe.down || (node->src[0] != g_mmh_moe.down && node->src[1] != g_mmh_moe.down)) {
         return -1;
     }
@@ -5940,6 +6197,11 @@ static int ggml_cuda_mmh_moe_reduce(ggml_backend_cuda_context & ctx, ggml_cgraph
     GGML_ASSERT(ggml_cuda_match_moe_weighted_reduction(cgraph, i, m) && m.experts == g_mmh_moe.down &&
                 "MMH_MOE: the weighted sum seen at the gate node is not there");
     int last = i + m.node_count - 1;
+    if (g_mmh_moe.fold_mul) {
+        GGML_ASSERT(!g_mmh_moe.fold_sum_seen);
+        g_mmh_moe.fold_sum_seen = true;   // the reduce runs at the shared expert's MUL
+        return last - i;
+    }
     if (g_mmh_moe.a.sx) {
         last += 2;
         GGML_ASSERT(last < cgraph->n_nodes && cgraph->nodes[last]->data == g_mmh_moe.a.out);
@@ -5963,6 +6225,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (g_mmh_moe.fold_mul && (node == g_mmh_moe.fold_gin || node == g_mmh_moe.fold_sig)) {
+        return 0;   // the folded shared expert's gate: plain nodes, its MUL is the reduce's
+    }
 
     if (node->op == GGML_OP_SSM_SCAN) {
         const int sk = ggml_cuda_ssm_scan_cache_fuse(*cuda_ctx, cgraph, i);
@@ -7308,6 +7574,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 // strixllama: a conv state copy the conv's kernel does (ggml_cuda_gdn_conv_match::n_tail)
                 if (ggml_cuda_gdn_conv_tail_skip(node)) {
+                    continue;
+                }
+                // strixllama: a shared expert product the decode pipeline made (ggml_cuda_mmh_moe_fold_skip)
+                if (ggml_cuda_mmh_moe_fold_skip(node)) {
                     continue;
                 }
 
