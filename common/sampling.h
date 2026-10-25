@@ -71,6 +71,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 // strixllama: common_sampler_sample from a stored row of n_vocab logits (a checkpoint's) instead of a context's output
 llama_token common_sampler_sample_logits(struct common_sampler * gsmpl, const float * logits, int n_vocab, bool grammar_first = false);
 
+// strixllama: whether the next token takes the exact fast top-k (a row of logits is read once, ~60 us)
+bool common_sampler_fast_applies(const struct common_sampler * gsmpl);
+
 // generalized version of common_sampler_sample
 //
 // will cross-reference the sampled tokens with a batch of draft tokens and accept those that match

@@ -7161,7 +7161,8 @@ private:
         // default; 0: one after the other). A slot's sampler, its candidates and its random state are its own, and the
         // logits are only read once the context has synchronized, so each slot samples the token it did before; what
         // follows - accepting it, the text, the stop checks, the responses - still runs slot by slot in order. With eight
-        // conversations this was ~1.6 ms of every step, the GPU idle.
+        // conversations this was ~1.6 ms of every step, the GPU idle. A row the exact fast top-k takes (~60 us) is sampled
+        // in turn below: the threads of an eight-row step cost more than its rows (1.08 -> 0.58 ms)
         std::vector<llama_token> pre_sampled(slots.size(), LLAMA_TOKEN_NULL);
         const int64_t t_ps0 = strixllama_spec_timing::enabled() ? ggml_time_us() : 0;
         {
@@ -7173,7 +7174,8 @@ private:
                 for (size_t k = 0; k < slots.size(); ++k) {
                     const server_slot & slot = slots[k];
                     if (slot.state == SLOT_STATE_GENERATING && is_inside_view(slot.i_batch) && slot.task &&
-                            !(slot.can_speculate() && !slot.spec_draft.empty()) && !slot.task->params.sampling.backend_sampling) {
+                            !(slot.can_speculate() && !slot.spec_draft.empty()) && !slot.task->params.sampling.backend_sampling &&
+                            !common_sampler_fast_applies(slot.smpl.get())) {
                         work.push_back(k);
                     }
                 }

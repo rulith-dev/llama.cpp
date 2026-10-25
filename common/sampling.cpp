@@ -8,6 +8,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <climits>
 #include <cmath>
@@ -16,6 +17,10 @@
 #include <random>
 #include <unordered_map>
 #include <vector>
+
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 // TODO: deduplicate with llama-impl.h
@@ -125,6 +130,9 @@ struct common_sampler {
 
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
+
+    // strixllama: the model's vocabulary, for the fast top-k of a stored row (common_sampler_sample_logits)
+    const llama_vocab * vocab = nullptr;
 
     void reset() {
         prev.clear();
@@ -453,6 +461,7 @@ struct common_sampler * common_sampler_init(
         // mix it, the chain and the draft are seeded from this one too
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
     };
+    result->vocab = vocab;
 
     return result;
 }
@@ -527,7 +536,7 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
+    auto * result = new common_sampler {
         /* .params  = */ gsmpl->params,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
@@ -537,6 +546,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur_p   = */ gsmpl->cur_p,
         /* .rng     = */ gsmpl->rng,
     };
+    result->vocab = gsmpl->vocab;
+    return result;
 }
 
 void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
@@ -688,6 +699,27 @@ static bool common_sampler_fast_candidates(common_sampler * gsmpl, const llama_v
     int cnt = 0;
     size_t bi = 0;
     for (llama_token t = 0; t < n_vocab; ++t) {
+#if defined(__SSE2__)
+        // once the k + 1 slots are full, eight tokens at a time: a block with no biased token, no NaN and no logit
+        // above the current (k + 1)-th holds only tokens the loop below skips (the threshold only rises), so it is
+        // skipped whole; a block with a hit is read one token at a time. 248K logits a row: ~6x shorter
+        if (cnt == m && (t & 7) == 0) {
+            const llama_token next_b = bi < biased.size() ? biased[bi].first : n_vocab;
+            const __m128 thr = _mm_set1_ps(tv[m - 1]);
+            while (t + 8 <= n_vocab && t + 8 <= next_b) {
+                const __m128 a = _mm_loadu_ps(logits + t), b = _mm_loadu_ps(logits + t + 4);
+                const __m128 hit = _mm_or_ps(_mm_or_ps(_mm_cmpgt_ps(a, thr), _mm_cmpunord_ps(a, a)),
+                                             _mm_or_ps(_mm_cmpgt_ps(b, thr), _mm_cmpunord_ps(b, b)));
+                if (_mm_movemask_ps(hit)) {
+                    break;
+                }
+                t += 8;
+            }
+            if (t >= n_vocab) {
+                break;
+            }
+        }
+#endif
         float v = logits[t];
         if (bi < biased.size() && biased[bi].first == t) {
             v = biased[bi].second;
@@ -723,6 +755,87 @@ static bool common_sampler_fast_candidates(common_sampler * gsmpl, const llama_v
     return true;
 }
 
+// strixllama: exact fast top-k (common_sampler_fast_candidates): the chain from its top-k on, on the k candidates.
+// LLAMA_TOKEN_NULL where it does not apply (the caller runs the full path). get_logits: the row; set_full: the full
+// candidates, for the resampling after a grammar rejected the token
+template <typename G, typename S>
+static llama_token common_sampler_sample_fast(common_sampler * gsmpl, const llama_vocab * vocab, const int n_vocab,
+        const bool grammar_first, G && get_logits, S && set_full) {
+    static const bool fast_env = !getenv("STRIX_FAST_SAMPLE") || atoi(getenv("STRIX_FAST_SAMPLE")) != 0;
+    static const bool check_env = getenv("STRIX_FAST_SAMPLE_CHECK") && atoi(getenv("STRIX_FAST_SAMPLE_CHECK")) != 0;
+    auto & grmr    = gsmpl->grmr;
+    auto & rbudget = gsmpl->rbudget;
+    auto & chain   = gsmpl->chain;
+    auto & cur_p   = gsmpl->cur_p;
+    const int ik = fast_env ? common_sampler_fast_topk_index(gsmpl) : -1;
+    if (ik < 0 || (grammar_first && grammar_should_apply(gsmpl)) ||
+            (rbudget && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING)) {
+        return LLAMA_TOKEN_NULL;
+    }
+    const float * logits = get_logits();
+    if (!logits) {
+        return LLAMA_TOKEN_NULL;
+    }
+    // the check: the full path on a clone of the chain (its RNG state included) before the fast one draws
+    llama_token ref_id = LLAMA_TOKEN_NULL;
+    std::vector<llama_token_data> ref_cur;
+    if (check_env) {
+        llama_sampler * ref = llama_sampler_clone(chain);
+        std::vector<llama_token_data> full(n_vocab);
+        for (llama_token t = 0; t < n_vocab; ++t) {
+            full[t] = llama_token_data{ t, logits[t], 0.0f };
+        }
+        llama_token_data_array fp = { full.data(), full.size(), -1, false };
+        llama_sampler_apply(ref, &fp);
+        ref_id = fp.data[fp.selected].id;
+        ref_cur.assign(fp.data, fp.data + fp.size);
+        llama_sampler_free(ref);
+    }
+    if (!common_sampler_fast_candidates(gsmpl, vocab, logits, n_vocab, gsmpl->params.top_k)) {
+        return LLAMA_TOKEN_NULL;
+    }
+    const int n = llama_sampler_chain_n(chain);
+    for (int i = ik + 1; i < n; ++i) {
+        llama_sampler_apply(llama_sampler_chain_get(chain, i), &cur_p);
+    }
+    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+    const llama_token id = cur_p.data[cur_p.selected].id;
+    if (check_env && ref_id != LLAMA_TOKEN_NULL) {
+        bool same = ref_id == id && ref_cur.size() == cur_p.size;
+        for (size_t i = 0; same && i < cur_p.size; ++i) {
+            same = ref_cur[i].id == cur_p.data[i].id && memcmp(&ref_cur[i].logit, &cur_p.data[i].logit, sizeof(float)) == 0 &&
+                memcmp(&ref_cur[i].p, &cur_p.data[i].p, sizeof(float)) == 0;
+        }
+        static std::atomic<long long> checked{0};   // the server samples rows on several threads
+        if (!same) {
+            fprintf(stderr, "FAST_SAMPLE_CHECK mismatch after %lld: fast %d (%zu candidates) full %d (%zu)\n",
+                (long long) checked, id, cur_p.size, ref_id, ref_cur.size());
+            GGML_ABORT("fast sampling differs from the full path");
+        }
+        if (++checked % 1000 == 0) {
+            fprintf(stderr, "FAST_SAMPLE_CHECK %lld samples identical\n", (long long) checked);
+        }
+    }
+    if (grammar_first || !grammar_should_apply(gsmpl)) {
+        return id;
+    }
+    // the grammar-based rejection check and the full resampling, as after the full path
+    llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
+    llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
+    llama_sampler_apply(grmr, &single_token_data_array);
+    if (single_token_data_array.data[0].logit != -INFINITY) {
+        return id;
+    }
+    set_full();
+    llama_sampler_apply(rbudget, &cur_p);
+    if (grammar_should_apply(gsmpl)) {
+        llama_sampler_apply(grmr, &cur_p);
+    }
+    llama_sampler_apply(chain, &cur_p);
+    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+    return cur_p.data[cur_p.selected].id;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -736,75 +849,14 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    // strixllama: exact fast top-k (common_sampler_fast_candidates): the chain from its top-k on, on the k candidates
-    {
-        static const bool fast_env = !getenv("STRIX_FAST_SAMPLE") || atoi(getenv("STRIX_FAST_SAMPLE")) != 0;
-        static const bool check_env = getenv("STRIX_FAST_SAMPLE_CHECK") && atoi(getenv("STRIX_FAST_SAMPLE_CHECK")) != 0;
-        const int ik = fast_env ? common_sampler_fast_topk_index(gsmpl) : -1;
-        if (ik >= 0 && !(grammar_first && grammar_should_apply(gsmpl)) &&
-                !(rbudget && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING) &&
-                llama_get_sampled_probs_ith(ctx, idx) == nullptr && llama_get_sampled_logits_ith(ctx, idx) == nullptr &&
-                llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL) {
-            const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
-            const int n_vocab = llama_vocab_n_tokens(vocab);
-            const float * logits = llama_get_logits_ith(ctx, idx);
-            // the check: the full path on a clone of the chain (its RNG state included) before the fast one draws
-            llama_token ref_id = LLAMA_TOKEN_NULL;
-            std::vector<llama_token_data> ref_cur;
-            if (check_env && logits) {
-                llama_sampler * ref = llama_sampler_clone(chain);
-                std::vector<llama_token_data> full(n_vocab);
-                for (llama_token t = 0; t < n_vocab; ++t) {
-                    full[t] = llama_token_data{ t, logits[t], 0.0f };
-                }
-                llama_token_data_array fp = { full.data(), full.size(), -1, false };
-                llama_sampler_apply(ref, &fp);
-                ref_id = fp.data[fp.selected].id;
-                ref_cur.assign(fp.data, fp.data + fp.size);
-                llama_sampler_free(ref);
-            }
-            if (logits && common_sampler_fast_candidates(gsmpl, vocab, logits, n_vocab, gsmpl->params.top_k)) {
-                const int n = llama_sampler_chain_n(chain);
-                for (int i = ik + 1; i < n; ++i) {
-                    llama_sampler_apply(llama_sampler_chain_get(chain, i), &cur_p);
-                }
-                GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
-                id = cur_p.data[cur_p.selected].id;
-                if (check_env && ref_id != LLAMA_TOKEN_NULL) {
-                    bool same = ref_id == id && ref_cur.size() == cur_p.size;
-                    for (size_t i = 0; same && i < cur_p.size; ++i) {
-                        same = ref_cur[i].id == cur_p.data[i].id && memcmp(&ref_cur[i].logit, &cur_p.data[i].logit, sizeof(float)) == 0 &&
-                            memcmp(&ref_cur[i].p, &cur_p.data[i].p, sizeof(float)) == 0;
-                    }
-                    static long long checked = 0;
-                    if (!same) {
-                        fprintf(stderr, "FAST_SAMPLE_CHECK mismatch after %lld: fast %d (%zu candidates) full %d (%zu)\n",
-                            checked, id, cur_p.size, ref_id, ref_cur.size());
-                        GGML_ABORT("fast sampling differs from the full path");
-                    }
-                    if (++checked % 1000 == 0) {
-                        fprintf(stderr, "FAST_SAMPLE_CHECK %lld samples identical\n", checked);
-                    }
-                }
-                if (grammar_first || !grammar_should_apply(gsmpl)) {
-                    return id;
-                }
-                // the grammar-based rejection check and the full resampling below, as after the full path
-                llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
-                llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
-                llama_sampler_apply(grmr, &single_token_data_array);
-                if (single_token_data_array.data[0].logit != -INFINITY) {
-                    return id;
-                }
-                gsmpl->set_logits(ctx, idx);
-                llama_sampler_apply(rbudget, &cur_p);
-                if (grammar_should_apply(gsmpl)) {
-                    llama_sampler_apply(grmr, &cur_p);
-                }
-                llama_sampler_apply(chain, &cur_p);
-                GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
-                return cur_p.data[cur_p.selected].id;
-            }
+    // strixllama: exact fast top-k (common_sampler_sample_fast), unless a backend sampler has made this row's candidates
+    if (llama_get_sampled_probs_ith(ctx, idx) == nullptr && llama_get_sampled_logits_ith(ctx, idx) == nullptr &&
+            llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL) {
+        const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+        id = common_sampler_sample_fast(gsmpl, vocab, llama_vocab_n_tokens(vocab), grammar_first,
+                                        [&] { return llama_get_logits_ith(ctx, idx); }, [&] { gsmpl->set_logits(ctx, idx); });
+        if (id != LLAMA_TOKEN_NULL) {
+            return id;
         }
     }
 
@@ -879,6 +931,12 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
+bool common_sampler_fast_applies(const struct common_sampler * gsmpl) {
+    static const bool fast_env = !getenv("STRIX_FAST_SAMPLE") || atoi(getenv("STRIX_FAST_SAMPLE")) != 0;
+    return fast_env && gsmpl && common_sampler_fast_topk_index(gsmpl) >= 0 &&
+        !(gsmpl->rbudget && common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_FORCING);
+}
+
 llama_token common_sampler_sample_logits(struct common_sampler * gsmpl, const float * logits, int n_vocab, bool grammar_first) {
     const auto tm = gsmpl->tm();
 
@@ -886,6 +944,14 @@ llama_token common_sampler_sample_logits(struct common_sampler * gsmpl, const fl
     auto & rbudget = gsmpl->rbudget;
     auto & chain   = gsmpl->chain;
     auto & cur_p   = gsmpl->cur_p; // initialized by set_logits_row
+
+    if (gsmpl->vocab) {
+        const llama_token id = common_sampler_sample_fast(gsmpl, gsmpl->vocab, n_vocab, grammar_first, [&] { return logits; },
+                                                          [&] { gsmpl->set_logits_row(logits, n_vocab); });
+        if (id != LLAMA_TOKEN_NULL) {
+            return id;
+        }
+    }
 
     gsmpl->set_logits_row(logits, n_vocab);
 
