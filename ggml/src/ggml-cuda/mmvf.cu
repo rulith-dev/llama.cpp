@@ -5,8 +5,8 @@
 #include "mmf.cuh"
 #include "convert.cuh"
 
-// strixllama: few_rows - fewer than 128 rows, so a handful of blocks: the F32 and BF16 loops keep four iterations' loads
-// in flight (the same elements a thread, the same multiply-adds in the same order)
+// strixllama: few_rows - fewer than 1024 rows (128 before 0.6.11), so few blocks: the F32 and BF16 loops keep four
+// iterations' loads in flight (the same elements a thread, the same multiply-adds in the same order)
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false,
           bool few_rows = false>
 static __global__ void mul_mat_vec_f(
@@ -439,7 +439,10 @@ static void mul_mat_vec_f_switch_fusion(
 
     if constexpr (block_size == 256 && !is_multi_token_id && (std::is_same_v<T, float> || std::is_same_v<T, nv_bfloat16>)) {
         static const bool few_rows_on = !getenv("STRIX_MMVF_FEW_ROWS") || atoi(getenv("STRIX_MMVF_FEW_ROWS")) != 0;
-        if (few_rows_on && block_nums.x < 128 && ids == nullptr) {
+        // below 1024 rows: the router's BF16 product (512 rows of 2560) 908 -> 828 us a token on UD-Q4_K_XL, 713 -> 641
+        // on EXL3 4.05, the same text (the loop keeps each thread's multiply-adds in order). DEV: STRIX_MMVF_FEW_ROWS_MAX
+        static const int few_rows_max = getenv("STRIX_MMVF_FEW_ROWS_MAX") ? atoi(getenv("STRIX_MMVF_FEW_ROWS_MAX")) : 1024;
+        if (few_rows_on && block_nums.x < (unsigned) few_rows_max && ids == nullptr) {
             ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id, true>, launch_params,
                 x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,

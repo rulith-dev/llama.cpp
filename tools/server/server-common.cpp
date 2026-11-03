@@ -1340,6 +1340,30 @@ server_tokens tokenize_oai_content_array(const llama_vocab * vocab, mtmd_context
 }
 
 // used by /chat/completions endpoint
+// strixllama: the media marker in a request's own text is replaced (issue #26). It is the server's random delimiter for
+// the images it splices in, and /props shows it: an agent that printed /props in a tool result sent it back as plain
+// text, mtmd_tokenize took it for an image without a bitmap and the request - and every later one carrying that
+// history - failed with HTTP 400 "Failed to tokenize prompt". Only the markers the server puts in for media parts
+// (oaicompat_content_load_media, after this) stay markers
+static size_t neutralize_media_marker(json & j, const std::string & marker, const std::string & repl) {
+    size_t n = 0;
+    if (j.is_string()) {
+        std::string s = j.get<std::string>();
+        for (size_t pos = s.find(marker); pos != std::string::npos; pos = s.find(marker, pos + repl.size())) {
+            s.replace(pos, marker.size(), repl);
+            ++n;
+        }
+        if (n > 0) {
+            j = s;
+        }
+    } else if (j.is_array() || j.is_object()) {
+        for (auto & v : j) {
+            n += neutralize_media_marker(v, marker, repl);
+        }
+    }
+    return n;
+}
+
 json oaicompat_chat_params_parse(
     const llama_vocab * vocab,
     json & body, /* openai api json semantics */
@@ -1404,6 +1428,15 @@ json oaicompat_chat_params_parse(
     json & messages = body.at("messages");
     if (!messages.is_array()) {
         throw std::invalid_argument("Expected 'messages' to be an array");
+    }
+    {
+        const std::string marker = get_media_marker();
+        const std::string repl   = marker == "<__media__>" ? "<__media_text__>" : "<__media__>";
+        size_t n = neutralize_media_marker(messages, marker, repl);
+        n += neutralize_media_marker(tools, marker, repl);   // the copy the template gets (inputs.tools)
+        if (n > 0) {
+            SRV_WRN("the request's text quoted the media marker %zu time(s); quoted as %s, not read as images\n", n, repl.c_str());
+        }
     }
     for (auto & msg : messages) {
         std::string role = json_value(msg, "role", std::string());

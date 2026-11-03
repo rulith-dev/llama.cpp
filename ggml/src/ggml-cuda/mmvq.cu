@@ -129,6 +129,10 @@ enum mmvq_parameter_table_id {
 #ifndef STRIX_MMVQ_RDNA35_ROWS
 #define STRIX_MMVQ_RDNA35_ROWS 4
 #endif
+// strixllama: the rows of a single-wave workgroup when the host picks the small_k form on RDNA3.5 (STRIX_MMVQ_SK)
+#ifndef STRIX_MMVQ_RDNA35_SK_ROWS
+#define STRIX_MMVQ_RDNA35_SK_ROWS 4
+#endif
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
 #if defined(RDNA4)
@@ -656,6 +660,9 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
         // Measured per-kernel at 2.3K context: down [2560,10] 4.17 -> 3.90 ms with two rows per
         // workgroup, while the IQ3_S gate/up [640,10] went the other way, so that one keeps one row.
         // Every wider batch keeps what the RDNA2 table gave it.
+        if (small_k && ncols_dst == 1) {
+            return STRIX_MMVQ_RDNA35_SK_ROWS;   // one wave, several rows: each row's sum as with one
+        }
         return ncols_dst == 1 && type == GGML_TYPE_IQ4_NL ? STRIX_MMVQ_RDNA35_ROWS : 1;
     }
     return 1;
@@ -1684,6 +1691,18 @@ static void mul_mat_vec_q_moe_launch(
             return;
         }
     }
+    // strixllama: on RDNA3.5, 2-8 tokens (an MTP verification), the unfused Q5_1 / Q8_0 expert products (UD-Q4_K_XL's
+    // down) take four rows a workgroup as IQ4_NL does: 9.29 -> 8.41 ms of a 4-row step, each row's sum as with two.
+    // The fused Q4_K gate / up measured the same with four. DEV: STRIX_MMVQ_MOE_R4 (default 1) - 2 the fused too, 0 off
+    if constexpr (type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_K || type == GGML_TYPE_IQ3_S) {
+        static const int r4 = getenv("STRIX_MMVQ_MOE_R4") ? atoi(getenv("STRIX_MMVQ_MOE_R4")) : 1;
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        const bool down = !has_fusion && (type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q8_0);
+        if (GGML_CUDA_CC_IS_RDNA3_5(cc) && nrows_x >= 512 && nrows_x % 4 == 0 && (((r4 & 1) && down) || ((r4 & 2) && has_fusion))) {
+            launch(std::integral_constant<int, 4>{});
+            return;
+        }
+    }
     launch(std::integral_constant<int, 2>{});
 }
 
@@ -1722,6 +1741,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const int     blocks_per_iter_1warp = vdr * warp_size / qi;
 
     const auto should_use_small_k = [&](int c_ncols_dst) {
+        // strixllama: on RDNA3.5 a one-token product over K = 352 .. 1024 (the routed and shared experts' down
+        // projections of Qwen3.8-Flash-Next, K 640) gives a single-wave workgroup four rows. One row a workgroup had
+        // 25600 workgroups of 480 bytes for the Q5_1 down of UD-Q4_K_XL: 4.05 -> 3.28 ms a token (149 -> 188 GB/s),
+        // each row's sum as before. Four rows slowed the Q4_K gate / up (K 2560, 4.76 -> 4.96 ms) and the HC up
+        // (K 320). DEV: STRIX_MMVQ_SK (default 8) - 1 every expert product, 2 rows of <= 32 blocks, 4 every product,
+        // 8 this rule; 0 off
+        if (table_id == MMVQ_PARAMETERS_RDNA3_5) {
+            static const int sk = getenv("STRIX_MMVQ_SK") ? atoi(getenv("STRIX_MMVQ_SK")) : 8;
+            return c_ncols_dst == 1 && (((sk & 1) && has_ids) || ((sk & 2) && blocks_per_row_x <= 32) || (sk & 4) ||
+                                        ((sk & 8) && ncols_x > 320 && ncols_x <= 1024));
+        }
         // When K is small, increase rows_per_block to match nwarps so each warp has more work to do
         // Trigger when the full thread block covers all K blocks in a single loop iteration and few threads remain idle.
         const int  nwarps = calc_nwarps(type, c_ncols_dst, table_id);
