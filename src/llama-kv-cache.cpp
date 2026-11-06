@@ -351,8 +351,13 @@ llama_kv_cache::llama_kv_cache(
                     model.attn_rot ? "LLAMA_ATTN_ROT_DISABLE" : "llama_model_set_attn_rot");
         }
 
+        // strixllama: qwen4exp keeps K as it is too (V below). With a rotated q8_0 K the four-passage long-range copy
+        // test (tmp/lsa, 200K tokens) lost most of its verbatim recall: copied-token NLL 0.088 -> 0.217 in prefill and
+        // 0.150 -> 0.788 in single-token decode, although the rotated Q / K and the stored rows check out exactly; at
+        // ctx 8192 the rotation was worth 0.0110 -> 0.0099 KLD (top-1 equal). Saved states record n_rot_k, so q8_0
+        // entries written with the rotation are refused, not misread.
         bool attn_rot_k =
-            !attn_rot_disable &&
+            !attn_rot_disable && model.arch != LLM_ARCH_QWEN4EXP &&
             n_embd_head_k_all > 0 &&
             ggml_is_quantized(type_k) &&
             hparams.n_embd_head_k() % 64 == 0;
@@ -3095,15 +3100,19 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
         // dequantize to f32 -> RoPE -> quantize back
         tmp = ggml_cast(ctx, cur, GGML_TYPE_F32);
 
-        // rotate back
-        tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
+        // rotate back (strixllama: only when the cache is rotated - qwen4exp keeps K as it is)
+        if (rot) {
+            tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
+        }
 
         tmp = ggml_rope_ext(ctx, tmp,
                 shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                 yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
 
         // rotate fwd
-        tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
+        if (rot) {
+            tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
+        }
 
         tmp = ggml_cpy(ctx, tmp, cur);
     } else {

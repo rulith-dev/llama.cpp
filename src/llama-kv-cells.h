@@ -628,7 +628,9 @@ public:
         seq_pos_rm(i);
 
         pos[i]   /= d;
-        shift[i] += p_old - pos[i];
+        // strixllama: the shift is new - old, as pos_add's (the K-shift rotates by it); since #13706 this added old - new,
+        // rotating a divided cell's key the wrong way
+        shift[i] += pos[i] - p_old;
 
         seq_pos_add(i);
 
