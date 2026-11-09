@@ -263,6 +263,33 @@ public:
     server_tokens clone() const;
 };
 
+// strixllama: splice_own_tokens' walk (server-context.cpp), shared with the disk tier (issue #30). A cache holds the
+// model's own sampled tokens of its earlier answers, and a new request sends those answers back as text that tokenizes
+// differently, so the raw common prefix stops inside the first such answer. The splice keeps the cache's own tokens
+// while their text is what the prompt continues with; this is how far it gets. `own` is what a cache holds (a slot's
+// tokens, a stored entry's), `prompt` the request. splice_own_tokens walks the same way and must stay in step with it.
+struct server_own_walk {
+    size_t k    = 0;    // the raw common prefix
+    size_t keep = 0;    // tokens of `own` the splice keeps (k and those after it), 0 when it would not splice
+    // with cuts: the lengths of `own` past k at which a splice of `own` cut there keeps all of it and the prompt goes on
+    // (ascending), and the whitespace tail it keeps as well: lengths in (ws_from, ws_to]
+    std::vector<size_t> cuts;
+    size_t ws_from = 0;
+    size_t ws_to   = 0;
+    // the images of `own` past k it matched: index in `own` -> index of the same image in `prompt`
+    std::vector<std::pair<size_t, size_t>> media;
+
+    // whether a cache holding only the first n tokens of `own` keeps all of them for the prompt: they are its raw common
+    // prefix, or the splice keeps them (at least 16 past it, as splice_own_tokens wants, or the trimmed whitespace tail)
+    bool keeps(size_t n) const;
+};
+
+// STRIX_SPLICE_OWN=0 turns the splice off, and with it this walk
+bool server_splice_own_on();
+
+server_own_walk server_tokens_own_walk(const llama_context * ctx, const server_tokens & own, const server_tokens & prompt,
+                                       bool with_cuts);
+
 
 //
 // tokenizer and input processing utils

@@ -78,6 +78,11 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
     return 0;
 }
 
+void server_queue::cancel_pending(int id_target) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    cleanup_pending_task(id_target);
+}
+
 void server_queue::defer(server_task && task) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     QUE_DBG("defer task, id = %d\n", task.id);

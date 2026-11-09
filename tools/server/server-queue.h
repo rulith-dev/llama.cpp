@@ -68,6 +68,11 @@ public:
     // strixllama: move the deferred tasks `ready` accepts to the front of the queue
     void pop_deferred_if(const std::function<bool(const server_task &)> & ready);
 
+    // strixllama (issue #28): drop a task still waiting - queued, deferred or declined while yielding - as posting a cancel
+    // does. A cancel is posted from the HTTP thread while the main loop may hold its task, about to defer it: the cancel
+    // then finds it in no queue and, run later, in no slot, and the task ran when a slot came free, for nobody
+    void cancel_pending(int id_target);
+
     // if sleeping, request exiting sleep state and wait until it is done
     // returns immediately if not sleeping
     void wait_until_no_sleep();

@@ -1865,6 +1865,14 @@ bool llama_model_loader::load_all_data(
                 return false;
             }
         }
+        {   // strixllama (issue #29): a line every 10 s while weights load - the manager restarts a load that stops
+            static int64_t t_beat = 0;
+            const int64_t t_now = ggml_time_us();
+            if (t_beat == 0 || t_now - t_beat >= 10000000) {
+                t_beat = t_now;
+                LLAMA_LOG_WARN("%s: loading weights: %.1f of %.1f GiB\n", __func__, size_done/1073741824.0, size_data/1073741824.0);
+            }
+        }
 
         size_t n_size = ggml_nbytes(cur);
 

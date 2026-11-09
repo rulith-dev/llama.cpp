@@ -219,6 +219,9 @@ public:
 private:
     // the cells of positions [p0, p0 + n) of seq_id as runs of consecutive cells, in position order (seq_rows_*)
     bool seq_row_cells(llama_seq_id seq_id, llama_pos p0, uint32_t n, bool own, std::vector<std::pair<uint32_t, uint32_t>> & runs) const;
+    // the cells [i0, i0 + n) of seq_id in position order (seq_cells_*), the same way, and where each one is (cells, may be null)
+    bool seq_cell_list(llama_seq_id seq_id, uint32_t i0, uint32_t n, bool own, std::vector<std::pair<uint32_t, uint32_t>> & runs,
+                       llama_strix_kv_cell * cells) const;
 
 public:
     // The stream holding seq_id's cells.
@@ -254,6 +257,15 @@ public:
     // qwen4exp indexer, one section of its own) gets the cell ext its cells get in a decode
     bool   seq_alloc(llama_seq_id seq_id, const llama_token * tokens, uint32_t n, uint32_t n_pos, const slot_info * sinfo_in,
                      slot_info * sinfo_out);
+    // strixllama: the same by cell (llama_strix_kv_*_cells): the cells [i0, i0 + n) of seq_id in position order (one
+    // position's cells in cell order), so a sequence with an image in it - cells sharing a position - has rows too.
+    // seq_cells_get: rows into dst (null: none) and where each cell is into cells (null: not wanted)
+    bool   seq_cells_get(llama_seq_id seq_id, uint32_t i0, uint32_t n, uint8_t * dst, llama_strix_kv_cell * cells) const;
+    bool   seq_cells_set(llama_seq_id seq_id, uint32_t i0, uint32_t n, const uint8_t * src, uint32_t src_rows);
+    // seq_id loses its cells and gets n cells placed as `cells` says, in that order; false when they cannot be (no room,
+    // positions decreasing, or cells of one position that would not keep their order)
+    bool   seq_alloc_cells(llama_seq_id seq_id, const llama_strix_kv_cell * cells, uint32_t n, uint32_t n_pos,
+                           const slot_info * sinfo_in, slot_info * sinfo_out);
     uint32_t n_pos_per_embd() const;
     // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
     void state_clear(llama_seq_id seq_id);

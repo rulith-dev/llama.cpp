@@ -801,8 +801,32 @@ struct server_prompt_cache {
     struct disk_runs_state {
         std::vector<disk_run_ref> tgt;
         std::vector<disk_run_ref> dft;
-        llama_tokens              tokens;  // what the runs were written for: they hold only while the prompt starts so
+        llama_tokens              tokens;  // what the runs were written for (disk_key): they hold only while the prompt starts so
     };
+    // strixllama (issue #31): with media in a conversation its rows are kept by cell (llama_strix_kv_*_cells), and the entry
+    // says where each cell is, in spans from row 0: a text span's cells follow one position after another from pos0, with
+    // the entry's tokens and their 2D position the position (xy = 1, M-RoPE) or 0; an image's cells are listed as they are
+    struct disk_cell_span {
+        int32_t r0   = 0;               // its first row (a row is a cell, in position order, and a token of the entry)
+        int32_t n    = 0;
+        int32_t pos0 = 0;               // text
+        int32_t xy   = 0;               // text
+        std::vector<llama_strix_kv_cell> cells;   // not empty: n cells as they are
+    };
+    // the spans of the cells of rows [0, cells.size()); `tokens` are the entry's (a row past them, or not its token, is
+    // listed as it is)
+    static std::vector<disk_cell_span> cell_spans(const std::vector<llama_strix_kv_cell> & cells, const server_tokens & tokens);
+    // and back: the cells of rows [0, n), false when the spans do not cover them
+    static bool cell_list(const std::vector<disk_cell_span> & spans, const server_tokens & tokens, int64_t n,
+                          std::vector<llama_strix_kv_cell> & out);
+    // the tokens the disk tier names a conversation by: its text tokens, and for each token of an image a value that
+    // names the image (its id and size) - never a token id nor LLAMA_TOKEN_NULL. For a text-only prompt, its tokens
+    static llama_tokens disk_key(const server_tokens & tokens, size_t n = SIZE_MAX);
+    // the longest prefix of the first n tokens that does not cut an image
+    static size_t chunk_floor(const server_tokens & tokens, size_t n);
+    // the tokens whose position is below max_pos, as server_tokens::size_up_to_pos counts them, a chunk at a time
+    // instead of a lookup per token (a busy conversation with an image asks every step)
+    static size_t tokens_below_pos(const server_tokens & tokens, llama_pos max_pos);
     // `spec_out` gets the drafter's state at the restored entry's end (empty when the entry has none), for the caller
     // to hand to common_speculative_set_state
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
@@ -833,6 +857,10 @@ struct server_prompt_cache {
         std::vector<disk_run_ref> runs_tgt;
         std::vector<disk_run_ref> runs_dft;
         int64_t  n_exact = 0;
+        // with media in it (issue #31): where its rows' cells are, and the projector its images went through
+        std::vector<disk_cell_span> cells_tgt;
+        std::vector<disk_cell_span> cells_dft;
+        uint64_t media_tag = 0;
     };
     struct disk_object {                // a chunk or checkpoint file, shared between entries
         uint64_t bytes = 0;
@@ -855,11 +883,14 @@ struct server_prompt_cache {
         std::vector<disk_run_ref> runs_dft;
         std::vector<std::pair<std::pair<uint64_t, uint64_t>, std::vector<uint8_t>>> run_data;
         std::vector<std::pair<uint64_t, uint64_t>> run_pinned;
+        std::vector<disk_cell_span> cells_tgt;                                   // with media: see disk_entry
+        std::vector<disk_cell_span> cells_dft;
     };
 
     std::string disk_dir;
     uint64_t    disk_limit    = 0;      // bytes, 0 = no disk tier
     bool        disk_has_mtmd = false;
+    uint64_t    disk_media_tag = 0;     // the vision projector this server encodes images with (0: none); see set_disk
     int32_t     disk_version  = 2;      // the manifest format this server writes; the store holds no older one
     int32_t     disk_block    = 4096;   // tokens a conversation grows by before it is written again
     int32_t     disk_run      = 4096;   // version 3: positions in a run (STRIX_PROMPT_CACHE_RUN)
@@ -891,9 +922,10 @@ struct server_prompt_cache {
     // entries live in <root>/<model_tag>: a state is only meaningful to the model that computed it. `version`
     // is the format this server writes (3 where its contexts serve rows by position, else 2), and row_tgt /
     // row_dft its rows' sizes (0 without a draft): entries of an earlier format, or with rows this server cannot
-    // take, are deleted as the store is opened
+    // take, are deleted as the store is opened. `media_tag` names the vision projector (and what decides an image's
+    // tokens): a conversation stored with images through another one comes back only up to its first image
     void     set_disk(const std::string & root, size_t limit_mib, bool has_mtmd, const std::string & model_tag, int32_t version,
-                      uint64_t row_tgt = 0, uint64_t row_dft = 0);
+                      uint64_t row_tgt = 0, uint64_t row_dft = 0, uint64_t media_tag = 0);
     bool     has_disk() const { return disk_limit > 0; }
     uint64_t disk_size();
     bool     disk_busy();                  // a job is waiting: a save that would not wait can skip its work
@@ -901,9 +933,10 @@ struct server_prompt_cache {
     // how much of `tokens` is on disk or on its way there: the longest stored prompt it starts with, or all
     // of it when a stored prompt starts with it
     size_t   disk_covered(const server_tokens & tokens, bool with_jobs = true);
-    // never for a prompt with media in it: the disk tier does not store those
+    // a prompt with media in it only where the store keeps rows (version 3, by cell - issue #31); version 2 does not
     bool     disk_wants(const server_prompt & prompt) {
-        return prompt.tokens.get_text_tokens().size() == prompt.tokens.size() && disk_covered(prompt.tokens) < prompt.tokens.size();
+        return (disk_version >= 4 || prompt.tokens.get_text_tokens().size() == prompt.tokens.size()) &&
+               disk_covered(prompt.tokens) < prompt.tokens.size();
     }
     // hand a gathered state to the writer; `wait` blocks while the queue is full instead of giving up. Checkpoints
     // with no bytes are ones the slot handed back, and `paged` says where they are
@@ -915,12 +948,14 @@ struct server_prompt_cache {
     // checkpoints come from `ckpts` and `paged` as in persist(), those past n left out - but only those in
     // `writable` are written, the rest named when the store has them already. `wait` blocks while the queue is full
     // instead of giving up. A job whose runs the store lost meanwhile is dropped, and the slot told through
-    // runs_lost() to start its runs over.
+    // runs_lost() to start its runs over. With media in `tokens`, `cells_tgt` / `cells_dft` say where the runs' cells are
+    // (rows by cell, issue #31); empty for text, whose rows are by position.
     bool persist_runs(int32_t id_slot, const server_tokens & tokens, const std::list<common_prompt_checkpoint> & ckpts,
                       const std::set<const common_prompt_checkpoint *> & writable,
                       const ckpt_paged_map * paged, const common_prompt_checkpoint * end, uint64_t row_tgt, uint64_t row_dft,
                       const std::vector<disk_run_ref> & runs_tgt, const std::vector<disk_run_ref> & runs_dft,
-                      std::vector<std::pair<std::pair<uint64_t, uint64_t>, std::vector<uint8_t>>> && run_data, bool wait);
+                      std::vector<std::pair<std::pair<uint64_t, uint64_t>, std::vector<uint8_t>>> && run_data, bool wait,
+                      std::vector<disk_cell_span> && cells_tgt = {}, std::vector<disk_cell_span> && cells_dft = {});
     bool runs_lost(int32_t id_slot);           // and clears it
     // the ref a run of rows is stored under: named by their XXH3-128
     static disk_run_ref make_run_ref(const std::vector<uint8_t> & rows, int32_t pos0, int32_t n);
@@ -956,7 +991,8 @@ struct server_prompt_cache {
     void   disk_retire_bad();
     void   disk_release_pins();
     size_t disk_covered_locked(const server_tokens & tokens, bool with_jobs);
-    bool   disk_in_flight(const server_tokens & tokens, float f_sim_base);
+    // with ctx: a job's common prefix with the prompt counts the model's own tokens the splice keeps (issue #30)
+    bool   disk_in_flight(const server_tokens & tokens, float f_sim_base, const llama_context * ctx = nullptr);
     bool   disk_ckpt_in_flight(uint64_t key);
 };
 

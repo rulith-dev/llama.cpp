@@ -4445,6 +4445,36 @@ bool llama_strix_kv_copy_rows(llama_context * ctx, llama_seq_id seq_src, llama_s
     return mem->kv_rows_copy(seq_src, seq_dst, p0, (uint32_t) n);
 }
 
+bool llama_strix_kv_get_cells(llama_context * ctx, llama_seq_id seq_id, int32_t i0, int32_t n, void * dst, size_t size,
+                              llama_strix_kv_cell * cells) {
+    const auto * mem = llama_strix_kv_memory(ctx);
+    if (!mem || i0 < 0 || n < 0 || (dst != nullptr && size != (size_t) n*mem->kv_row_size())) {
+        return false;
+    }
+    if (dst) {
+        ctx->synchronize();                         // the graphs that wrote these rows may still be running
+    }
+    return mem->kv_cells_get(seq_id, (uint32_t) i0, (uint32_t) n, (uint8_t *) dst, cells);
+}
+
+bool llama_strix_kv_alloc_cells(llama_context * ctx, llama_seq_id seq_id, const llama_strix_kv_cell * cells, int32_t n) {
+    auto * mem = llama_strix_kv_memory(ctx);
+    if (!mem || n < 0 || (n > 0 && cells == nullptr)) {
+        return false;
+    }
+    ctx->synchronize();
+    return mem->kv_alloc_cells(seq_id, cells, (uint32_t) n);
+}
+
+bool llama_strix_kv_set_cells(llama_context * ctx, llama_seq_id seq_id, int32_t i0, int32_t n, const void * src, int32_t src_rows) {
+    auto * mem = llama_strix_kv_memory(ctx);
+    if (!mem || i0 < 0 || n < 0 || src_rows < n || src == nullptr) {
+        return false;
+    }
+    ctx->synchronize();
+    return mem->kv_cells_set(seq_id, (uint32_t) i0, (uint32_t) n, (const uint8_t *) src, (uint32_t) src_rows);
+}
+
 void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void * data), void * abort_callback_data) {
     ctx->set_abort_callback(abort_callback, abort_callback_data);
 }

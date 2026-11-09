@@ -920,6 +920,157 @@ server_tokens server_tokens::clone() const {
 }
 
 //
+// strixllama: the own-token walk (see server_own_walk)
+//
+
+bool server_splice_own_on() {
+    static const bool on = !getenv("STRIX_SPLICE_OWN") || atoi(getenv("STRIX_SPLICE_OWN")) != 0;
+    return on;
+}
+
+bool server_own_walk::keeps(size_t n) const {
+    if (n <= k) {
+        return true;
+    }
+    if (n >= k + 16 && std::binary_search(cuts.begin(), cuts.end(), n)) {
+        return true;
+    }
+    return ws_to > ws_from && n > ws_from && n <= ws_to;
+}
+
+server_own_walk server_tokens_own_walk(const llama_context * ctx, const server_tokens & own, const server_tokens & prompt,
+                                       bool with_cuts) {
+    server_own_walk w;
+    const server_tokens & ct = own;
+    const server_tokens & pt = prompt;
+    const size_t k = ct.get_common_prefix(pt);
+    w.k = k;
+    if (k == 0 || ct.size() <= k || pt.size() <= k) {
+        return w;
+    }
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    const auto n_media = [](const server_tokens & t, size_t i) {
+        return (size_t) mtmd_input_chunk_get_n_tokens(t.find_chunk(i).get());
+    };
+    // the prompt after the common prefix in runs: text (its text built only as far as it is read) or one media chunk
+    struct run {
+        size_t      b, e;
+        bool        media;
+        std::string text;
+        size_t      n_text;
+    };
+    std::vector<run> runs;
+    for (size_t i = k; i < pt.size(); ) {
+        const bool media = pt[i] == LLAMA_TOKEN_NULL;
+        size_t e = i;
+        if (media) {
+            e = i + n_media(pt, i);
+        } else {
+            while (e < pt.size() && pt[e] != LLAMA_TOKEN_NULL) {
+                ++e;
+            }
+        }
+        runs.push_back({ i, e, media, std::string(), i });
+        i = e;
+    }
+    const auto text_to = [&](run & x, size_t n) {
+        while (x.text.size() < n && x.n_text < x.e) {
+            x.text += common_token_to_piece(ctx, pt[x.n_text++], true);
+        }
+        return x.text.size() >= n;
+    };
+    size_t i = k, r = 0, off = 0, n_keep = 0, r_keep = 0, off_keep = 0;
+    while (i < ct.size() && r < runs.size()) {
+        if (ct[i] == LLAMA_TOKEN_NULL) {
+            // an image of the cache's: the prompt must have the same one next, after the whole of its text run
+            size_t rm = r;
+            if (!runs[rm].media) {
+                text_to(runs[rm], std::string::npos);
+                if (off != runs[rm].text.size() || ++rm >= runs.size() || !runs[rm].media) {
+                    break;
+                }
+            }
+            const mtmd_input_chunk * a = ct.find_chunk(i).get();
+            const mtmd_input_chunk * b = pt.find_chunk(runs[rm].b).get();
+            const size_t n = mtmd_input_chunk_get_n_tokens(a);
+            if (n != mtmd_input_chunk_get_n_tokens(b) ||
+                    std::string(mtmd_input_chunk_get_id(a)) != std::string(mtmd_input_chunk_get_id(b))) {
+                break;
+            }
+            w.media.push_back({ i, runs[rm].b });
+            i += n;
+            r = rm + 1;
+            off = 0;
+            n_keep   = i - k;
+            r_keep   = r;
+            off_keep = 0;
+            if (with_cuts && r < runs.size()) {
+                w.cuts.push_back(i);
+            }
+            continue;
+        }
+        run & x = runs[r];
+        if (x.media) {
+            break;
+        }
+        const std::string piece = common_token_to_piece(ctx, ct[i], true);
+        if (piece.empty() || !text_to(x, off + piece.size()) || x.text.compare(off, piece.size(), piece) != 0) {
+            break;
+        }
+        off += piece.size();
+        ++i;
+        const bool more = text_to(x, off + 1);
+        if (more && ((unsigned char) x.text[off] & 0xC0) == 0x80) {
+            continue; // inside a multi-byte character: not a place to cut
+        }
+        n_keep   = i - k;
+        r_keep   = r;
+        off_keep = off;
+        if (with_cuts && (more || r + 1 < runs.size())) {
+            w.cuts.push_back(i);
+        }
+    }
+    // the trimmed end of an answer: whitespace only left in the cache, the end of the turn next in the text
+    bool ws_tail = false;
+    if (i < ct.size() && k + n_keep == i && r == r_keep && r_keep < runs.size() && !runs[r_keep].media &&
+            text_to(runs[r_keep], off_keep + 1)) {
+        size_t j = i;
+        while (j < ct.size()) {
+            const std::string piece = ct[j] == LLAMA_TOKEN_NULL ? std::string() : common_token_to_piece(ctx, ct[j], true);
+            if (piece.empty() || piece.find_first_not_of(" \t\r\n") != std::string::npos) {
+                break;
+            }
+            ++j;
+        }
+        bool turn_end = false;
+        for (const llama_token eog : { llama_vocab_eot(vocab), llama_vocab_eos(vocab) }) {
+            if (eog == LLAMA_TOKEN_NULL) {
+                continue;
+            }
+            const std::string piece = common_token_to_piece(ctx, eog, true);
+            turn_end = turn_end || (!piece.empty() && text_to(runs[r_keep], off_keep + piece.size()) &&
+                                    runs[r_keep].text.compare(off_keep, piece.size(), piece) == 0);
+        }
+        if (turn_end && j > i) {
+            w.ws_from = i;
+            w.ws_to   = j;
+        }
+        if (turn_end && j == ct.size()) {
+            n_keep  = ct.size() - k;
+            ws_tail = true;
+        }
+    }
+    if ((!ws_tail && n_keep < 16) || n_keep == 0) {
+        w.cuts.clear();
+        w.ws_from = w.ws_to = 0;
+        w.media.clear();
+        return w;
+    }
+    w.keep = k + n_keep;
+    return w;
+}
+
+//
 // tokenizer and input processing utils
 //
 

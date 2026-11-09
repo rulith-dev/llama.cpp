@@ -1136,6 +1136,27 @@ extern "C" {
     // (llama_strix_kv_alloc), device to device and queued behind the graphs: nothing is waited for
     LLAMA_API bool llama_strix_kv_copy_rows(struct llama_context * ctx, llama_seq_id seq_src, llama_seq_id seq_dst, llama_pos p0, int32_t n);
 
+    // strixllama: rows by cell, for a sequence with an image in it. Under M-RoPE an image's cells share one position and
+    // the positions after it up to the next token have none, so rows by position cannot hold it. The cells of a sequence
+    // in position order - those of one position in the order of their cells - are its rows here, each with where it is:
+    // a sequence of text tokens from position 0 has cell i at position i, and these give exactly the rows above.
+    typedef struct llama_strix_kv_cell {
+        llama_pos   pos;    // the cell's position
+        llama_pos   x;      // its 2D position (M-RoPE), as the cell holds it
+        llama_pos   y;
+        llama_token tok;    // its token; for an embedding's cell what the cache put there (LLAMA_TOKEN_NULL, or a PLE id)
+    } llama_strix_kv_cell;
+    // the rows of the cells [i0, i0 + n) of seq_id into dst (n * row size bytes; null: no rows), and where those cells
+    // are into cells (n entries; null: not wanted). False when the sequence has fewer cells
+    LLAMA_API bool llama_strix_kv_get_cells(struct llama_context * ctx, llama_seq_id seq_id, int32_t i0, int32_t n, void * dst, size_t size,
+                                            llama_strix_kv_cell * cells);
+    // seq_id loses whatever it held and gets n cells, placed as cells says and in that order (positions not decreasing),
+    // with no data yet
+    LLAMA_API bool llama_strix_kv_alloc_cells(struct llama_context * ctx, llama_seq_id seq_id, const llama_strix_kv_cell * cells, int32_t n);
+    // rows into the cells [i0, i0 + n) of seq_id (llama_strix_kv_alloc_cells); src is laid out for src_rows cells, of
+    // which the first n are used
+    LLAMA_API bool llama_strix_kv_set_cells(struct llama_context * ctx, llama_seq_id seq_id, int32_t i0, int32_t n, const void * src, int32_t src_rows);
+
     // Set whether the context outputs embeddings or not
     // TODO: rename to avoid confusion with llama_get_embeddings()
     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);
