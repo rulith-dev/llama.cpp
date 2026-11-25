@@ -141,6 +141,14 @@ bool server_http_context::init(const common_params & params) {
         if (!init_listener(params)) {
             return false;
         }
+#ifdef _WIN32
+        if (!params.reuse_port && !string_ends_with(pimpl->hosts[i], ".sock")) {
+            // A second listener on this address could answer status requests for the previous process.
+            pimpl->servers.back()->set_socket_options([](const socket_t sock) {
+                httplib::set_socket_opt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1);
+            });
+        }
+#endif
         // with multiple TCP addresses, [::] must not also claim 0.0.0.0
         if (n_tcp_hosts > 1) {
             pimpl->servers.back()->set_ipv6_v6only(true);
